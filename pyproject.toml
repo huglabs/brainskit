@@ -21,6 +21,13 @@ integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.2,<4"]
 [project.scripts]
 bk = "brainkit.interfaces.cli:main"
 
+[dependency-groups]
+dev = [
+  "pytest>=8,<9",
+  "ruff>=0.11,<0.13",
+  "mypy>=1.15,<2",
+]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 include-package-data = true

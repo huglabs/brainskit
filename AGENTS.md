@@ -214,3 +214,70 @@ Two process lessons from the repair round itself:
   hook is reported rather than overwritten. Git is now optional there — a
   missing repository skips the hook instead of failing the whole install, since
   the skill has nothing to do with git.
+
+## Brainkit uv packaging learnings (2026-08-02)
+
+- `bk` acts on a vault passed by `--vault`, not on the current project, so the
+  distribution unit is `uv tool install`, not a project dependency. The tool
+  environment is isolated from every consumer, which is why extras belong in the
+  install target (`uv tool install '/path/to/brainkit[integrations]'`) and not
+  in the consumer's lockfile. `-e` keeps the PATH `bk` on the working tree while
+  developing the engine; `--force` is required to change extras or re-point an
+  existing tool.
+- The setuptools backend and `[project.scripts]` were already uv-compatible, so
+  nothing in the build had to change for uv: `uv add <path>`, `uv tool install`,
+  wheel targets and PEP 508 direct references all resolved the same metadata.
+  Verify a packaging claim by installing, not by reading `pyproject.toml`.
+- `uv` picks the first interpreter it finds unless the project pins one. It
+  selected 3.12 while the repository's own caches were 3.13, so `.python-version`
+  now pins the dev interpreter. It constrains only development; `requires-python`
+  still governs what an installed `bk` accepts.
+- Packaged resources cannot be verified from the source tree, where `jobs/`,
+  `jobs/_output-schemas/` and `templates/` exist regardless of what the wheel
+  contains. `scripts/verify-wheel.sh` builds, installs into a throwaway venv,
+  asserts all 15 resources through `importlib.resources`, then drives
+  `init → capture → status → lint` and fails on `ok: false`. An import check
+  would pass on a wheel that cannot initialize a vault.
+- The wheel smoke test needs a complete vault policy, and the policy contract
+  has one source: the script imports the `policy()` fixture from
+  `tests/test_engine.py` instead of embedding a copy that would silently rot
+  when `VaultConfig` gains a required area.
+- `ruff check` and `mypy src` pass; `ruff format --check` does not (20 files).
+  The project is lint-clean, not format-clean — do not treat a formatting diff
+  as a regression introduced by a change.
+
+## README learnings (2026-08-02)
+
+- Derive every command/flag table in the README from `build_parser()` and the
+  MCP dispatch map, never from memory. Writing the table from recall put
+  `lint --semantic` under "mechanical, never calls a model" when it runs the
+  `lint-semantic` structured job — the same class of claim the engine exists to
+  prevent.
+- A full-file `Write` on a document another session may be editing is unsafe:
+  the README's install section gained the HTTPS/`@<ref>` pinning guidance
+  between the read and the rewrite, and only the stale-read guard prevented
+  losing it. Re-read immediately before a full overwrite; a partial `Read`
+  (with `limit`) does not satisfy that guard.
+- The origin serves git over HTTPS only: port 22 never answers (`ssh` reports
+  `Operation timed out` and a raw connect hangs with no reset), while 443
+  responds. Install from `git+https://…`, which authenticates through the git
+  credential helper and pins the resolved commit in the tool receipt. Diagnose a
+  transport before rewriting a URL; the SSH failure was upstream, not local.
+- Verify the artifact that is actually shipped. `uv build --wheel` reads the
+  working tree, while a plain `uv build` writes the sdist and then builds the
+  wheel *from it* — the pipeline publishing uses. The first version of the gate
+  verified the working-tree wheel and would have uploaded the sdist-derived one,
+  so a file the sdist dropped would ship unverified. `scripts/verify-wheel.sh`
+  now builds both and proves the sdist-derived wheel, and `scripts/publish.sh`
+  uploads those exact files instead of rebuilding. (setuptools does carry all 15
+  resources into the sdist here, so the gap was latent, not yet a defect.)
+- A published version is permanent, so publishing refuses a dirty working tree:
+  a registry filename that maps to a working tree nobody can reconstruct is
+  worse than a failed upload. Tokens reach uv through `UV_PUBLISH_PASSWORD`
+  rather than `-p`, keeping them out of the process arguments.
+- Git access and API access are different privileges on the same host. The
+  stored credential clones and fetches, yet `/api/v4/projects/...` answers
+  `insufficient_scope` under `PRIVATE-TOKEN`, `Bearer` and `JOB-TOKEN`.
+  Publishing to the GitLab PyPI registry therefore needs a separate token with
+  `write_package_registry`, plus the numeric project id the API would return —
+  a working `git clone` proves nothing about the package registry.
