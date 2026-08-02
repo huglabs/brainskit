@@ -1,15 +1,37 @@
+# Byte code
 __pycache__/
 *.py[cod]
-*.egg-info/
+
+# Tool caches
+.cache/
 .mypy_cache/
+.dmypy.json
+dmypy.json
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Coverage
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+
+# Build artefacts
 build/
 dist/
+.eggs/
+*.egg-info/
+
+# Environments
 .venv/
 env/
+
+# Vault working directories produced by running bk from the repo root.
+# A vault's own disposables (.brain/index.db and its -shm/-wal siblings) are
+# covered by the .gitignore that `bk init` writes into the vault itself.
 work/
 outputs/
 
@@ -18,5 +40,5 @@ outputs/
 # .claude/skills are legitimate tracked content.
 .claude/worktrees/
 
+# macOS
 .DS_Store
-
