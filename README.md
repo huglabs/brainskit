@@ -110,11 +110,46 @@ milestones; they are not silently simulated by this repository.
 
 `bk` operates on a vault directory, not on the project it is invoked from, so
 install it as an isolated uv tool. It lands on `PATH` for every vault without
-becoming a dependency of any project:
+becoming a dependency of any project.
+
+### From the package registry
+
+Released versions are published to this project's GitLab PyPI registry, which
+is the path for anyone who is not developing the engine. The registry is
+private — an unauthenticated request to the index returns `401` — so uv needs a
+token with `read_package_registry`. Give the index a name and uv takes the
+credentials from the environment, keeping the token out of the shell history
+and the process arguments:
+
+```bash
+# once — GitLab: Settings → Access Tokens, scope read_package_registry.
+# -w last makes security prompt, so the token misses the shell history too.
+security add-generic-password -a "$USER" -s brainkit-gitlab-read -U -w
+
+export UV_INDEX_BRAINKIT_USERNAME=brainkit-reader   # any value; a PAT ignores it
+export UV_INDEX_BRAINKIT_PASSWORD="$(security find-generic-password -a "$USER" -s brainkit-gitlab-read -w)"
+
+uv tool install brainkit \
+  --index brainkit=https://gitlab.dev.hugyourcustomer.ai/api/v4/projects/129/packages/pypi/simple
+bk --help
+```
+
+Extras and exact versions work as usual, and uv records the index in the tool
+receipt, so a later `uv tool upgrade brainkit` reuses it and needs only the two
+environment variables again:
+
+```bash
+uv tool install 'brainkit[integrations]==0.4.0' \
+  --index brainkit=https://gitlab.dev.hugyourcustomer.ai/api/v4/projects/129/packages/pypi/simple
+```
+
+### From a checkout
+
+Install the working tree, or a specific ref, when you are developing the engine
+or need a version that was never published:
 
 ```bash
 uv tool install /path/to/brainkit
-bk --help
 ```
 
 Install only the native database drivers you use:
@@ -139,8 +174,11 @@ tip. Without a ref the install still records the resolved commit, so upgrading
 is always an explicit `uv tool upgrade brainkit`:
 
 ```bash
-uv tool install 'brainkit[integrations] @ git+https://gitlab.dev.hugyourcustomer.ai/prototipos-raul/brainkit.git@main'
+uv tool install 'brainkit[integrations] @ git+https://gitlab.dev.hugyourcustomer.ai/prototipos-raul/brainkit.git@v0.4.0'
 ```
+
+Every published version carries a matching `v<version>` tag, so a release is
+installable from the registry and from git without knowing a commit hash.
 
 Reinstall after changing extras or the checkout with `--force`, drop the tool
 with `uv tool uninstall brainkit`, and use `-e` while developing the engine so
@@ -212,15 +250,33 @@ The host and project id default to this repository's own registry; override
 `BRAINKIT_GITLAB_HOST` and `BRAINKIT_GITLAB_PROJECT_ID` to publish a fork
 somewhere else.
 
-Consumers then install by name and version, with the registry as a named index:
+Consumers then install by name, as described in
+[From the package registry](#from-the-package-registry).
+
+### Versioning and tags
+
+Releases are `MAJOR.MINOR.PATCH` in `[project].version`, and every published
+version carries an annotated `v<version>` git tag on the commit it was built
+from. The registry rejects the re-upload of a filename it already stores, so a
+version is permanent and the tag is the only durable record of which tree
+produced it. Bump the version *before* publishing, never after:
 
 ```bash
-uv tool install brainkit \
-  --index brainkit=https://gitlab.dev.hugyourcustomer.ai/api/v4/projects/129/packages/pypi/simple
+# 1. bump [project].version, then commit
+git commit -am 'Release 0.5.0'
+# 2. tag the exact commit the artifact will be built from
+git tag -a v0.5.0 -m 'brainkit 0.5.0'
+# 3. publish — the gate refuses a dirty tree, so this is reproducible
+./scripts/publish.sh
+# 4. push the commit and the tag together
+git push origin main --follow-tags
 ```
 
-Bump `[project].version` before every publish; a registry rejects the re-upload
-of a filename it already stores.
+Tags already in the repository:
+
+| Tag | Version | State |
+|---|---|---|
+| `v0.4.0` | 0.4.0 | Published to the registry |
 
 Engineering conventions — and the defect classes this codebase has already paid
 for — are recorded in [`AGENTS.md`](./AGENTS.md). Read it before changing the
