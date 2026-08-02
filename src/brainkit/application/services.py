@@ -62,6 +62,25 @@ _RELATED_PAGE_LIMIT = 5
 _RELATED_MIN_SHARED_TERMS = 2
 _RELATED_TEXT_LIMIT = 20_000
 
+GRAPH_PROJECTION = "graph/graph.json"
+VIEWS_PROJECTION = "views"
+# `views/` is a tree whose branch maps come and go with the branches that hold
+# sources, so the artefact is identified by the one file every run writes:
+# `views/home.md`. The recorder, the lint check and `status` all use this anchor,
+# so "the artefact exists" means the same thing in all three.
+PROJECTION_ANCHORS: dict[str, str] = {
+    GRAPH_PROJECTION: GRAPH_PROJECTION,
+    VIEWS_PROJECTION: "views/home.md",
+}
+PROJECTION_COMMANDS: dict[str, str] = {
+    GRAPH_PROJECTION: "bk graph",
+    VIEWS_PROJECTION: "bk views",
+}
+PROJECTION_LINT_CODES: dict[str, str] = {
+    GRAPH_PROJECTION: "graph.stale",
+    VIEWS_PROJECTION: "views.stale",
+}
+
 
 class BrainkitService:
     """Application facade. It coordinates ports without owning infrastructure."""
@@ -389,6 +408,8 @@ class BrainkitService:
             branch = parts[1] if len(parts) > 1 else "unknown"
             raw_counts[branch] += 1
         lint_result = self.lint()
+        # Read after lint: `_mechanical_lint` refreshes page staleness in place,
+        # so reading first would report the state that lint just superseded.
         freshness = self.vault.read_state("freshness")
         return {
             "vault": str(self.vault.root),
@@ -398,6 +419,7 @@ class BrainkitService:
             "by_branch": dict(sorted(raw_counts.items())),
             "index": self.index.stats(),
             "freshness": _freshness_summary(freshness, present=set(pages)),
+            "projections": self._projection_report(freshness),
             "healthy": lint_result["ok"],
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in lint_result["findings"]
@@ -658,6 +680,7 @@ class BrainkitService:
             self.vault.write_generated(view_path, "\n".join(rows) + "\n")
             written.append(view_path)
         self.vault.write_generated("views/home.md", "\n".join(home) + "\n")
+        self._record_projection(VIEWS_PROJECTION)
         return {"written": written}
 
     def graph(self, *, html: bool = False) -> dict[str, Any]:
@@ -673,6 +696,7 @@ class BrainkitService:
                 "graph/graph.html", self.graph_port.export(graph, "html")
             )
             written.append("graph/graph.html")
+        self._record_projection(GRAPH_PROJECTION)
         return {
             "nodes": len(graph["nodes"]),
             "edges": len(graph["edges"]),
@@ -1543,6 +1567,65 @@ class BrainkitService:
 
         return self.vault.mutate_state("freshness", mutate)
 
+    def _record_projection(self, artifact: str) -> None:
+        """Stamp a derived artefact with the page set it was just built from.
+
+        The fingerprint is taken inside the mutator, so it is computed from the
+        state the write actually commits: an apply landing between a read and a
+        write cannot leave a projection claiming to cover pages it never saw.
+        """
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            projections = state.setdefault("projections", {})
+            projections[artifact] = {
+                "generated_at": utc_now(),
+                "source_hash": _projection_source_hash(state),
+            }
+            return state
+
+        self.vault.mutate_state("freshness", mutate)
+
+    def _projection_report(self, freshness: dict[str, Any]) -> dict[str, Any]:
+        """Compare every derived artefact against the page set it was built from.
+
+        Three outcomes, and they are not the same thing:
+
+        - `missing` — the artefact is not on disk. Nothing derives from the vault
+          yet, so nothing can be out of date. `bk graph` and `bk views` are
+          on-demand, and a vault that never ran them is not in error.
+        - `stale` — the artefact exists but was built from a different page set,
+          or from an unrecorded one. A projection whose provenance is unknown is
+          treated as out of date rather than trusted.
+        - `fresh` — the recorded fingerprint matches the current page set.
+        """
+        expected = _projection_source_hash(freshness)
+        recorded = freshness.get("projections", {})
+        recorded = recorded if isinstance(recorded, dict) else {}
+        now = datetime.now(timezone.utc)
+        report: dict[str, Any] = {}
+        for artifact, anchor in PROJECTION_ANCHORS.items():
+            entry = recorded.get(artifact)
+            entry = entry if isinstance(entry, dict) else {}
+            generated_at = entry.get("generated_at")
+            if not isinstance(generated_at, str):
+                generated_at = None
+            if self.vault.wiki_version(anchor) is None:
+                state = "missing"
+            elif entry.get("source_hash") != expected:
+                state = "stale"
+            else:
+                state = "fresh"
+            item: dict[str, Any] = {
+                "state": state,
+                "stale": state == "stale",
+                "generated_at": generated_at,
+            }
+            age_days = _age_in_days(generated_at, now)
+            if age_days is not None:
+                item["age_days"] = age_days
+            report[artifact] = item
+        return report
+
     def _mechanical_lint(self) -> list[LintFinding]:
         findings: list[LintFinding] = []
         freshness = self._refresh_staleness()
@@ -1684,6 +1767,22 @@ class BrainkitService:
                     "run bk reconcile",
                     severity="warning",
                     path=path,
+                )
+            )
+        # `freshness` is the state `_refresh_staleness` just committed, so the
+        # projection comparison reads the same pages lint reported on. Note the
+        # fingerprint covers page paths and content hashes only: the status and
+        # age fields that refresh rewrites on every run must not move it, or
+        # every lint would invent a stale projection.
+        for artifact, report in self._projection_report(freshness).items():
+            if not report["stale"]:
+                continue
+            findings.append(
+                LintFinding(
+                    PROJECTION_LINT_CODES[artifact],
+                    f"Derived {artifact} was built from a different set of wiki "
+                    f"pages; run {PROJECTION_COMMANDS[artifact]}",
+                    severity="warning",
                 )
             )
         return findings
@@ -2078,6 +2177,46 @@ def _freshness_summary(
         status = entry.get("status", "unknown") if isinstance(entry, dict) else "unknown"
         summary[status if status in summary else "unknown"] += 1
     return summary
+
+
+def _projection_source_hash(state: dict[str, Any]) -> str:
+    """Fingerprint the wiki page set that a derived artefact is built from.
+
+    Deliberately not mtime. A `git checkout` rewrites every mtime in the working
+    tree, which would call a current graph stale and — after a checkout that
+    restores an old graph — call a stale one current. Content hashes travel with
+    the content, so they survive any clone, checkout or rsync.
+
+    Only `(path, content_hash)` pairs enter the digest. Freshness also carries
+    `status`, `age_days` and review bookkeeping that `bk lint` rewrites on every
+    run; folding those in would make each lint report its own projections stale.
+
+    Serialization is pinned so two processes agree: pairs sorted by path,
+    NUL between path and hash, record separator between pairs, UTF-8.
+    """
+    pages = state.get("pages", {})
+    if not isinstance(pages, dict):
+        pages = {}
+    pairs: list[str] = []
+    for path in sorted(pages):
+        entry = pages[path]
+        content_hash = entry.get("content_hash") if isinstance(entry, dict) else None
+        if not isinstance(content_hash, str):
+            content_hash = ""
+        pairs.append(f"{path}\x00{content_hash}")
+    return hashlib.sha256("\x1e".join(pairs).encode("utf-8")).hexdigest()
+
+
+def _age_in_days(timestamp: str | None, now: datetime) -> int | None:
+    if not timestamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (now - moment).days
 
 
 def _orphaned_freshness(state: dict[str, Any], present: set[str]) -> list[str]:
