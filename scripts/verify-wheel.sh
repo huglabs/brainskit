@@ -48,7 +48,8 @@ expected = {
     "jobs/_output-schemas": {"digest.json", "file-proposal.json", "ingest.json",
                              "lint-semantic.json", "query.json", "resurface.json"},
     "templates/default": {"schema.json"},
-    "templates/agents": {"claude-skill.md", "instructions.md"},
+    "templates/agents": {"claude-skill.md", "instructions.md",
+                         "brainkit-gate.sh", "brainkit-status.sh"},
 }
 
 root = files("brainkit")
