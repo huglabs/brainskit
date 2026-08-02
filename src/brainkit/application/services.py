@@ -76,6 +76,17 @@ PROJECTION_COMMANDS: dict[str, str] = {
     GRAPH_PROJECTION: "bk graph",
     VIEWS_PROJECTION: "bk views",
 }
+# Which registry fields each artefact actually renders, measured by mutating one
+# field, regenerating, and diffing the output — not read off the source. Both
+# artefacts also cover the whole wiki page set, so that is not per-artefact.
+#
+# The graph labels a raw node with `original_name` and carries `path`; `views`
+# renders both plus the Status and Captured columns. `media_type` and `size`
+# reach neither, so re-extracting a document does not age a projection.
+PROJECTION_RAW_FIELDS: dict[str, tuple[str, ...]] = {
+    GRAPH_PROJECTION: ("path", "original_name"),
+    VIEWS_PROJECTION: ("path", "original_name", "status", "captured_at"),
+}
 PROJECTION_LINT_CODES: dict[str, str] = {
     GRAPH_PROJECTION: "graph.stale",
     VIEWS_PROJECTION: "views.stale",
@@ -419,7 +430,7 @@ class BrainkitService:
             "by_branch": dict(sorted(raw_counts.items())),
             "index": self.index.stats(),
             "freshness": _freshness_summary(freshness, present=set(pages)),
-            "projections": self._projection_report(freshness),
+            "projections": self._projection_report(freshness, records),
             "healthy": lint_result["ok"],
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in lint_result["findings"]
@@ -1568,42 +1579,66 @@ class BrainkitService:
         return self.vault.mutate_state("freshness", mutate)
 
     def _record_projection(self, artifact: str) -> None:
-        """Stamp a derived artefact with the page set it was just built from.
+        """Stamp a derived artefact with the inputs it was just built from.
 
-        The fingerprint is taken inside the mutator, so it is computed from the
-        state the write actually commits: an apply landing between a read and a
-        write cannot leave a projection claiming to cover pages it never saw.
+        The page half of the fingerprint is taken inside the mutator, so it is
+        computed from the state the write actually commits: an apply landing
+        between a read and a write cannot leave a projection claiming to cover
+        pages it never saw.
+
+        The registry is read *before* the mutator on purpose. `commit_wiki_batch`
+        takes the registry lock before the freshness lock, and both are blocking
+        `flock`s, so reading the registry while holding freshness would invert
+        the order and deadlock. Reading it first is also the safe direction: a
+        capture landing in between is simply absent from the recorded
+        fingerprint, and the next lint compares against a registry that has it
+        and reports stale. The error can only be a false `stale`, never a false
+        `fresh`.
         """
+        records = self.vault.registry()
+        raw_fields = PROJECTION_RAW_FIELDS[artifact]
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
             projections = state.setdefault("projections", {})
             projections[artifact] = {
                 "generated_at": utc_now(),
-                "source_hash": _projection_source_hash(state),
+                "source_hash": _projection_source_hash(
+                    state.get("pages", {}), records, raw_fields
+                ),
             }
             return state
 
         self.vault.mutate_state("freshness", mutate)
 
-    def _projection_report(self, freshness: dict[str, Any]) -> dict[str, Any]:
-        """Compare every derived artefact against the page set it was built from.
+    def _projection_report(
+        self, freshness: dict[str, Any], records: dict[str, SourceRecord]
+    ) -> dict[str, Any]:
+        """Compare every derived artefact against the inputs it was built from.
 
         Three outcomes, and they are not the same thing:
 
         - `missing` — the artefact is not on disk. Nothing derives from the vault
           yet, so nothing can be out of date. `bk graph` and `bk views` are
           on-demand, and a vault that never ran them is not in error.
-        - `stale` — the artefact exists but was built from a different page set,
-          or from an unrecorded one. A projection whose provenance is unknown is
+        - `stale` — the artefact exists but was built from different inputs, or
+          from an unrecorded set. A projection whose provenance is unknown is
           treated as out of date rather than trusted.
-        - `fresh` — the recorded fingerprint matches the current page set.
+        - `fresh` — the recorded fingerprint matches the current inputs.
+
+        Each artefact is compared against its own inputs. A shared fingerprint
+        would have to cover the union, so a change only one artefact renders
+        would age both — and a projection that cries wolf gets ignored, which
+        loses the signal by a different route than having no signal at all.
         """
-        expected = _projection_source_hash(freshness)
+        pages = freshness.get("pages", {})
         recorded = freshness.get("projections", {})
         recorded = recorded if isinstance(recorded, dict) else {}
         now = datetime.now(timezone.utc)
         report: dict[str, Any] = {}
         for artifact, anchor in PROJECTION_ANCHORS.items():
+            expected = _projection_source_hash(
+                pages, records, PROJECTION_RAW_FIELDS[artifact]
+            )
             entry = recorded.get(artifact)
             entry = entry if isinstance(entry, dict) else {}
             generated_at = entry.get("generated_at")
@@ -1769,12 +1804,12 @@ class BrainkitService:
                     path=path,
                 )
             )
-        # `freshness` is the state `_refresh_staleness` just committed, so the
-        # projection comparison reads the same pages lint reported on. Note the
-        # fingerprint covers page paths and content hashes only: the status and
-        # age fields that refresh rewrites on every run must not move it, or
-        # every lint would invent a stale projection.
-        for artifact, report in self._projection_report(freshness).items():
+        # `freshness` is the state `_refresh_staleness` just committed and
+        # `records` the registry this run already read, so the comparison sees
+        # exactly the inputs lint reported on without re-reading either. Note
+        # the fingerprint leaves out the status and age fields that refresh
+        # rewrites on every run, or every lint would invent a stale projection.
+        for artifact, report in self._projection_report(freshness, records).items():
             if not report["stale"]:
                 continue
             findings.append(
@@ -2179,32 +2214,66 @@ def _freshness_summary(
     return summary
 
 
-def _projection_source_hash(state: dict[str, Any]) -> str:
-    """Fingerprint the wiki page set that a derived artefact is built from.
+def _fingerprint_row(namespace: str, *fields: str) -> str:
+    """Encode one input row so that no two distinct rows can encode alike.
+
+    The namespace tag comes first, which is what keeps the wiki and raw domains
+    apart: a page path can never land in the position a content hash occupies,
+    so no transposition of one into the other collides. Every field is then
+    length-prefixed, so a separator appearing inside a value cannot fake a field
+    boundary either — `("a", "b:c")` and `("a:b", "c")` stay distinct.
+    """
+    return "|".join([namespace, *(f"{len(field)}:{field}" for field in fields)])
+
+
+def _projection_source_hash(
+    pages: Any,
+    records: dict[str, SourceRecord],
+    raw_fields: tuple[str, ...],
+) -> str:
+    """Fingerprint the inputs a derived artefact is built from.
 
     Deliberately not mtime. A `git checkout` rewrites every mtime in the working
     tree, which would call a current graph stale and — after a checkout that
     restores an old graph — call a stale one current. Content hashes travel with
     the content, so they survive any clone, checkout or rsync.
 
-    Only `(path, content_hash)` pairs enter the digest. Freshness also carries
-    `status`, `age_days` and review bookkeeping that `bk lint` rewrites on every
-    run; folding those in would make each lint report its own projections stale.
+    Two input domains, because both artefacts render both: the wiki page set,
+    and the raw registry. A page-only fingerprint let a `bk capture` add a
+    `raw:` node to the graph with nothing reporting it — the exact silent drift
+    this check exists to catch. `raw_fields` names the registry fields the
+    calling artefact actually renders, so a field only one of them shows cannot
+    age the other.
 
-    Serialization is pinned so two processes agree: pairs sorted by path,
-    NUL between path and hash, record separator between pairs, UTF-8.
+    What stays out: the `status` and `age_days` that `_refresh_staleness`
+    rewrites on every `bk lint`. `age_days` reaches no artefact at all, and
+    while a page's freshness badge does appear in `views/map/*.md`, that badge
+    moves with the clock rather than with anything a user did — folding it in
+    would make `views.stale` appear spontaneously on an untouched vault.
+
+    Serialization is pinned so two processes agree: pages sorted by path, raw
+    records sorted by content hash, pages before raw, newline between rows,
+    UTF-8.
     """
-    pages = state.get("pages", {})
+    rows: list[str] = []
     if not isinstance(pages, dict):
         pages = {}
-    pairs: list[str] = []
     for path in sorted(pages):
         entry = pages[path]
         content_hash = entry.get("content_hash") if isinstance(entry, dict) else None
         if not isinstance(content_hash, str):
             content_hash = ""
-        pairs.append(f"{path}\x00{content_hash}")
-    return hashlib.sha256("\x1e".join(pairs).encode("utf-8")).hexdigest()
+        rows.append(_fingerprint_row("page", path, content_hash))
+    for content_hash in sorted(records):
+        record = records[content_hash]
+        rows.append(
+            _fingerprint_row(
+                "raw",
+                content_hash,
+                *(str(getattr(record, field)) for field in raw_fields),
+            )
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
 
 def _age_in_days(timestamp: str | None, now: datetime) -> int | None:
