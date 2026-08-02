@@ -1,0 +1,61 @@
+{
+  "type": "object",
+  "required": ["operations"],
+  "additionalProperties": false,
+  "properties": {
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "action",
+          "kind",
+          "slug",
+          "title",
+          "aliases",
+          "source_hashes",
+          "body",
+          "links",
+          "base_hash"
+        ],
+        "properties": {
+          "action": { "const": "upsert" },
+          "kind": {
+            "enum": ["source", "entity", "concept", "synthesis"]
+          },
+          "slug": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "title": { "type": "string", "minLength": 1 },
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "source_hashes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "body": { "type": "string", "minLength": 1 },
+          "links": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "base_hash": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

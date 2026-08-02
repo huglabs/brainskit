@@ -1,0 +1,838 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shlex
+import sys
+import time
+import traceback
+from importlib.resources import files
+from pathlib import Path
+from typing import Any, Sequence
+
+from brainkit import __version__
+from brainkit.application.services import BrainkitService
+from brainkit.domain.model import (
+    BrainkitError,
+    FilingMode,
+    PolicyError,
+    PrivacyMode,
+    ValidationError,
+)
+from brainkit.infrastructure.graph import MarkdownGraph
+from brainkit.infrastructure.index import SqliteFtsIndex
+from brainkit.infrastructure.integrations import NativeIntegrations
+from brainkit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
+from brainkit.infrastructure.vault import FileVault
+
+
+class InternalError(BrainkitError):
+    """An unmodelled adapter failure that reached the CLI boundary."""
+
+    code = "internal_error"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="bk", description="Local-first, LLM-agnostic second-brain engine"
+    )
+    parser.add_argument("--vault", help="Vault root (otherwise discover from cwd)")
+    parser.add_argument("--json", action="store_true", help="Machine-readable output")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    init = commands.add_parser("init", help="Initialize a policy-complete vault")
+    init.add_argument("path", nargs="?", default=".")
+    init.add_argument(
+        "--config", help="Complete policy JSON path, or - for standard input"
+    )
+
+    capture = commands.add_parser("capture", help="Capture a file, URL, or text")
+    capture.add_argument("source", nargs="?")
+    capture.add_argument("--text", help="Capture literal text")
+    capture.add_argument("--title")
+
+    commands.add_parser("status", help="Show vault health and counts")
+    commands.add_parser("reconcile", help="Heal registry paths after manual moves")
+    commands.add_parser("reindex", help="Rebuild the disposable FTS5 index")
+
+    file_command = commands.add_parser("file", help="Move a raw source to a branch")
+    file_command.add_argument("item", help="Full/prefix hash or raw path")
+    file_command.add_argument("--to", required=True, dest="branch")
+
+    lint = commands.add_parser("lint", help="Validate registry and wiki contracts")
+    lint.add_argument("--changed", action="store_true")
+    lint.add_argument("--semantic", action="store_true")
+
+    search = commands.add_parser("search", help="Search with FTS5 BM25")
+    search.add_argument("query")
+    search.add_argument("--limit", type=int, default=10)
+    search.add_argument("--consumer", choices=["human", "local", "cloud"])
+
+    context = commands.add_parser("context", help="Build a bounded evidence bundle")
+    context.add_argument("query")
+    context.add_argument("--limit", type=int, default=8)
+    context.add_argument("--max-chars", type=int, default=24_000)
+    context.add_argument("--consumer", choices=["human", "local", "cloud"])
+
+    apply_command = commands.add_parser(
+        "apply", help="Validate and atomically stage wiki writes"
+    )
+    apply_command.add_argument("proposal", help="Proposal JSON path, or - for stdin")
+
+    commands.add_parser("views", help="Regenerate Obsidian views")
+    graph = commands.add_parser("graph", help="Regenerate the knowledge graph")
+    graph.add_argument("--html", action="store_true")
+
+    export = commands.add_parser("export", help="Export the graph")
+    export.add_argument(
+        "--target",
+        required=True,
+        choices=[
+            "json",
+            "graphml",
+            "cypher",
+            "obsidian",
+            "neo4j",
+            "postgres",
+            "kuzu",
+            "llms-txt",
+        ],
+    )
+    export.add_argument(
+        "--consumer",
+        choices=["human", "local", "cloud"],
+        default="local",
+        help=(
+            "Privacy boundary written into the export; defaults to local, "
+            "which excludes never-ingest branches"
+        ),
+    )
+
+    ingest = commands.add_parser("ingest", help="Run the configured ingest judgment")
+    ingest.add_argument("item", nargs="?")
+    ingest.add_argument("--all", action="store_true", dest="all_pending")
+    ingest.add_argument("--to", dest="target_branch")
+
+    proposals = commands.add_parser(
+        "proposals", help="List filing and wiki proposals"
+    )
+    proposals.add_argument(
+        "--status", choices=["pending", "applied", "rejected", "failed"]
+    )
+
+    approve = commands.add_parser("approve", help="Approve a pending proposal")
+    approve.add_argument("proposal_id")
+
+    reject = commands.add_parser("reject", help="Reject a pending proposal")
+    reject.add_argument("proposal_id")
+    reject.add_argument("--reason", default="")
+
+    ask = commands.add_parser("ask", help="Answer from compiled vault evidence")
+    ask.add_argument("question")
+    ask.add_argument("--save", action="store_true")
+
+    digest = commands.add_parser("digest", help="Generate the configured digest")
+    digest.add_argument("--since", default="7d")
+    commands.add_parser("resurface", help="Resurface one durable insight")
+
+    serve = commands.add_parser("serve", help="Serve robot interfaces")
+    serve.add_argument("--mcp", action="store_true", required=True)
+    serve.add_argument(
+        "--transport", choices=["stdio", "http"], default="stdio"
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8766)
+    serve.add_argument("--token-env")
+    serve.add_argument("--allowed-origin", action="append", default=[])
+    serve.add_argument("--tls-cert")
+    serve.add_argument("--tls-key")
+
+    watch = commands.add_parser("watch", help="Watch configured source folders")
+    watch.add_argument("--once", action="store_true")
+    watch.add_argument("--interval", type=float, default=5.0)
+
+    hooks = commands.add_parser("hooks", help="Install agent-facing vault hooks")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
+    hooks_install = hooks_sub.add_parser("install")
+    hooks_install.add_argument(
+        "--agent",
+        required=True,
+        choices=["claude", "codex", "gemini", "opencode"],
+    )
+    hooks_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing brainkit skill and pre-commit hook",
+    )
+
+    commands.add_parser("schedule", help="Show configured habit job registrations")
+
+    integration = commands.add_parser(
+        "integration", help="Configure and operate persistent integrations"
+    )
+    integration_sub = integration.add_subparsers(
+        dest="integration_command", required=True
+    )
+    integration_configure = integration_sub.add_parser("configure")
+    integration_configure.add_argument(
+        "name", choices=["obsidian", "neo4j", "postgres", "web"]
+    )
+    enabled_group = integration_configure.add_mutually_exclusive_group()
+    enabled_group.add_argument("--enable", action="store_true", default=None)
+    enabled_group.add_argument("--disable", action="store_true", default=None)
+    managed_group = integration_configure.add_mutually_exclusive_group()
+    managed_group.add_argument("--managed", action="store_true", default=None)
+    managed_group.add_argument("--external", action="store_true", default=None)
+    integration_configure.add_argument("--path")
+    integration_configure.add_argument("--subdirectory")
+    integration_configure.add_argument(
+        "--include-raw", action="store_true", default=None
+    )
+    integration_configure.add_argument("--uri")
+    integration_configure.add_argument("--user")
+    integration_configure.add_argument("--password-env")
+    integration_configure.add_argument("--database")
+    integration_configure.add_argument("--dsn-env")
+    integration_configure.add_argument("--schema")
+    integration_configure.add_argument("--image")
+    integration_configure.add_argument("--container-name")
+    integration_configure.add_argument("--host")
+    integration_configure.add_argument("--port", type=int)
+    integration_configure.add_argument("--http-port", type=int)
+    integration_configure.add_argument("--bolt-port", type=int)
+    integration_configure.add_argument("--token-env")
+    integration_configure.add_argument(
+        "--consumer", choices=["human", "local", "cloud"]
+    )
+    integration_status = integration_sub.add_parser("status")
+    integration_status.add_argument(
+        "name", nargs="?", choices=["obsidian", "neo4j", "postgres", "web"]
+    )
+    for operation in ("up", "down", "sync"):
+        command = integration_sub.add_parser(operation)
+        command.add_argument(
+            "name", choices=["obsidian", "neo4j", "postgres", "web"]
+        )
+
+    web = commands.add_parser("web", help="Run the complete local web viewer")
+    web_sub = web.add_subparsers(dest="web_command", required=True)
+    web_serve = web_sub.add_parser("serve")
+    web_serve.add_argument("--host")
+    web_serve.add_argument("--port", type=int)
+    web_serve.add_argument("--consumer", choices=["human", "local", "cloud"])
+    web_serve.add_argument("--token-env")
+    web_serve.add_argument("--instance-id", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    effective_argv = list(argv if argv is not None else sys.argv[1:])
+    effective_argv, global_values = _extract_global_options(effective_argv)
+    parser = build_parser()
+    args = parser.parse_args(effective_argv)
+    if global_values["vault"] is not None:
+        args.vault = global_values["vault"]
+    if global_values["json"]:
+        args.json = True
+    try:
+        result = _dispatch(args)
+        if result is not None:
+            _emit(result, json_mode=args.json)
+        if args.command == "lint" and isinstance(result, dict) and not result["ok"]:
+            return 1
+        return 0
+    except PolicyError as exc:
+        _emit_error(exc, json_mode=args.json)
+        return 3
+    except BrainkitError as exc:
+        _emit_error(exc, json_mode=args.json)
+        return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        wrapped = BrainkitError(str(exc))
+        _emit_error(wrapped, json_mode=args.json)
+        return 2
+    except KeyboardInterrupt:
+        _emit_error(BrainkitError("Interrupted"), json_mode=args.json)
+        return 130
+    except Exception as exc:  # noqa: BLE001 - top-level safety net
+        # An adapter raised something brainkit does not model. Never let a raw
+        # traceback replace the machine-readable envelope on stdout.
+        _emit_error(_internal_error(exc), json_mode=args.json)
+        return 2
+
+
+def create_service(vault_path: str | None) -> BrainkitService:
+    vault = FileVault(Path(vault_path)) if vault_path else FileVault.discover()
+    index = SqliteFtsIndex(vault.index_path)
+    jobs = JobSpecs()
+    judgment = PolicyJudgmentRouter(vault.config(), jobs)
+    graph = MarkdownGraph()
+    return BrainkitService(
+        vault,
+        index,
+        judgment=judgment,
+        jobs=jobs,
+        graph=graph,
+        integrations=NativeIntegrations(vault),
+    )
+
+
+def _dispatch(args: argparse.Namespace) -> Any:
+    if args.command == "init":
+        raw_config = (
+            _read_json(args.config) if args.config else _interactive_policy_wizard()
+        )
+        vault = FileVault.initialize(Path(args.vault or args.path), raw_config)
+        service = create_service(str(vault.root))
+        indexed = service.reindex()
+        views = service.views()
+        return {
+            "vault": str(vault.root),
+            "config": vault.config().to_dict(),
+            **indexed,
+            "views": views["written"],
+        }
+
+    service = create_service(args.vault)
+    if args.command == "capture":
+        return service.capture(args.source, text=args.text, title=args.title)
+    if args.command == "status":
+        return service.status()
+    if args.command == "reconcile":
+        return service.reconcile()
+    if args.command == "reindex":
+        return service.reindex()
+    if args.command == "file":
+        return service.file(args.item, args.branch)
+    if args.command == "lint":
+        return service.lint(semantic=args.semantic)
+    if args.command == "search":
+        return service.search(
+            args.query,
+            args.limit,
+            consumer=_consumer_for_args(args),
+        )
+    if args.command == "context":
+        return service.context(
+            args.query,
+            limit=args.limit,
+            max_chars=args.max_chars,
+            consumer=_consumer_for_args(args),
+        )
+    if args.command == "apply":
+        return service.apply(_read_json(args.proposal))
+    if args.command == "views":
+        return service.views()
+    if args.command == "graph":
+        return service.graph(html=args.html)
+    if args.command == "export":
+        return service.export(args.target, consumer=args.consumer or "local")
+    if args.command == "ingest":
+        return service.ingest(
+            args.item,
+            all_pending=args.all_pending,
+            target_branch=args.target_branch,
+        )
+    if args.command == "proposals":
+        return service.proposals(args.status)
+    if args.command == "approve":
+        return service.approve(args.proposal_id)
+    if args.command == "reject":
+        return service.reject(args.proposal_id, args.reason)
+    if args.command == "ask":
+        return service.ask(args.question, save=args.save)
+    if args.command == "digest":
+        return service.digest(args.since)
+    if args.command == "resurface":
+        return service.resurface()
+    if args.command == "serve":
+        from brainkit.interfaces.mcp import run_http, run_stdio
+
+        if args.transport == "http":
+            run_http(
+                service,
+                host=args.host,
+                port=args.port,
+                token_env=args.token_env or "",
+                allowed_origins=args.allowed_origin,
+                tls_cert=args.tls_cert,
+                tls_key=args.tls_key,
+            )
+        else:
+            run_stdio(service)
+        return None
+    if args.command == "watch":
+        return _watch(service, once=args.once, interval=args.interval, json_mode=args.json)
+    if args.command == "hooks":
+        return _install_hooks(service, args.agent, force=args.force)
+    if args.command == "schedule":
+        return _schedule(service)
+    if args.command == "integration":
+        if args.integration_command == "configure":
+            enabled = True if args.enable else False if args.disable else None
+            managed = True if args.managed else False if args.external else None
+            option_names = (
+                "path",
+                "subdirectory",
+                "include_raw",
+                "uri",
+                "user",
+                "password_env",
+                "database",
+                "dsn_env",
+                "schema",
+                "image",
+                "container_name",
+                "host",
+                "port",
+                "http_port",
+                "bolt_port",
+                "token_env",
+                "consumer",
+            )
+            options = {
+                name: getattr(args, name)
+                for name in option_names
+                if getattr(args, name) is not None
+            }
+            return service.integration_configure(
+                args.name,
+                enabled=enabled,
+                managed=managed,
+                options=options,
+            )
+        if args.integration_command == "status":
+            return service.integration_status(args.name)
+        if args.integration_command == "up":
+            return service.integration_up(args.name)
+        if args.integration_command == "down":
+            return service.integration_down(args.name)
+        if args.integration_command == "sync":
+            return service.integration_sync(args.name)
+    if args.command == "web":
+        from brainkit.interfaces.web import run_web
+
+        policy = service.vault.config().integrations["web"]
+        if not policy.enabled:
+            raise ValidationError(
+                "Web integration is disabled",
+                details={"hint": "Run bk integration configure web --enable"},
+            )
+        options = policy.options
+        run_web(
+            service,
+            host=args.host or str(options.get("host", "127.0.0.1")),
+            port=args.port or int(options.get("port", 8765)),
+            consumer=args.consumer or str(options.get("consumer", "human")),
+            token_env=args.token_env or str(options.get("token_env", "")),
+            instance_id=args.instance_id or "",
+        )
+        return None
+    raise ValidationError("Unknown command")
+
+
+def _read_json(path: str) -> dict[str, Any]:
+    raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValidationError("Expected a JSON object", details={"path": path})
+    return value
+
+
+def _interactive_policy_wizard() -> dict[str, Any]:
+    if not sys.stdin.isatty():
+        raise ValidationError(
+            "Interactive init needs a terminal; use --config with a complete policy"
+        )
+    print("brainkit policy wizard — every question must be answered.")
+    wiki_language = _ask("Wiki language", "Portuguese (Brazil)")
+    branch_names = [
+        item.strip()
+        for item in _ask(
+            "Raw branches (comma-separated)",
+            "10-work,20-research,30-learning,90-personal",
+        ).split(",")
+        if item.strip()
+    ]
+    inbox_policy = _ask_policy("_inbox")
+    branches = {branch: _ask_policy(branch) for branch in branch_names}
+    providers = _ask_json(
+        "Provider configuration JSON",
+        {
+            "ollama": {"base_url": "http://127.0.0.1:11434"},
+        },
+    )
+    job_models = _ask_json(
+        "Model-per-job JSON",
+        {
+            "ingest": {"provider": "ollama", "model": "qwen3:8b"},
+            "query": {"provider": "ollama", "model": "qwen3:8b"},
+            "digest": {"provider": "ollama", "model": "qwen3:8b"},
+            "lint-semantic": {"provider": "ollama", "model": "qwen3:8b"},
+            "file-proposal": {"provider": "ollama", "model": "qwen3:8b"},
+            "resurface": {"provider": "ollama", "model": "qwen3:8b"},
+        },
+    )
+    sources = _comma_values(_ask("Source folders/files (comma-separated)", ""))
+    digest_schedule = _ask("Morning digest cron schedule", "0 8 * * *")
+    taxonomy = _comma_values(
+        _ask("Taxonomy seed (comma-separated)", ",".join(branch_names))
+    )
+    novelty = _ask_json(
+        "Novelty and freshness policy JSON",
+        {
+            "duplicate_similarity_threshold": 0.9,
+            "min_new_token_ratio": 0.15,
+            "stale_after_days": 30,
+        },
+    )
+    integrations = _ask_json(
+        "Persistent integrations JSON",
+        {
+            "obsidian": {"enabled": False, "managed": False, "options": {}},
+            "neo4j": {"enabled": False, "managed": False, "options": {}},
+            "postgres": {"enabled": False, "managed": False, "options": {}},
+            "web": {
+                "enabled": False,
+                "managed": True,
+                "options": {
+                    "host": "127.0.0.1",
+                    "port": 8765,
+                    "consumer": "human",
+                },
+            },
+        },
+    )
+    return {
+        "version": 3,
+        "wiki_language": wiki_language,
+        "inbox_policy": inbox_policy,
+        "branches": branches,
+        "providers": providers,
+        "job_models": job_models,
+        "sources": sources,
+        "schedule": {"digest": digest_schedule},
+        "taxonomy_seed": taxonomy,
+        "novelty": novelty,
+        "integrations": integrations,
+    }
+
+
+def _ask_policy(branch: str) -> dict[str, str]:
+    privacy = _ask_choice(
+        f"{branch} privacy",
+        [mode.value for mode in PrivacyMode],
+        PrivacyMode.LOCAL_ONLY.value,
+    )
+    filing = _ask_choice(
+        f"{branch} filing",
+        [mode.value for mode in FilingMode],
+        FilingMode.APPROVE_EACH.value,
+    )
+    return {"privacy": privacy, "filing": filing}
+
+
+def _ask(prompt: str, suggestion: str) -> str:
+    suffix = f" [{suggestion}]" if suggestion else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value or suggestion
+
+
+def _ask_choice(prompt: str, values: list[str], suggestion: str) -> str:
+    while True:
+        value = _ask(f"{prompt} ({'/'.join(values)})", suggestion)
+        if value in values:
+            return value
+        print(f"Choose one of: {', '.join(values)}")
+
+
+def _ask_json(prompt: str, suggestion: dict[str, Any]) -> dict[str, Any]:
+    while True:
+        raw = _ask(prompt, json.dumps(suggestion, ensure_ascii=False))
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            print("Enter a valid JSON object.")
+            continue
+        if isinstance(value, dict):
+            return value
+        print("Enter a JSON object.")
+
+
+def _comma_values(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _consumer_for_args(args: argparse.Namespace) -> str:
+    if args.consumer:
+        return str(args.consumer)
+    if args.json:
+        raise ValidationError(
+            "Machine-readable search/context requires --consumer",
+            details={"choices": ["human", "local", "cloud"]},
+        )
+    return "human"
+
+
+def _watch(
+    service: BrainkitService, *, once: bool, interval: float, json_mode: bool
+) -> dict[str, Any] | None:
+    if interval <= 0:
+        raise ValidationError("Watch interval must be positive")
+    source_paths = [
+        Path(value).expanduser().resolve() for value in service.vault.config().sources
+    ]
+    if not source_paths:
+        raise ValidationError("No source folders/files are configured")
+    while True:
+        created = 0
+        duplicates = 0
+        failures: list[dict[str, str]] = []
+        for source in source_paths:
+            candidates = [source] if source.is_file() else (
+                [path for path in source.rglob("*") if path.is_file()]
+                if source.is_dir()
+                else []
+            )
+            for candidate in candidates:
+                if service.vault.root == candidate or service.vault.root in candidate.parents:
+                    continue
+                try:
+                    result = service.capture(str(candidate))
+                    created += int(result["created"])
+                    duplicates += int(not result["created"])
+                except (BrainkitError, OSError) as exc:
+                    failures.append({"path": str(candidate), "error": str(exc)})
+        result = {
+            "created": created,
+            "duplicates": duplicates,
+            "failures": failures,
+        }
+        if once:
+            return result
+        _emit(result, json_mode=json_mode)
+        time.sleep(interval)
+
+
+INSTRUCTION_FILES = {
+    "claude": "CLAUDE.md",
+    "codex": "AGENTS.md",
+    "gemini": "GEMINI.md",
+    "opencode": "AGENTS.md",
+}
+INSTRUCTION_START = "<!-- brainkit:start -->"
+INSTRUCTION_END = "<!-- brainkit:end -->"
+_MANAGED_BLOCK_RE = re.compile(
+    rf"{re.escape(INSTRUCTION_START)}.*?{re.escape(INSTRUCTION_END)}\n?",
+    re.DOTALL,
+)
+
+
+def _agent_template(name: str, vault: Path) -> str:
+    resource = files("brainkit").joinpath("templates", "agents", f"{name}.md")
+    if not resource.is_file():
+        raise ValidationError(
+            "Agent template is missing from the installation",
+            details={"template": name},
+        )
+    return resource.read_text(encoding="utf-8").replace("{{vault}}", str(vault))
+
+
+def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
+    """Install the Claude Code skill that teaches the vault contract."""
+    skill = root / ".claude" / "skills" / "brainkit" / "SKILL.md"
+    content = _agent_template("claude-skill", vault)
+    if skill.is_file() and not force:
+        if skill.read_text(encoding="utf-8") == content:
+            return {"path": str(skill), "state": "current"}
+        raise ValidationError(
+            "A brainkit skill already exists; re-run with --force to replace it",
+            details={"path": str(skill)},
+        )
+    updated = skill.is_file()
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(content, encoding="utf-8")
+    return {"path": str(skill), "state": "updated" if updated else "created"}
+
+
+def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]:
+    """Append the graph contract, replacing any block a previous run wrote.
+
+    The block is fenced by HTML comments so re-running never duplicates it and
+    never disturbs instructions the operator wrote around it.
+    """
+    target = root / INSTRUCTION_FILES[agent]
+    block = (
+        f"{INSTRUCTION_START}\n"
+        f"{_agent_template('instructions', vault).strip()}\n"
+        f"{INSTRUCTION_END}\n"
+    )
+    existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+    if INSTRUCTION_START in existing:
+        # Replace in place so instructions written after the block keep their
+        # position; a lambda avoids re.sub interpreting escapes in the block.
+        content = _MANAGED_BLOCK_RE.sub(lambda _: block, existing, count=1)
+        state = "current" if existing == content else "updated"
+    else:
+        stripped = existing.strip()
+        content = f"{stripped}\n\n{block}" if stripped else block
+        state = "appended" if stripped else "created"
+    if content != existing:
+        target.write_text(content, encoding="utf-8")
+    return {"path": str(target), "state": state}
+
+
+def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
+    """Install the lint hook when the vault is a git repository.
+
+    A missing repository is reported rather than raised: the skill and the
+    instructions are useful on their own and have nothing to do with git.
+    """
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        return {
+            "state": "skipped",
+            "reason": "vault is not a git repository",
+            "hint": "Run git init in the vault, then install again",
+        }
+    hook = git_dir / "hooks" / "pre-commit"
+    content = f"#!/bin/sh\nexec bk --vault {json.dumps(str(vault))} lint --changed\n"
+    if hook.exists() and not force:
+        if hook.read_text(encoding="utf-8") == content:
+            return {"path": str(hook), "state": "current"}
+        return {
+            "path": str(hook),
+            "state": "skipped",
+            "reason": "a pre-commit hook already exists",
+            "hint": "Merge brainkit lint into it, or re-run with --force",
+        }
+    updated = hook.exists()
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(content, encoding="utf-8")
+    hook.chmod(0o755)
+    return {"path": str(hook), "state": "updated" if updated else "created"}
+
+
+def _install_hooks(
+    service: BrainkitService, agent: str, *, force: bool = False
+) -> dict[str, Any]:
+    root = service.vault.root
+    adapter_path = f".brain/agent-{agent}.json"
+    service.vault.write_generated(
+        adapter_path,
+        json.dumps(
+            {
+                "agent": agent,
+                "rules": [
+                    "Read evidence with bk context --json --consumer local",
+                    "Write wiki pages only with bk apply",
+                    "Never edit raw content",
+                ],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    result: dict[str, Any] = {
+        "agent": agent,
+        "adapter": adapter_path,
+        "instructions": _install_instructions(root, root, agent),
+        "pre_commit": _install_pre_commit(root, root, force=force),
+    }
+    if agent == "claude":
+        result["skill"] = _install_skill(root, root, force=force)
+    return result
+
+
+def _schedule(service: BrainkitService) -> dict[str, Any]:
+    schedules = service.vault.config().schedule
+    return {
+        "jobs": [
+            {
+                "job": job,
+                "schedule": expression,
+                "command": f"bk --vault {shlex.quote(str(service.vault.root))} {job}",
+            }
+            for job, expression in schedules.items()
+        ],
+        "ownership": "Register these jobs with cron or the gateway agent that owns the user channel.",
+    }
+
+
+def _extract_global_options(argv: list[str]) -> tuple[list[str], dict[str, Any]]:
+    result: list[str] = []
+    values: dict[str, Any] = {"json": False, "vault": None}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--json":
+            values["json"] = True
+            index += 1
+            continue
+        if token == "--vault":
+            if index + 1 >= len(argv):
+                raise SystemExit("--vault requires a path")
+            values["vault"] = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith("--vault="):
+            values["vault"] = token.split("=", 1)[1]
+            index += 1
+            continue
+        result.append(token)
+        index += 1
+    return result, values
+
+
+def _emit(value: Any, *, json_mode: bool) -> None:
+    if json_mode:
+        print(json.dumps({"ok": True, "result": value}, ensure_ascii=False))
+        return
+    if isinstance(value, dict) and isinstance(value.get("answer"), str):
+        print(value["answer"])
+        if value.get("saved_to"):
+            print(f"\nSaved to {value['saved_to']}")
+        return
+    if isinstance(value, dict) and isinstance(value.get("digest"), str):
+        print(value["digest"])
+        print(f"\nSaved to {value['path']}")
+        return
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def _internal_error(exc: BaseException) -> InternalError:
+    """Summarize an unmodelled failure; the traceback stays on stderr."""
+
+    print("bk: unhandled internal error", file=sys.stderr)
+    traceback.print_exception(exc, file=sys.stderr)
+    sys.stderr.flush()
+    name = type(exc).__name__
+    message = str(exc).strip()
+    return InternalError(
+        f"{name}: {message}" if message else name,
+        details={"kind": name},
+    )
+
+
+def _emit_error(error: BrainkitError, *, json_mode: bool) -> None:
+    payload = {
+        "ok": False,
+        "error": {
+            "code": error.code,
+            "message": str(error),
+            "details": error.details,
+        },
+    }
+    stream = sys.stdout if json_mode else sys.stderr
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=False), file=stream)
+    else:
+        print(f"bk: {error}", file=stream)
+        if error.details:
+            print(json.dumps(error.details, indent=2, ensure_ascii=False), file=stream)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brainkit"
+version = "0.4.0"
+description = "Local-first, LLM-agnostic second-brain engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "HugLabs" }]
+dependencies = ["jsonschema[format]>=4.20,<5"]
+
+[project.optional-dependencies]
+convert = ["markitdown"]
+neo4j = ["neo4j>=5.25,<7"]
+postgres = ["psycopg[binary]>=3.2,<4"]
+integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.2,<4"]
+
+[project.scripts]
+bk = "brainkit.interfaces.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+brainkit = [
+  "jobs/*.md",
+  "jobs/_output-schemas/*.json",
+  "templates/default/*.json",
+  "templates/agents/*.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

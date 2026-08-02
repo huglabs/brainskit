@@ -1,0 +1,2 @@
+"""Domain model and invariants."""
+
