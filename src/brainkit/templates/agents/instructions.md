@@ -51,7 +51,9 @@ name it explicitly only when the operator asked for unrestricted evidence.
   `context`, and retries carry a stable `proposal_id`.
 - Never edit anything under `raw/` — sources are immutable and identified by
   their hash. Never hand-edit anything under `wiki/`; `bk lint` reports it as
-  `wiki.outside_apply`.
+  `wiki.outside_apply`. Both are refused mechanically rather than by
+  convention: `bk gate check-write PATH` is the decision, and the installed
+  PreToolUse hook asks it before every file write.
 - Run `bk reconcile` after moving or deleting files outside the tooling. It
   re-links moved sources by hash and drops freshness entries whose page is gone.
 - A failed apply writes nothing, and an interrupted one is rolled back when the

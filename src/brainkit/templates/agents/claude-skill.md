@@ -11,9 +11,18 @@ cite the source hashes it was built from. SQLite FTS5 is a disposable index.
 
 ## The only write path
 
-You may never create or edit a file under `wiki/` or `raw/` directly. `bk lint`
-detects it by comparing each page against the hash the apply gate recorded, and
-the vault will report `wiki.outside_apply` until it is reverted.
+You may never create or edit a file under `wiki/` or `raw/` directly. This is
+not advice you are being asked to follow: `bk hooks install` registers a
+PreToolUse hook that refuses the write while you are attempting it, and returns
+the command to use instead. Ask it yourself before writing anywhere unusual:
+
+```bash
+bk --vault {{vault}} gate check-write PATH --json   # exit 0 allowed, 2 denied
+```
+
+A write that slips past the hook is still caught afterwards: `bk lint` compares
+each page against the hash the apply gate recorded, and the vault reports
+`wiki.outside_apply` until it is reverted.
 
 ```bash
 bk --vault {{vault}} context "QUERY" --consumer local --json   # 1. get evidence

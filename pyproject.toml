@@ -41,6 +41,7 @@ brainkit = [
   "jobs/_output-schemas/*.json",
   "templates/default/*.json",
   "templates/agents/*.md",
+  "templates/agents/*.sh",
 ]
 
 [tool.pytest.ini_options]
