@@ -436,9 +436,148 @@ class BrainkitService:
             "index": self.index.stats(),
             "freshness": _freshness_summary(freshness, present=set(pages)),
             "projections": self._projection_report(freshness, records),
+            "enforcement": self._enforcement_state(),
             "healthy": lint_result["ok"],
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in lint_result["findings"]
+            ),
+        }
+
+    def _enforcement_state(self) -> dict[str, Any]:
+        """Report which enforcement layers are live for this vault, from disk.
+
+        `hooks install` says what it wrote at the moment it ran; this says what
+        is guarding the vault now. They diverge whenever a hook is edited away,
+        a settings file is rewritten, or the vault is copied without its git
+        directory -- and a layer that is off while everything still reads like
+        success is precisely how an invariant ends up guarded by nothing.
+        """
+        root = self.vault.root
+        settings_path = root / ".claude" / "settings.json"
+        registered: set[str] = set()
+        events: dict[str, set[str]] = {}
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            hooks = settings.get("hooks")
+            if isinstance(hooks, dict):
+                for event, groups in hooks.items():
+                    commands = {
+                        str(hook.get("command", ""))
+                        for group in groups
+                        if isinstance(group, dict)
+                        for hook in group.get("hooks", [])
+                        if isinstance(hook, dict)
+                    }
+                    events[event] = commands
+                    registered |= commands
+        except (OSError, ValueError, AttributeError, TypeError):
+            # An unreadable or malformed settings file means "nothing is
+            # registered", never an exception out of `bk status`.
+            pass
+
+        def registered_under(event: str, path: Path) -> bool:
+            """Is ``path`` the script some command on ``event`` actually runs?
+
+            Compared against the resolved path as well as the literal one: on
+            macOS a vault under /var resolves to /private/var, so a settings
+            file written with either spelling must still read as registered.
+            A command may also wrap the script in a shell guard rather than
+            naming it alone, so containment counts.
+            """
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            candidates = {str(path), str(resolved)}
+            for command in events.get(event, set()):
+                if command in candidates or any(c in command for c in candidates):
+                    return True
+                # The command may spell the same file a different way. Compare
+                # resolved forms, guarded because a command is often a shell
+                # snippet rather than a bare path.
+                try:
+                    if Path(command).resolve() == resolved:
+                        return True
+                except (OSError, ValueError):
+                    continue
+            return False
+
+        def hook_layer(
+            name: str, script: str, event: str, mechanism: str
+        ) -> dict[str, Any]:
+            path = root / ".claude" / "hooks" / script
+            active = path.is_file() and registered_under(event, path)
+            detail = "active"
+            if not path.is_file():
+                detail = f"{script} is not installed"
+            elif not active:
+                detail = f"{script} exists but is not registered under {event}"
+            return {
+                "layer": name,
+                "mechanism": mechanism,
+                "active": active,
+                "detail": detail,
+            }
+
+        pre_commit = root / ".git" / "hooks" / "pre-commit"
+        try:
+            commit_active = pre_commit.is_file() and "lint" in pre_commit.read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            commit_active = False
+        # The sentinel is duplicated from the installer rather than imported:
+        # the application layer must not depend on interfaces.
+        instructions = root / "CLAUDE.md"
+        try:
+            advisory_active = (
+                instructions.is_file()
+                and "<!-- brainkit:start -->" in instructions.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except OSError:
+            advisory_active = False
+
+        layers = [
+            hook_layer(
+                "write_gate",
+                "brainkit-gate.sh",
+                "PreToolUse",
+                "Claude Code PreToolUse hook on Write|Edit|MultiEdit",
+            ),
+            hook_layer(
+                "session_status",
+                "brainkit-status.sh",
+                "SessionStart",
+                "Claude Code SessionStart hook reporting vault state",
+            ),
+            {
+                "layer": "commit_lint",
+                "mechanism": ".git/hooks/pre-commit running bk lint --changed",
+                "active": commit_active,
+                "detail": "active"
+                if commit_active
+                else "the vault is not a git repository or has no brainkit pre-commit hook",
+            },
+            {
+                "layer": "instructions",
+                "mechanism": "CLAUDE.md managed block",
+                "active": advisory_active,
+                "advisory": True,
+                "detail": "active" if advisory_active else "no managed block found",
+            },
+        ]
+        return {
+            "layers": layers,
+            "inactive": [layer["layer"] for layer in layers if not layer["active"]],
+            # Specifically the write gate, not "any non-advisory layer is on".
+            # session_status is observability and commit_lint catches a bypass
+            # only after the fact; neither one keeps a write out of the wiki, so
+            # letting either imply `gated` would report a guarded vault that a
+            # Write tool can still walk straight into.
+            "gated": any(
+                layer["active"] for layer in layers if layer["layer"] == "write_gate"
             ),
         }
 
