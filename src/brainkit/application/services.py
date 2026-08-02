@@ -63,6 +63,36 @@ _RELATED_PAGE_LIMIT = 5
 _RELATED_MIN_SHARED_TERMS = 2
 _RELATED_TEXT_LIMIT = 20_000
 
+GRAPH_PROJECTION = "graph/graph.json"
+VIEWS_PROJECTION = "views"
+# `views/` is a tree whose branch maps come and go with the branches that hold
+# sources, so the artefact is identified by the one file every run writes:
+# `views/home.md`. The recorder, the lint check and `status` all use this anchor,
+# so "the artefact exists" means the same thing in all three.
+PROJECTION_ANCHORS: dict[str, str] = {
+    GRAPH_PROJECTION: GRAPH_PROJECTION,
+    VIEWS_PROJECTION: "views/home.md",
+}
+PROJECTION_COMMANDS: dict[str, str] = {
+    GRAPH_PROJECTION: "bk graph",
+    VIEWS_PROJECTION: "bk views",
+}
+# Which registry fields each artefact actually renders, measured by mutating one
+# field, regenerating, and diffing the output — not read off the source. Both
+# artefacts also cover the whole wiki page set, so that is not per-artefact.
+#
+# The graph labels a raw node with `original_name` and carries `path`; `views`
+# renders both plus the Status and Captured columns. `media_type` and `size`
+# reach neither, so re-extracting a document does not age a projection.
+PROJECTION_RAW_FIELDS: dict[str, tuple[str, ...]] = {
+    GRAPH_PROJECTION: ("path", "original_name"),
+    VIEWS_PROJECTION: ("path", "original_name", "status", "captured_at"),
+}
+PROJECTION_LINT_CODES: dict[str, str] = {
+    GRAPH_PROJECTION: "graph.stale",
+    VIEWS_PROJECTION: "views.stale",
+}
+
 
 class BrainkitService:
     """Application facade. It coordinates ports without owning infrastructure."""
@@ -394,6 +424,8 @@ class BrainkitService:
             branch = parts[1] if len(parts) > 1 else "unknown"
             raw_counts[branch] += 1
         lint_result = self.lint()
+        # Read after lint: `_mechanical_lint` refreshes page staleness in place,
+        # so reading first would report the state that lint just superseded.
         freshness = self.vault.read_state("freshness")
         return {
             "vault": str(self.vault.root),
@@ -403,6 +435,7 @@ class BrainkitService:
             "by_branch": dict(sorted(raw_counts.items())),
             "index": self.index.stats(),
             "freshness": _freshness_summary(freshness, present=set(pages)),
+            "projections": self._projection_report(freshness, records),
             "healthy": lint_result["ok"],
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in lint_result["findings"]
@@ -663,6 +696,7 @@ class BrainkitService:
             self.vault.write_generated(view_path, "\n".join(rows) + "\n")
             written.append(view_path)
         self.vault.write_generated("views/home.md", "\n".join(home) + "\n")
+        self._record_projection(VIEWS_PROJECTION)
         return {"written": written}
 
     def graph(self, *, html: bool = False) -> dict[str, Any]:
@@ -678,6 +712,7 @@ class BrainkitService:
                 "graph/graph.html", self.graph_port.export(graph, "html")
             )
             written.append("graph/graph.html")
+        self._record_projection(GRAPH_PROJECTION)
         return {
             "nodes": len(graph["nodes"]),
             "edges": len(graph["edges"]),
@@ -1548,6 +1583,89 @@ class BrainkitService:
 
         return self.vault.mutate_state("freshness", mutate)
 
+    def _record_projection(self, artifact: str) -> None:
+        """Stamp a derived artefact with the inputs it was just built from.
+
+        The page half of the fingerprint is taken inside the mutator, so it is
+        computed from the state the write actually commits: an apply landing
+        between a read and a write cannot leave a projection claiming to cover
+        pages it never saw.
+
+        The registry is read *before* the mutator on purpose. `commit_wiki_batch`
+        takes the registry lock before the freshness lock, and both are blocking
+        `flock`s, so reading the registry while holding freshness would invert
+        the order and deadlock. Reading it first is also the safe direction: a
+        capture landing in between is simply absent from the recorded
+        fingerprint, and the next lint compares against a registry that has it
+        and reports stale. The error can only be a false `stale`, never a false
+        `fresh`.
+        """
+        records = self.vault.registry()
+        raw_fields = PROJECTION_RAW_FIELDS[artifact]
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            projections = state.setdefault("projections", {})
+            projections[artifact] = {
+                "generated_at": utc_now(),
+                "source_hash": _projection_source_hash(
+                    state.get("pages", {}), records, raw_fields
+                ),
+            }
+            return state
+
+        self.vault.mutate_state("freshness", mutate)
+
+    def _projection_report(
+        self, freshness: dict[str, Any], records: dict[str, SourceRecord]
+    ) -> dict[str, Any]:
+        """Compare every derived artefact against the inputs it was built from.
+
+        Three outcomes, and they are not the same thing:
+
+        - `missing` — the artefact is not on disk. Nothing derives from the vault
+          yet, so nothing can be out of date. `bk graph` and `bk views` are
+          on-demand, and a vault that never ran them is not in error.
+        - `stale` — the artefact exists but was built from different inputs, or
+          from an unrecorded set. A projection whose provenance is unknown is
+          treated as out of date rather than trusted.
+        - `fresh` — the recorded fingerprint matches the current inputs.
+
+        Each artefact is compared against its own inputs. A shared fingerprint
+        would have to cover the union, so a change only one artefact renders
+        would age both — and a projection that cries wolf gets ignored, which
+        loses the signal by a different route than having no signal at all.
+        """
+        pages = freshness.get("pages", {})
+        recorded = freshness.get("projections", {})
+        recorded = recorded if isinstance(recorded, dict) else {}
+        now = datetime.now(timezone.utc)
+        report: dict[str, Any] = {}
+        for artifact, anchor in PROJECTION_ANCHORS.items():
+            expected = _projection_source_hash(
+                pages, records, PROJECTION_RAW_FIELDS[artifact]
+            )
+            entry = recorded.get(artifact)
+            entry = entry if isinstance(entry, dict) else {}
+            generated_at = entry.get("generated_at")
+            if not isinstance(generated_at, str):
+                generated_at = None
+            if self.vault.wiki_version(anchor) is None:
+                state = "missing"
+            elif entry.get("source_hash") != expected:
+                state = "stale"
+            else:
+                state = "fresh"
+            item: dict[str, Any] = {
+                "state": state,
+                "stale": state == "stale",
+                "generated_at": generated_at,
+            }
+            age_days = _age_in_days(generated_at, now)
+            if age_days is not None:
+                item["age_days"] = age_days
+            report[artifact] = item
+        return report
+
     def _mechanical_lint(self) -> list[LintFinding]:
         findings: list[LintFinding] = []
         freshness = self._refresh_staleness()
@@ -1689,6 +1807,22 @@ class BrainkitService:
                     "run bk reconcile",
                     severity="warning",
                     path=path,
+                )
+            )
+        # `freshness` is the state `_refresh_staleness` just committed and
+        # `records` the registry this run already read, so the comparison sees
+        # exactly the inputs lint reported on without re-reading either. Note
+        # the fingerprint leaves out the status and age fields that refresh
+        # rewrites on every run, or every lint would invent a stale projection.
+        for artifact, report in self._projection_report(freshness, records).items():
+            if not report["stale"]:
+                continue
+            findings.append(
+                LintFinding(
+                    PROJECTION_LINT_CODES[artifact],
+                    f"Derived {artifact} was built from a different set of wiki "
+                    f"pages; run {PROJECTION_COMMANDS[artifact]}",
+                    severity="warning",
                 )
             )
         return findings
@@ -2083,6 +2217,80 @@ def _freshness_summary(
         status = entry.get("status", "unknown") if isinstance(entry, dict) else "unknown"
         summary[status if status in summary else "unknown"] += 1
     return summary
+
+
+def _fingerprint_row(namespace: str, *fields: str) -> str:
+    """Encode one input row so that no two distinct rows can encode alike.
+
+    The namespace tag comes first, which is what keeps the wiki and raw domains
+    apart: a page path can never land in the position a content hash occupies,
+    so no transposition of one into the other collides. Every field is then
+    length-prefixed, so a separator appearing inside a value cannot fake a field
+    boundary either — `("a", "b:c")` and `("a:b", "c")` stay distinct.
+    """
+    return "|".join([namespace, *(f"{len(field)}:{field}" for field in fields)])
+
+
+def _projection_source_hash(
+    pages: Any,
+    records: dict[str, SourceRecord],
+    raw_fields: tuple[str, ...],
+) -> str:
+    """Fingerprint the inputs a derived artefact is built from.
+
+    Deliberately not mtime. A `git checkout` rewrites every mtime in the working
+    tree, which would call a current graph stale and — after a checkout that
+    restores an old graph — call a stale one current. Content hashes travel with
+    the content, so they survive any clone, checkout or rsync.
+
+    Two input domains, because both artefacts render both: the wiki page set,
+    and the raw registry. A page-only fingerprint let a `bk capture` add a
+    `raw:` node to the graph with nothing reporting it — the exact silent drift
+    this check exists to catch. `raw_fields` names the registry fields the
+    calling artefact actually renders, so a field only one of them shows cannot
+    age the other.
+
+    What stays out: the `status` and `age_days` that `_refresh_staleness`
+    rewrites on every `bk lint`. `age_days` reaches no artefact at all, and
+    while a page's freshness badge does appear in `views/map/*.md`, that badge
+    moves with the clock rather than with anything a user did — folding it in
+    would make `views.stale` appear spontaneously on an untouched vault.
+
+    Serialization is pinned so two processes agree: pages sorted by path, raw
+    records sorted by content hash, pages before raw, newline between rows,
+    UTF-8.
+    """
+    rows: list[str] = []
+    if not isinstance(pages, dict):
+        pages = {}
+    for path in sorted(pages):
+        entry = pages[path]
+        content_hash = entry.get("content_hash") if isinstance(entry, dict) else None
+        if not isinstance(content_hash, str):
+            content_hash = ""
+        rows.append(_fingerprint_row("page", path, content_hash))
+    for content_hash in sorted(records):
+        record = records[content_hash]
+        rows.append(
+            _fingerprint_row(
+                "raw",
+                content_hash,
+                *(str(getattr(record, field)) for field in raw_fields),
+            )
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def _age_in_days(timestamp: str | None, now: datetime) -> int | None:
+    if not timestamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (now - moment).days
 
 
 def _orphaned_freshness(state: dict[str, Any], present: set[str]) -> list[str]:
