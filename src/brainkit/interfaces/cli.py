@@ -9,7 +9,7 @@ import time
 import traceback
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from brainkit import __version__
 from brainkit.application.services import BrainkitService
@@ -80,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
         "apply", help="Validate and atomically stage wiki writes"
     )
     apply_command.add_argument("proposal", help="Proposal JSON path, or - for stdin")
+
+    gate = commands.add_parser(
+        "gate", help="Answer whether a direct write is permitted"
+    )
+    gate_sub = gate.add_subparsers(dest="gate_command", required=True)
+    gate_check = gate_sub.add_parser(
+        "check-write", help="Exit 0 when a direct write is allowed, 2 when denied"
+    )
+    gate_check.add_argument("path", metavar="PATH", help="Path a tool wants to write")
+    gate_check.add_argument(
+        "--agent", default="claude", help="Policy adapter to consult"
+    )
 
     commands.add_parser("views", help="Regenerate Obsidian views")
     graph = commands.add_parser("graph", help="Regenerate the knowledge graph")
@@ -164,7 +176,10 @@ def build_parser() -> argparse.ArgumentParser:
     hooks_install.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite an existing brainkit skill and pre-commit hook",
+        help=(
+            "Overwrite an existing brainkit skill, pre-commit hook and hook "
+            "scripts; settings.json is merged, never overwritten"
+        ),
     )
 
     commands.add_parser("schedule", help="Show configured habit job registrations")
@@ -238,6 +253,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.json = True
     try:
         result = _dispatch(args)
+        if args.command == "gate":
+            # The gate answers with an exit code, and its denial text is prose
+            # for a model rather than the ok/result envelope.
+            return _emit_gate(result, json_mode=args.json)
         if result is not None:
             _emit(result, json_mode=args.json)
         if args.command == "lint" and isinstance(result, dict) and not result["ok"]:
@@ -323,6 +342,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         )
     if args.command == "apply":
         return service.apply(_read_json(args.proposal))
+    if args.command == "gate":
+        return service.gate_check_write(args.path, agent=args.agent)
     if args.command == "views":
         return service.views()
     if args.command == "graph":
@@ -630,6 +651,53 @@ _MANAGED_BLOCK_RE = re.compile(
 )
 
 
+class ClaudeHook(NamedTuple):
+    """A Claude Code hook brainkit ships, installs and registers."""
+
+    template: str
+    event: str
+    matcher: str | None
+    timeout: int
+
+
+CLAUDE_HOOKS: tuple[ClaudeHook, ...] = (
+    ClaudeHook("brainkit-gate", "PreToolUse", "Write|Edit|MultiEdit", 10),
+    # SessionStart carries no matcher so every session source is covered; the
+    # settings schema treats an absent matcher as "all", which is how the other
+    # session-scoped hooks in a real settings file are written.
+    ClaudeHook("brainkit-status", "SessionStart", None, 15),
+)
+HOOK_SENTINEL = "# brainkit:generated"
+
+GATE_DENY_PREFIXES: tuple[str, ...] = ("wiki/", "raw/")
+GATE_REMEDIATION: dict[str, str] = {
+    "wiki/": "Wiki pages are written only by the apply gate. Use: bk apply",
+    "raw/": "Sources are immutable and hash-identified. Use: bk capture",
+}
+
+
+def _agent_policy(agent: str) -> dict[str, Any]:
+    """The adapter file, written as policy the gate reads rather than prose.
+
+    `rules` stays for the human who opens the vault. `gate` is what code reads,
+    which is the whole point: metadata with a consumer stays accurate, and
+    metadata without one rots into something that merely looks like enforcement.
+    """
+    return {
+        "agent": agent,
+        "version": 1,
+        "gate": {
+            "deny_prefixes": list(GATE_DENY_PREFIXES),
+            "remediation": dict(GATE_REMEDIATION),
+        },
+        "rules": [
+            "Read evidence with bk context --json --consumer local",
+            "Write wiki pages only with bk apply",
+            "Never edit raw content",
+        ],
+    }
+
+
 def _agent_template(name: str, vault: Path) -> str:
     resource = files("brainkit").joinpath("templates", "agents", f"{name}.md")
     if not resource.is_file():
@@ -638,6 +706,24 @@ def _agent_template(name: str, vault: Path) -> str:
             details={"template": name},
         )
     return resource.read_text(encoding="utf-8").replace("{{vault}}", str(vault))
+
+
+def _hook_script(name: str, vault: Path) -> str:
+    """Render a shipped hook script with the vault path baked in.
+
+    The path is shell-quoted, not interpolated raw: real vault paths carry
+    spaces and non-ASCII, and a hook that cannot parse its own argument would
+    fail open on every write it was installed to govern.
+    """
+    resource = files("brainkit").joinpath("templates", "agents", f"{name}.sh")
+    if not resource.is_file():
+        raise ValidationError(
+            "Agent hook script is missing from the installation",
+            details={"script": name},
+        )
+    return resource.read_text(encoding="utf-8").replace(
+        "{{vault}}", shlex.quote(str(vault))
+    )
 
 
 def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
@@ -684,11 +770,19 @@ def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]
     return {"path": str(target), "state": state}
 
 
+COMMIT_LINT_OFF = (
+    "Commit-time linting is OFF: nothing runs bk lint --changed, so a page "
+    "written outside the apply gate is only reported when somebody runs bk lint."
+)
+
+
 def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
     """Install the lint hook when the vault is a git repository.
 
     A missing repository is reported rather than raised: the skill and the
-    instructions are useful on their own and have nothing to do with git.
+    instructions are useful on their own and have nothing to do with git. It is
+    reported *loudly* — a bare `{"state": "skipped"}` reads as a detail, and the
+    detail it hides is that a whole enforcement layer does not exist.
     """
     git_dir = root / ".git"
     if not git_dir.is_dir():
@@ -696,6 +790,8 @@ def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, An
             "state": "skipped",
             "reason": "vault is not a git repository",
             "hint": "Run git init in the vault, then install again",
+            "enforcement": "off",
+            "consequence": COMMIT_LINT_OFF,
         }
     hook = git_dir / "hooks" / "pre-commit"
     content = f"#!/bin/sh\nexec bk --vault {json.dumps(str(vault))} lint --changed\n"
@@ -707,6 +803,8 @@ def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, An
             "state": "skipped",
             "reason": "a pre-commit hook already exists",
             "hint": "Merge brainkit lint into it, or re-run with --force",
+            "enforcement": "off",
+            "consequence": COMMIT_LINT_OFF,
         }
     updated = hook.exists()
     hook.parent.mkdir(parents=True, exist_ok=True)
@@ -715,25 +813,245 @@ def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, An
     return {"path": str(hook), "state": "updated" if updated else "created"}
 
 
+def _write_hook_script(
+    root: Path, vault: Path, hook: ClaudeHook, *, force: bool
+) -> dict[str, Any]:
+    """Write one hook script, refusing to clobber a file brainkit did not write.
+
+    The sentinel comment is what makes a rewrite safe: a script carrying it is
+    ours to replace, and a script without it belongs to the operator.
+    """
+    target = root / ".claude" / "hooks" / f"{hook.template}.sh"
+    content = _hook_script(hook.template, vault)
+    existed = target.is_file()
+    if existed:
+        existing = target.read_text(encoding="utf-8")
+        if HOOK_SENTINEL not in existing and not force:
+            return {
+                "path": str(target),
+                "state": "skipped",
+                "reason": "an unmanaged script already occupies this path",
+                "hint": "Move it aside, or re-run with --force",
+            }
+        if existing == content:
+            # The mode, not the bytes, is what silently disables a hook.
+            target.chmod(0o755)
+            return {"path": str(target), "state": "current"}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    target.chmod(0o755)
+    return {"path": str(target), "state": "updated" if existed else "created"}
+
+
+def _hook_command_registered(group: Sequence[Any], command: str) -> bool:
+    """Whether any entry in a settings hook array already runs this command."""
+    for entry in group:
+        if not isinstance(entry, dict):
+            continue
+        commands = entry.get("hooks")
+        if not isinstance(commands, list):
+            continue
+        for item in commands:
+            if isinstance(item, dict) and item.get("command") == command:
+                return True
+    return False
+
+
+def _register_claude_hooks(
+    root: Path, entries: Sequence[tuple[ClaudeHook, str]]
+) -> dict[str, Any]:
+    """Register hook commands in `.claude/settings.json` without clobbering it.
+
+    The file belongs to the operator and routinely carries unrelated tooling on
+    the same events, so this reads, mutates and writes: unknown top-level keys
+    survive, existing arrays are appended to rather than replaced, and a file
+    that does not parse is left exactly as it is instead of being rebuilt. The
+    idempotency key is the hook's command path, so a second install appends
+    nothing and the file stays byte-identical.
+    """
+    target = root / ".claude" / "settings.json"
+    settings: dict[str, Any] = {}
+    existed = target.is_file()
+    if existed:
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return {
+                "path": str(target),
+                "state": "skipped",
+                "reason": f"settings.json is not valid JSON: {exc}",
+                "hint": "Repair the file, then run bk hooks install again",
+            }
+        if not isinstance(parsed, dict):
+            return {
+                "path": str(target),
+                "state": "skipped",
+                "reason": "settings.json is not a JSON object",
+                "hint": "Repair the file, then run bk hooks install again",
+            }
+        settings = parsed
+
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return {
+            "path": str(target),
+            "state": "skipped",
+            "reason": "the hooks key in settings.json is not an object",
+            "hint": "Repair the file, then run bk hooks install again",
+        }
+    for hook, _ in entries:
+        if not isinstance(hooks.get(hook.event, []), list):
+            return {
+                "path": str(target),
+                "state": "skipped",
+                "reason": f"hooks.{hook.event} in settings.json is not an array",
+                "hint": "Repair the file, then run bk hooks install again",
+            }
+
+    registered: list[dict[str, Any]] = []
+    changed = False
+    for hook, command in entries:
+        group = list(hooks.get(hook.event, []))
+        if _hook_command_registered(group, command):
+            registered.append(
+                {"event": hook.event, "command": command, "state": "current"}
+            )
+            continue
+        entry: dict[str, Any] = {}
+        if hook.matcher:
+            entry["matcher"] = hook.matcher
+        entry["hooks"] = [
+            {"type": "command", "command": command, "timeout": hook.timeout}
+        ]
+        group.append(entry)
+        hooks[hook.event] = group
+        registered.append(
+            {"event": hook.event, "command": command, "state": "appended"}
+        )
+        changed = True
+
+    if not changed:
+        return {"path": str(target), "state": "current", "registered": registered}
+    settings["hooks"] = hooks
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return {
+        "path": str(target),
+        "state": "updated" if existed else "created",
+        "registered": registered,
+    }
+
+
+def _install_claude_hook(
+    root: Path, vault: Path, *, force: bool = False
+) -> dict[str, Any]:
+    """Install the Claude Code hooks and register them in settings.json.
+
+    The instructions and the skill *ask* the model to route writes through the
+    apply gate. This is the part that does not depend on the model agreeing: a
+    PreToolUse hook that refuses the write while it is being attempted, and a
+    SessionStart hook that says what the vault looks like before the first one.
+    """
+    scripts: dict[str, Any] = {}
+    registrable: list[tuple[ClaudeHook, str]] = []
+    for hook in CLAUDE_HOOKS:
+        outcome = _write_hook_script(root, vault, hook, force=force)
+        scripts[hook.template] = outcome
+        if outcome["state"] != "skipped":
+            registrable.append((hook, str(outcome["path"])))
+    return {"scripts": scripts, "settings": _register_claude_hooks(root, registrable)}
+
+
+def _enforcement_layer(
+    name: str, mechanism: str, outcome: dict[str, Any], *, active: bool
+) -> dict[str, Any]:
+    layer: dict[str, Any] = {"layer": name, "mechanism": mechanism, "active": active}
+    if not active:
+        for key in ("reason", "hint", "consequence"):
+            if outcome.get(key):
+                layer[key] = outcome[key]
+    return layer
+
+
+def _enforcement_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Name every enforcement layer and say plainly whether it is on.
+
+    An installer that reports only what it managed to write hides the layers it
+    could not, which is exactly how an invariant ends up guarded by nothing at
+    all while the install output still reads like success.
+    """
+    layers: list[dict[str, Any]] = []
+    hook = result.get("claude_hook")
+    if isinstance(hook, dict):
+        settings = hook["settings"]
+        registered = {
+            str(item["command"]) for item in settings.get("registered", [])
+        }
+        for name, template, mechanism in (
+            (
+                "write_gate",
+                "brainkit-gate",
+                "Claude Code PreToolUse hook on Write|Edit|MultiEdit",
+            ),
+            (
+                "session_status",
+                "brainkit-status",
+                "Claude Code SessionStart hook reporting vault state",
+            ),
+        ):
+            script = hook["scripts"][template]
+            active = script["state"] != "skipped" and script["path"] in registered
+            outcome = script if script["state"] == "skipped" else settings
+            layers.append(
+                _enforcement_layer(name, mechanism, outcome, active=active)
+            )
+    pre_commit = result["pre_commit"]
+    layers.append(
+        _enforcement_layer(
+            "commit_lint",
+            ".git/hooks/pre-commit running bk lint --changed",
+            pre_commit,
+            active=pre_commit["state"] != "skipped",
+        )
+    )
+    layers.append(
+        {
+            "layer": "instructions",
+            "mechanism": f"{INSTRUCTION_FILES[result['agent']]} managed block",
+            "active": True,
+            "advisory": True,
+        }
+    )
+    return {
+        "layers": layers,
+        "inactive": [layer["layer"] for layer in layers if not layer["active"]],
+    }
+
+
+def _warn_about_inactive_enforcement(enforcement: dict[str, Any]) -> None:
+    """Put every missing enforcement layer on stderr, where it cannot be piped away."""
+    inactive = [layer for layer in enforcement["layers"] if not layer["active"]]
+    if not inactive:
+        return
+    print("", file=sys.stderr)
+    print("bk: ENFORCEMENT GAP - these layers are NOT active:", file=sys.stderr)
+    for layer in inactive:
+        print(f"  - {layer['layer']}: {layer['mechanism']}", file=sys.stderr)
+        for key in ("reason", "consequence", "hint"):
+            if layer.get(key):
+                print(f"      {layer[key]}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def _install_hooks(
     service: BrainkitService, agent: str, *, force: bool = False
 ) -> dict[str, Any]:
     root = service.vault.root
     adapter_path = f".brain/agent-{agent}.json"
     service.vault.write_generated(
-        adapter_path,
-        json.dumps(
-            {
-                "agent": agent,
-                "rules": [
-                    "Read evidence with bk context --json --consumer local",
-                    "Write wiki pages only with bk apply",
-                    "Never edit raw content",
-                ],
-            },
-            indent=2,
-        )
-        + "\n",
+        adapter_path, json.dumps(_agent_policy(agent), indent=2) + "\n"
     )
     result: dict[str, Any] = {
         "agent": agent,
@@ -743,6 +1061,9 @@ def _install_hooks(
     }
     if agent == "claude":
         result["skill"] = _install_skill(root, root, force=force)
+        result["claude_hook"] = _install_claude_hook(root, root, force=force)
+    result["enforcement"] = _enforcement_summary(result)
+    _warn_about_inactive_enforcement(result["enforcement"])
     return result
 
 
@@ -800,6 +1121,28 @@ def _emit(value: Any, *, json_mode: bool) -> None:
         print(f"\nSaved to {value['path']}")
         return
     print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def _emit_gate(decision: Any, *, json_mode: bool) -> int:
+    """Report a gate decision and return the process exit code.
+
+    Exit 0 is allowed and exit 2 is denied, so a hook can branch on the status
+    alone. The denial text goes to stderr because that is the stream a Claude
+    Code hook feeds back to the model.
+    """
+    if not isinstance(decision, dict) or "allowed" not in decision:
+        raise InternalError("The gate returned no decision")
+    allowed = bool(decision["allowed"])
+    if json_mode:
+        print(json.dumps(decision, ensure_ascii=False))
+    elif allowed:
+        print(f"allowed: {decision.get('path', '')}")
+    else:
+        reason = str(decision.get("reason") or "This write is not permitted")
+        remediation = str(decision.get("remediation") or "")
+        line = f"bk: {reason} {remediation}".rstrip()
+        print(line, file=sys.stderr)
+    return 0 if allowed else 2
 
 
 def _internal_error(exc: BaseException) -> InternalError:
