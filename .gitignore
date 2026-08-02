@@ -9,6 +9,14 @@ htmlcov/
 build/
 dist/
 .venv/
+env/
 work/
 outputs/
+
+# Agent scaffolding: worktrees nested in the repo would otherwise be staged as
+# broken gitlinks by `git add -A`. Only worktrees — .claude/settings.json and
+# .claude/skills are legitimate tracked content.
+.claude/worktrees/
+
+.DS_Store
 
