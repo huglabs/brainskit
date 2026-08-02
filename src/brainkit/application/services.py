@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from brainkit.application.gate import check_write
 from brainkit.application.ports import (
     GraphPort,
     IntegrationPort,
@@ -82,6 +83,10 @@ class BrainkitService:
         self.jobs = jobs
         self.graph_port = graph
         self.integration_port = integrations
+
+    def gate_check_write(self, target: str, *, agent: str = "claude") -> dict[str, Any]:
+        """Decide whether a direct write to ``target`` is allowed by the gate."""
+        return check_write(self.vault.root, target, agent=agent).to_dict()
 
     def capture(
         self, source: str | None, *, text: str | None = None, title: str | None = None
