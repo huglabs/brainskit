@@ -37,6 +37,7 @@ editorial changes, but only the deterministic `bk apply` gate can write the
 - [Vault layout](#vault-layout)
 - [Command reference](#command-reference)
 - [The privacy boundary](#the-privacy-boundary)
+- [The code graph](#the-code-graph)
 - [Persistent integrations](#persistent-integrations)
 - [Web viewer](#web-viewer)
 - [MCP over the network](#mcp-over-the-network)
@@ -160,6 +161,21 @@ uv tool install '/path/to/brainkit[postgres]'
 # or both
 uv tool install '/path/to/brainkit[integrations]'
 ```
+
+Two further extras are optional for the same reason — the core keeps a single
+dependency, and neither capability is one every vault wants:
+
+```bash
+uv tool install '/path/to/brainkit[code]'     # bk code: tree-sitter grammars, ~70 MB
+uv tool install '/path/to/brainkit[convert]'  # capture .docx/.pdf/.pptx via markitdown
+```
+
+`code` is the larger commitment: vendoring the analysis source did not vendor a
+parser, so the grammars stay compiled wheels and remain a real dependency. A
+`bk code` command without it fails with the install hint rather than a stack
+trace, and the code-graph tests skip rather than fail — so a vault that never
+reads a repository never pays for one. Without `convert`, a non-text capture is
+stored verbatim with a "no converter available" note rather than being refused.
 
 The same target accepts a built wheel or the repository over HTTPS, which
 resolves through the git credential helper and pins the installed commit:
@@ -386,10 +402,15 @@ switches to machine-readable output.
 | `search QUERY [--limit N] [--consumer C]` | FTS5 BM25 search |
 | `context QUERY [--limit N] [--max-chars N] [--consumer C]` | Bounded evidence bundle |
 | `apply PROPOSAL\|-` | Validate and atomically commit wiki writes |
+| `gate check-write PATH [--agent A]` | Whether a direct write to `PATH` is permitted |
 | `views` · `graph [--html]` | Regenerate views and the knowledge graph |
+| `code build [PATH …]` · `code import` · `code status` | Extract the repository graph, import one, re-check it — `build` needs `[code]` |
+| `code affected` · `code path` · `code hubs` | Queries over that graph, on the base install |
+| `code communities` · `code cycles` · `code diff` | Delegated to the vendored analysis — needs `[code]` |
 | `export --target T [--consumer C]` | Export to `json`, `graphml`, `cypher`, `obsidian`, `neo4j`, `postgres`, `kuzu`, `llms-txt` |
 | `proposals [--status S]` · `approve ID` · `reject ID --reason R` | Filing review queue |
 | `integration configure\|status\|up\|down\|sync NAME` | Persistent integration lifecycle |
+| `vaults register\|list\|forget\|sync` | The vaults on this machine, synced into one shared store |
 | `web serve [--host H] [--port P] [--consumer C] [--token-env V]` | Foreground web viewer |
 | `serve --mcp [--transport stdio\|http] …` | MCP transports |
 | `watch [--once] [--interval S]` | Capture new files under the configured source folders, minus `ignore` |
@@ -430,6 +451,46 @@ same reason `search` and `context` report `redacted` as a count and never
 describe what was withheld: the bundle `context` returns is the payload handed
 to a cloud model, and naming a withheld source there would defeat the boundary
 that dropped it.
+
+## The code graph
+
+`bk code` describes the repository a vault documents, so a question about the
+code is answered from its structure rather than from a grep.
+
+Only two things need the `[code]` extra, and they need different halves of it:
+`build` needs the tree-sitter grammars to extract, and `communities`, `cycles`
+and `diff` need networkx for the vendored analysis. Everything else — `import`,
+`status`, `affected`, `path`, `hubs` — reads the stored graph and runs on the
+base install, so a graph extracted elsewhere can be imported and queried with
+no extra at all. A command that does need it fails with the install hint rather
+than a stack trace.
+
+```bash
+bk code build                     # extract in-process and store graph/code.json
+bk code import GRAPH.json         # or take one an external extractor produced
+bk code status                    # does the stored graph still describe the tree?
+bk code affected SYMBOL           # what breaks if this changes
+bk code path FROM TO              # shortest chain of edges between two symbols
+bk code hubs                      # the most connected symbols
+bk code communities               # structurally cohesive clusters
+bk code cycles                    # import cycles among files
+bk code diff                      # what changed structurally since the stored graph
+```
+
+`code_root` is read from `.brain/config.json`, is relative to the vault, and is
+discovered upward when absent. An explicitly empty string means the vault root,
+for a vault that sits at the top of the repository it documents — the same
+absent-versus-empty rule the `ignore` patterns follow. The vault's own
+directories are excluded from the graph: an extractor pointed at the repository
+has no idea one of those folders is the vault asking the question, and left in
+they arrive as the most connected nodes in it.
+
+`build` and `import` share one importer, so a graph from an external extractor
+is normalised on the way in rather than trusted as given. `communities`,
+`cycles` and `diff` are the three questions brainkit does not answer itself and
+are delegated to the vendored analysis; `affected`, `path` and `hubs` use
+brainkit's own traversal, which needs no dependency and already answers under a
+`--consumer`.
 
 ## Persistent integrations
 
