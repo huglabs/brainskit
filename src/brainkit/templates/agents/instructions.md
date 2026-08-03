@@ -1,7 +1,21 @@
 ## brainkit vault
 
-This project is a brainkit vault at `{{vault}}`. Markdown and JSON are the
-source of truth; the SQLite FTS5 index is disposable and rebuilt on demand.
+This project is a brainkit vault at `{{vault}}` — or contains one at that
+path, if it is a subdirectory below this file rather than this project's
+root. Markdown and JSON are the source of truth; the SQLite FTS5 index is
+disposable and rebuilt on demand.
+
+### If the vault is nested below this project
+
+`bk hooks install` can be pointed at a project root with `--root` while the
+vault itself lives in a subdirectory, which is the case whenever `{{vault}}`
+above differs from where this file sits. `.claude/`, this file and the git
+`pre-commit` hook belong to the project (the workspace); `.brain/` and the
+graph belong to the vault. The resolved workspace is recorded in
+`.brain/agent-claude.json` inside the vault — nothing else on disk remembers
+it — and `bk status` reads it from there to confirm the installed hooks are
+actually loaded by an agent opened on this project rather than silently
+guarding a directory nobody reads.
 
 ### How the graph is formed
 
@@ -56,8 +70,38 @@ name it explicitly only when the operator asked for unrestricted evidence.
   PreToolUse hook asks it before every file write.
 - Run `bk reconcile` after moving or deleting files outside the tooling. It
   re-links moved sources by hash and drops freshness entries whose page is gone.
+- Drop a source you no longer want with `bk forget ITEM` (add `--force` if the
+  raw file is still on disk). That is this vault's own registry — unrelated to
+  `bk vaults forget`, which unregisters a whole vault from this machine and
+  never touches its files.
+- `bk watch` only captures new files outside the patterns in `.brain/config.json`'s
+  `ignore` list (version-control metadata, dependency and build directories by
+  default). Edit that list rather than fighting the watcher.
 - A failed apply writes nothing, and an interrupted one is rolled back when the
   vault is next opened.
+
+### The code graph
+
+`bk code` is a second graph, alongside the vault's own — one describing this
+repository's code rather than its evidence. It is never confused with `bk
+graph`: that regenerates `graph/graph.json` from the vault; `bk code build`
+extracts `graph/code.json` from `code_root` (read from `.brain/config.json`,
+discovered upward when unset, always excluding the vault's own directories).
+
+- `bk code build [PATH …]` extracts in-process and stores the graph; scoped to
+  `PATH`s, it merges that subset into what is already stored instead of
+  replacing it. `bk code import GRAPH.json` takes one an external extractor
+  produced instead, through the same boundary.
+- `bk code status` says whether the stored graph still describes the tree.
+- `bk code affected SYMBOL`, `bk code path FROM TO` and `bk code hubs` are
+  brainkit's own traversal and need no extra dependency.
+- `bk code communities`, `bk code cycles` and `bk code diff` are delegated to
+  the vendored analysis and need the `code` extra's `networkx`; `build` needs
+  the extra's tree-sitter grammars instead. A command that needs the extra and
+  lacks it fails with the install hint, never a stack trace.
+
+Every code-graph read defaults to `--consumer local`, because it carries
+repository paths and is not meant to leave the machine.
 
 ### Exporting the graph
 
@@ -81,3 +125,14 @@ Persistent integrations carry their own configured consumer, and passing
 - **PostgreSQL** — portable `nodes`/`edges` tables with JSONB properties,
   foreign keys and a recursive `graph_walk(start_node, max_depth)` function. No
   graph extension required. Consumer is mandatory.
+
+### Other vaults on this machine
+
+`bk vaults` is unrelated to this vault's own commands: it manages the list of
+vaults registered on this machine (`bk vaults register|list|forget`) and syncs
+all of them into one shared store as a set (`bk vaults sync --target
+postgres|neo4j|obsidian`). Each vault keeps its own policy — one that has not
+enabled the target is skipped, not enabled on its behalf — and one vault
+failing does not stop the rest. This group is CLI-only, unlike `bk
+integration`, and is not exposed over MCP: an MCP server answers under one
+vault's declared boundary, and reaching into unrelated vaults would widen it.

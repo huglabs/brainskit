@@ -5,6 +5,11 @@ description: Read and write a brainkit vault — a local-first second brain wher
 
 # brainkit
 
+Read `CLAUDE.md` in this project before your first `bk` call. It states the
+full vault contract this skill assumes — how the graph is formed, the privacy
+model, and, when the vault sits in a subdirectory rather than at this
+project's root, where the two paths diverge.
+
 The vault at `{{vault}}` is a compiled knowledge base. `raw/` holds immutable
 evidence, `wiki/` holds pages compiled from that evidence, and every page must
 cite the source hashes it was built from. SQLite FTS5 is a disposable index.
@@ -87,6 +92,36 @@ not its body, not its name.
 | Answer from the vault | `bk --vault {{vault}} ask "Q" --json` |
 | Check integrity | `bk --vault {{vault}} lint --json` |
 | Heal state after manual moves/deletes | `bk --vault {{vault}} reconcile --json` |
+| Drop one source record | `bk --vault {{vault}} forget ITEM --json` |
 | Vault health | `bk --vault {{vault}} status --json` |
 
-Read `CLAUDE.md` for how the graph is formed and where it can be exported.
+`forget` needs `--force` when the raw file is still on disk. It drops one
+source from this vault's own registry — not `bk vaults forget`, which
+unregisters a whole vault from this machine and never touches its files.
+
+## The code graph
+
+A question about this repository's own code — not the vault's evidence — is
+`bk code`, answered from structure rather than a grep:
+
+| Goal | Command |
+| --- | --- |
+| Extract or refresh the graph | `bk --vault {{vault}} code build [PATH …] --json` |
+| Is it still accurate? | `bk --vault {{vault}} code status --json` |
+| What breaks if this changes | `bk --vault {{vault}} code affected SYMBOL --json` |
+| Shortest chain between two symbols | `bk --vault {{vault}} code path FROM TO --json` |
+| Most connected symbols | `bk --vault {{vault}} code hubs --json` |
+| Structural clusters | `bk --vault {{vault}} code communities --json` |
+| Import cycles among files | `bk --vault {{vault}} code cycles --json` |
+| What changed structurally | `bk --vault {{vault}} code diff --json` |
+
+Given `PATH`s, `build` merges that subset into the stored graph instead of
+replacing it. `build`, `communities`, `cycles` and `diff` need the `code`
+extra installed (`pip install brainkit[code]`); `import`, `status`,
+`affected`, `path` and `hubs` read the stored graph and need nothing extra. A
+command that needs the extra and lacks it fails with the install hint, never a
+stack trace. Every code-graph read defaults to `--consumer local` — it carries
+repository paths and is not meant to leave the machine.
+
+Read `CLAUDE.md` for how the vault's own graph is formed and where it can be
+exported.
