@@ -1,0 +1,22 @@
+Brainkit
+Copyright 2026 the Brainkit contributors.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+
+This product includes software developed by the Graphify project.
+
+  Graphify
+  Copyright 2026 Safi Shamsi and the Graphify contributors.
+  https://github.com/Graphify-Labs/graphify
+  Licensed under the Apache License, Version 2.0.
+
+  Portions of Graphify were contributed under the MIT License prior to its
+  relicensing and remain available under those terms. That license text is
+  retained at src/brainkit/infrastructure/codeanalysis/LICENSE-MIT.
+
+The vendored subset, the upstream revision it was taken from, and the changes
+made to it are recorded in:
+
+  src/brainkit/infrastructure/codeanalysis/NOTICE

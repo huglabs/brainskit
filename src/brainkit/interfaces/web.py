@@ -11,6 +11,57 @@ from urllib.parse import parse_qs, urlparse
 from brainkit.application.services import BrainkitService
 from brainkit.domain.model import BrainkitError, ValidationError
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def build_server(
+    service: BrainkitService,
+    *,
+    host: str,
+    port: int,
+    consumer: str,
+    token: str | None = None,
+    instance_id: str = "",
+    allowed_origins: list[str] | None = None,
+) -> BrainkitWebServer:
+    """Validate the policy and return a configured, unstarted server.
+
+    Every caller goes through here, tests included. The handler reads five
+    attributes off the server, and a caller that assembles one by hand gets a
+    request-time `AttributeError` for whichever it forgets — which is how a
+    security check can be added to the handler and silently not reach a test.
+    """
+
+    # 0 is not a port, it is a request for an ephemeral one. Refusing it would
+    # push every caller that wants a free port — tests above all — into
+    # assembling the server by hand, which is what this function exists to stop.
+    if port != 0 and not 1 <= port <= 65535:
+        raise ValidationError("Web viewer port must be between 1 and 65535")
+    if consumer not in {"human", "local", "cloud"}:
+        raise ValidationError("Web viewer consumer is invalid")
+    if host not in LOOPBACK_HOSTS and not token:
+        raise ValidationError(
+            "Remote web viewer binding requires --token-env with a populated variable"
+        )
+    server = BrainkitWebServer((host, port), BrainkitWebHandler)
+    # Bound to port 0, the real port is only known after binding — and it is
+    # what the default origins have to name.
+    resolved_port = server.server_port
+    # Same default as the MCP endpoint: the origins the viewer is actually
+    # served from. A same-origin GET sends no Origin at all, so this only has
+    # to cover the requests a browser does label.
+    origins = set(allowed_origins or ()) or {
+        f"http://127.0.0.1:{resolved_port}",
+        f"http://localhost:{resolved_port}",
+    }
+    server.service = service
+    server.consumer = consumer
+    server.token = token
+    server.instance_id = instance_id
+    server.allowed_origins = origins
+    server.allowed_hosts = _allowed_hosts(host, origins)
+    return server
+
 
 def run_web(
     service: BrainkitService,
@@ -20,25 +71,46 @@ def run_web(
     consumer: str,
     token_env: str = "",
     instance_id: str = "",
+    allowed_origins: list[str] | None = None,
 ) -> None:
-    if not 1 <= port <= 65535:
-        raise ValidationError("Web viewer port must be between 1 and 65535")
-    if consumer not in {"human", "local", "cloud"}:
-        raise ValidationError("Web viewer consumer is invalid")
-    token = os.environ.get(token_env) if token_env else None
-    if host not in {"127.0.0.1", "localhost", "::1"} and not token:
-        raise ValidationError(
-            "Remote web viewer binding requires --token-env with a populated variable"
-        )
-    server = BrainkitWebServer((host, port), BrainkitWebHandler)
-    server.service = service
-    server.consumer = consumer
-    server.token = token
-    server.instance_id = instance_id
+    server = build_server(
+        service,
+        host=host,
+        port=port,
+        consumer=consumer,
+        token=os.environ.get(token_env) if token_env else None,
+        instance_id=instance_id,
+        allowed_origins=allowed_origins,
+    )
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
         server.server_close()
+
+
+def _allowed_hosts(host: str, allowed_origins: set[str]) -> set[str]:
+    """Host names this server will answer to.
+
+    The loopback bind is the case that matters. It is the documented default
+    and it needs no token, so the only thing standing between a web page and
+    the vault is that the page cannot reach 127.0.0.1 — which DNS rebinding
+    defeats by pointing its own name at it. The browser then sends
+    `Host: attacker.example`, so comparing the host is what actually refuses
+    the request; the Origin header cannot, because a same-origin GET carries
+    none at all.
+
+    Hostnames named through --allowed-origin are accepted too, so an operator
+    who fronts the viewer with a real name does not have to pass it twice.
+    """
+
+    names = {host.strip("[]").lower()}
+    if host in LOOPBACK_HOSTS:
+        names |= LOOPBACK_HOSTS
+    for origin in allowed_origins:
+        hostname = urlparse(origin).hostname
+        if hostname:
+            names.add(hostname.lower())
+    return names
 
 
 class BrainkitWebServer(ThreadingHTTPServer):
@@ -48,13 +120,30 @@ class BrainkitWebServer(ThreadingHTTPServer):
     consumer: str
     token: str | None
     instance_id: str
+    allowed_origins: set[str]
+    allowed_hosts: set[str]
 
 
 class BrainkitWebHandler(BaseHTTPRequestHandler):
     server: BrainkitWebServer
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        # Ahead of the route table, and ahead of health: a rebound page must
+        # not be able to confirm a viewer is even running here, let alone read
+        # a vault whose consumer is `human` and therefore withholds nothing.
+        if not self._host_allowed():
+            self._send_json(
+                {"ok": False, "error": {"code": "host_denied"}},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+        if not self._origin_allowed():
+            self._send_json(
+                {"ok": False, "error": {"code": "origin_denied"}},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
         if parsed.path in {"/", "/index.html"}:
             self._send_html(WEB_VIEWER_HTML)
             return
@@ -140,7 +229,8 @@ class BrainkitWebHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "result": value})
 
-    def log_message(self, format: str, *args: Any) -> None:
+    # `format` is BaseHTTPRequestHandler's parameter name, not ours.
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
 
     def _authorized(self) -> bool:
@@ -149,6 +239,32 @@ class BrainkitWebHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(
             self.headers.get("Authorization", ""), f"Bearer {self.server.token}"
         )
+
+    def _host_allowed(self) -> bool:
+        """Refuse a request addressed to a name this server does not serve.
+
+        A missing Host is refused rather than waved through: HTTP/1.1 requires
+        it, so its absence is not a browser reaching a local viewer.
+        """
+
+        header = self.headers.get("Host")
+        if not header:
+            return False
+        hostname = urlparse(f"//{header}").hostname
+        if hostname is None:
+            return False
+        return hostname.lower() in self.server.allowed_hosts
+
+    def _origin_allowed(self) -> bool:
+        """Mirror the MCP endpoint: an absent Origin is fine, a foreign one is not.
+
+        This is the cross-origin half. It cannot carry the rebinding case on
+        its own — see `_allowed_hosts` — but it stops a page that simply asks
+        the browser for the vault from a different origin.
+        """
+
+        origin = self.headers.get("Origin")
+        return origin is None or origin in self.server.allowed_origins
 
     def _send_json(
         self, value: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK

@@ -12,9 +12,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Sequence
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import urlopen
@@ -295,6 +296,8 @@ class NativeIntegrations:
         try:
             from neo4j import (  # type: ignore[import-not-found]
                 GraphDatabase,
+            )
+            from neo4j import (
                 exceptions as neo4j_exceptions,
             )
         except ImportError as exc:
@@ -306,7 +309,7 @@ class NativeIntegrations:
         uri = str(policy.options["uri"])
         user = str(policy.options["user"])
         database = str(policy.options.get("database", "neo4j"))
-        vault_id = hashlib.sha256(str(self.vault.root).encode("utf-8")).hexdigest()[:24]
+        vault_id = _vault_id(self.vault.root)
         nodes = [
             {
                 **dict(node),
@@ -375,9 +378,17 @@ class NativeIntegrations:
             ) from exc
         schema = _sql_identifier(str(policy.options.get("schema", "brainkit")))
         dsn = _postgres_dsn(policy)
+        vault_id = _vault_id(self.vault.root)
+        # Stored ids carry the vault namespace exactly as the Neo4j export's do.
+        # One schema holds every vault pointed at it, while the graph's natural
+        # ids (`page:<path>`, `raw:<hash>`) are only unique within a vault --
+        # `page:wiki/index.md` exists in all of them. The natural id is not lost:
+        # `properties` is the untouched node, so it stays readable as
+        # properties->>'id'.
         nodes = [
             (
-                node["id"],
+                f'{vault_id}:{node["id"]}',
+                vault_id,
                 node["label"],
                 node["kind"],
                 node["path"],
@@ -387,8 +398,9 @@ class NativeIntegrations:
         ]
         edges = [
             (
-                edge["source"],
-                edge["target"],
+                f'{vault_id}:{edge["source"]}',
+                f'{vault_id}:{edge["target"]}',
+                vault_id,
                 edge["type"],
                 json.dumps(edge, ensure_ascii=False),
             )
@@ -406,20 +418,32 @@ class NativeIntegrations:
         ):
             with psycopg.connect(dsn) as connection:
                 with connection.cursor() as cursor:
-                    for statement in _postgres_schema_statements(schema):
-                        cursor.execute(statement)
-                    cursor.execute(f'DELETE FROM "{schema}".edges')
-                    cursor.execute(f'DELETE FROM "{schema}".nodes')
+                    for statement, parameters in _postgres_schema_statements(
+                        schema, vault_id
+                    ):
+                        cursor.execute(statement, parameters or None)
+                    # Every delete names this vault. An unscoped refresh would
+                    # take the whole schema with it, which is another
+                    # application's data, not just another copy of ours. Edges
+                    # go first so the foreign key back to `nodes` still holds.
+                    cursor.execute(
+                        f'DELETE FROM "{schema}".edges WHERE vault_id = %s',
+                        (vault_id,),
+                    )
+                    cursor.execute(
+                        f'DELETE FROM "{schema}".nodes WHERE vault_id = %s',
+                        (vault_id,),
+                    )
                     cursor.executemany(
                         f'INSERT INTO "{schema}".nodes '
-                        '(id, label, kind, path, properties) '
-                        'VALUES (%s, %s, %s, %s, %s::jsonb)',
+                        '(id, vault_id, label, kind, path, properties) '
+                        'VALUES (%s, %s, %s, %s, %s, %s::jsonb)',
                         nodes,
                     )
                     cursor.executemany(
                         f'INSERT INTO "{schema}".edges '
-                        '(source, target, type, properties) '
-                        'VALUES (%s, %s, %s, %s::jsonb)',
+                        '(source, target, vault_id, type, properties) '
+                        'VALUES (%s, %s, %s, %s, %s::jsonb)',
                         edges,
                     )
         return {
@@ -428,6 +452,7 @@ class NativeIntegrations:
             "nodes": len(nodes),
             "edges": len(edges),
             "schema": schema,
+            "vault_id": vault_id,
         }
 
     def _database_up(
@@ -803,31 +828,108 @@ def _postgres_dsn(policy: IntegrationPolicy) -> str:
     return f"postgresql://{user}:{password}@127.0.0.1:{port}/{database}"
 
 
-def _postgres_schema_statements(schema: str) -> list[str]:
+def _postgres_schema_statements(
+    schema: str, vault_id: str
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Statements that bring a fresh and an already-deployed schema to one shape.
+
+    `CREATE TABLE IF NOT EXISTS` is inert against a table that already exists, so
+    it can create `vault_id` but never add it. Every column later statements rely
+    on is therefore also stated as `ALTER ... ADD COLUMN IF NOT EXISTS`, which is
+    a no-op on a fresh table and the actual migration on a deployed one. Both
+    orders converge, and re-running changes nothing.
+
+    The backfill adopts pre-existing rows into the syncing vault. That is sound
+    precisely because of the defect being fixed: the old refresh emptied both
+    tables outright, so whatever is on disk is exactly one vault's last complete
+    sync and never a mixture. Those rows are then replaced by the scoped delete
+    on this same run, leaving no unreclaimable debris behind -- which a sentinel
+    like 'unknown' would, since no vault's delete would ever name it.
+    """
     namespace = f'"{schema}"'
+    empty: tuple[str, ...] = ()
     return [
-        f"CREATE SCHEMA IF NOT EXISTS {namespace}",
-        f"""CREATE TABLE IF NOT EXISTS {namespace}.nodes(
+        (f"CREATE SCHEMA IF NOT EXISTS {namespace}", empty),
+        (
+            f"""CREATE TABLE IF NOT EXISTS {namespace}.nodes(
             id text PRIMARY KEY,
+            vault_id text NOT NULL,
             label text NOT NULL,
             kind text NOT NULL,
             path text NOT NULL,
             properties jsonb NOT NULL DEFAULT '{{}}'::jsonb
         )""",
-        f"""CREATE TABLE IF NOT EXISTS {namespace}.edges(
+            empty,
+        ),
+        (
+            f"""CREATE TABLE IF NOT EXISTS {namespace}.edges(
             source text NOT NULL REFERENCES {namespace}.nodes(id) ON DELETE CASCADE,
             target text NOT NULL REFERENCES {namespace}.nodes(id) ON DELETE CASCADE,
+            vault_id text NOT NULL,
             type text NOT NULL,
             properties jsonb NOT NULL DEFAULT '{{}}'::jsonb,
             PRIMARY KEY(source, target, type)
         )""",
-        f"CREATE INDEX IF NOT EXISTS brainkit_edges_source_idx ON {namespace}.edges(source)",
-        f"CREATE INDEX IF NOT EXISTS brainkit_edges_target_idx ON {namespace}.edges(target)",
-        f"CREATE INDEX IF NOT EXISTS brainkit_nodes_properties_idx ON {namespace}.nodes USING gin(properties)",
-        f"""CREATE OR REPLACE FUNCTION {namespace}.graph_walk(
+            empty,
+        ),
+        (
+            f"ALTER TABLE {namespace}.nodes ADD COLUMN IF NOT EXISTS vault_id text",
+            empty,
+        ),
+        (
+            f"ALTER TABLE {namespace}.edges ADD COLUMN IF NOT EXISTS vault_id text",
+            empty,
+        ),
+        (
+            f"UPDATE {namespace}.nodes SET vault_id = %s WHERE vault_id IS NULL",
+            (vault_id,),
+        ),
+        (
+            f"UPDATE {namespace}.edges SET vault_id = %s WHERE vault_id IS NULL",
+            (vault_id,),
+        ),
+        (
+            f"ALTER TABLE {namespace}.nodes ALTER COLUMN vault_id SET NOT NULL",
+            empty,
+        ),
+        (
+            f"ALTER TABLE {namespace}.edges ALTER COLUMN vault_id SET NOT NULL",
+            empty,
+        ),
+        (
+            f"CREATE INDEX IF NOT EXISTS brainkit_nodes_vault_idx ON {namespace}.nodes(vault_id)",
+            empty,
+        ),
+        (
+            f"CREATE INDEX IF NOT EXISTS brainkit_edges_vault_idx ON {namespace}.edges(vault_id)",
+            empty,
+        ),
+        (
+            f"CREATE INDEX IF NOT EXISTS brainkit_edges_source_idx ON {namespace}.edges(source)",
+            empty,
+        ),
+        (
+            f"CREATE INDEX IF NOT EXISTS brainkit_edges_target_idx ON {namespace}.edges(target)",
+            empty,
+        ),
+        (
+            f"CREATE INDEX IF NOT EXISTS brainkit_nodes_properties_idx ON {namespace}.nodes USING gin(properties)",
+            empty,
+        ),
+        # graph_walk needs no vault predicate, and deliberately keeps its
+        # two-argument signature. Every stored id is prefixed with the vault
+        # namespace, so `edge.source = walk.node_id` can only match an edge
+        # belonging to the same vault as start_node: a walk cannot leave the
+        # vault it started in. Isolation holds by construction rather than by
+        # the caller remembering to filter -- which also means a caller must
+        # pass the prefixed id, not the natural one.
+        (
+            f"""CREATE OR REPLACE FUNCTION {namespace}.graph_walk(
             start_node text, max_depth integer DEFAULT 3
         ) RETURNS TABLE(node_id text, depth integer, path text[])
         LANGUAGE sql STABLE AS $$
+        -- start_node is the stored id, '<vault_id>:<natural id>'. The prefix is
+        -- what confines the walk to one vault; see _postgres_schema_statements.
         WITH RECURSIVE walk(node_id, depth, path) AS (
             SELECT start_node, 0, ARRAY[start_node]
             UNION ALL
@@ -836,6 +938,8 @@ def _postgres_schema_statements(schema: str) -> list[str]:
             WHERE walk.depth < max_depth AND NOT edge.target = ANY(walk.path)
         ) SELECT * FROM walk
         $$""",
+            empty,
+        ),
     ]
 
 
@@ -853,6 +957,23 @@ def _safe_subdirectory(value: str) -> str:
     if value and (pure.is_absolute() or ".." in pure.parts):
         raise ValidationError("Obsidian subdirectory is invalid")
     return pure.as_posix() if pure.parts else ""
+
+
+def vault_id(root: Path) -> str:
+    """The namespace every shared graph target uses to tell vaults apart.
+
+    Both graph backends write into a store an operator may point several vaults
+    at, so the two must agree on this value exactly; deriving it in one place is
+    what keeps them from drifting apart. The machine-level vault registry
+    reports it too, which is why it carries a public name: an operator reading
+    rows out of a shared schema has to be able to say which vault wrote them.
+    """
+    return hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:24]
+
+
+# The in-module spelling, kept so the call sites and the tests that pin this
+# behaviour do not have to move. New callers should use `vault_id`.
+_vault_id = vault_id
 
 
 def _container_name(root: Path, name: str, options: dict[str, Any]) -> str:

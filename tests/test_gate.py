@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -203,7 +204,9 @@ class GateDecisionShapeTest(GateFixture):
 
     def test_decisions_are_frozen(self) -> None:
         decision = self.decide("wiki/index.md")
-        with self.assertRaises(Exception):
+        # A frozen dataclass raises FrozenInstanceError, not any exception:
+        # asserting the precise type is what proves the field is really frozen.
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             decision.allowed = True  # type: ignore[misc]
 
 

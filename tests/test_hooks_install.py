@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -394,7 +395,10 @@ class EnforcementReportTest(VaultCase):
         warning = buffer.getvalue()
         self.assertIn("ENFORCEMENT GAP", warning)
         self.assertIn("commit_lint", warning)
-        self.assertIn("vault is not a git repository", warning)
+        # The message names the directory it looked in, because with --root
+        # that is no longer necessarily the vault.
+        self.assertIn(f"{self.root} is not a git repository", warning)
+        self.assertIn("--root", warning)
 
     def test_an_existing_pre_commit_hook_reports_the_gap_too(self) -> None:
         hooks = self.root / ".git" / "hooks"
@@ -433,7 +437,8 @@ class EnforcementReportTest(VaultCase):
         stored = json.loads(
             (self.root / result["adapter"]).read_text(encoding="utf-8")
         )
-        self.assertEqual(stored["version"], 1)
+        self.assertEqual(stored["version"], 2)
+        self.assertEqual(stored["workspace"], str(self.root))
         self.assertEqual(stored["gate"]["deny_prefixes"], ["wiki/", "raw/"])
         self.assertIn("bk apply", stored["gate"]["remediation"]["wiki/"])
         self.assertIn("bk capture", stored["gate"]["remediation"]["raw/"])
@@ -911,6 +916,169 @@ class PackagingTest(unittest.TestCase):
         shipped = {path.name for path in templates.glob("*.sh")}
         expected = {f"{hook.template}.sh" for hook in cli.CLAUDE_HOOKS}
         self.assertEqual(shipped, expected)
+
+
+class NestedVaultWorkspaceTest(unittest.TestCase):
+    """The vault an agent guards is usually not the project the agent opened.
+
+    Installing agent configuration into a nested vault is the worst failure
+    this installer has: every file lands, the summary reads like success, and
+    Claude Code loads none of it because it reads `.claude/` from the project
+    root. These cover the separation and, just as importantly, that a vault
+    which really is its own workspace keeps working untouched.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.project = Path(self.temporary.name).resolve()
+        (self.project / ".claude").mkdir()
+        self.vault = FileVault.initialize(self.project / "docs" / "brain", policy())
+        self.service = BrainkitService(
+            self.vault,
+            SqliteFtsIndex(self.vault.index_path),
+            graph=MarkdownGraph(),
+        )
+        self.root = self.vault.root
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def install(self, **kwargs: Any) -> dict[str, Any]:
+        with redirect_stderr(StringIO()):
+            return cli._install_hooks(self.service, "claude", **kwargs)
+
+    def test_root_puts_agent_configuration_in_the_project(self) -> None:
+        result = self.install(root=str(self.project))
+        self.assertEqual(result["workspace"], str(self.project))
+        for path in (
+            self.project / ".claude" / "settings.json",
+            self.project / ".claude" / "hooks" / "brainkit-gate.sh",
+            self.project / ".claude" / "skills" / "brainkit" / "SKILL.md",
+            self.project / "CLAUDE.md",
+        ):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), f"{path} was not written")
+
+    def test_nothing_agent_facing_leaks_into_the_vault(self) -> None:
+        self.install(root=str(self.project))
+        self.assertFalse((self.root / ".claude").exists())
+        self.assertFalse((self.root / "CLAUDE.md").exists())
+        # The adapter is vault policy and belongs to the vault, not the project.
+        self.assertTrue((self.root / ".brain" / "agent-claude.json").is_file())
+        self.assertFalse((self.project / ".brain").exists())
+
+    def test_the_hook_still_governs_the_vault_not_the_workspace(self) -> None:
+        self.install(root=str(self.project))
+        script = (
+            self.project / ".claude" / "hooks" / "brainkit-gate.sh"
+        ).read_text(encoding="utf-8")
+        # Compare the whole assignment line: the vault path is *under* the
+        # project path, so a substring check passes for the wrong value too.
+        assigned = [
+            line for line in script.splitlines() if line.startswith("VAULT=")
+        ]
+        self.assertEqual(assigned, [f"VAULT={shlex.quote(str(self.root))}"])
+
+    def test_the_status_hook_looks_for_git_in_the_workspace(self) -> None:
+        """The commit-lint layer lives in the workspace's repository.
+
+        This shipped broken: the script checked `$VAULT/.git`, so a vault
+        nested in a git project reported commit lint OFF while the pre-commit
+        hook was installed and running. An enforcement report that says OFF
+        for a live layer is the same failure as one that says ON for a dead
+        one — it is trusted, and it is wrong.
+        """
+        self.install(root=str(self.project))
+        script = (
+            self.project / ".claude" / "hooks" / "brainkit-status.sh"
+        ).read_text(encoding="utf-8")
+        assigned = {
+            line.split("=", 1)[0]: line.split("=", 1)[1]
+            for line in script.splitlines()
+            if line.startswith(("VAULT=", "WORKSPACE="))
+        }
+        self.assertEqual(assigned["VAULT"], shlex.quote(str(self.root)))
+        self.assertEqual(assigned["WORKSPACE"], shlex.quote(str(self.project)))
+        self.assertIn('"$WORKSPACE/.git"', script)
+        self.assertNotIn('"$VAULT/.git"', script)
+
+    def test_no_template_placeholder_survives_rendering(self) -> None:
+        """An unsubstituted {{token}} is a silent hole in a shipped script."""
+        self.install(root=str(self.project))
+        for name in ("brainkit-gate", "brainkit-status"):
+            with self.subTest(script=name):
+                body = (
+                    self.project / ".claude" / "hooks" / f"{name}.sh"
+                ).read_text(encoding="utf-8")
+                self.assertNotIn("{{", body)
+
+    def test_status_finds_the_layers_where_they_were_installed(self) -> None:
+        """The half of the bug that survives a correct install.
+
+        `bk status` used to look beside the vault unconditionally, so a
+        correctly installed gate still reported every layer off.
+        """
+        self.install(root=str(self.project))
+        layers = {
+            layer["layer"]: layer
+            for layer in self.service.status()["enforcement"]["layers"]
+        }
+        self.assertTrue(layers["write_gate"]["active"], layers["write_gate"])
+        self.assertTrue(layers["session_status"]["active"])
+        self.assertTrue(layers["instructions"]["active"])
+
+    def test_a_nested_vault_without_root_is_reported_not_silently_wrong(self) -> None:
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            result = cli._install_hooks(self.service, "claude")
+        advisory = result["workspace_advisory"]
+        self.assertIn(str(self.project), advisory["reason"])
+        self.assertIn(f"--root {self.project}", advisory["hint"])
+        self.assertIn("WORKSPACE", buffer.getvalue())
+
+    def test_an_explicit_root_never_triggers_the_advisory(self) -> None:
+        result = self.install(root=str(self.project))
+        self.assertNotIn("workspace_advisory", result)
+
+    def test_a_root_that_is_not_a_directory_is_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            self.install(root=str(self.project / "nope"))
+
+    def test_pre_commit_lands_in_the_workspace_repository(self) -> None:
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=self.project, check=True
+        )
+        self.install(root=str(self.project))
+        hook = self.project / ".git" / "hooks" / "pre-commit"
+        self.assertTrue(hook.is_file())
+        # It must lint the vault, which is not the repository it lives in.
+        self.assertIn(json.dumps(str(self.root)), hook.read_text(encoding="utf-8"))
+
+
+class StandaloneVaultWorkspaceTest(VaultCase):
+    """A vault that is its own project must behave exactly as it always did."""
+
+    def test_the_default_workspace_is_still_the_vault(self) -> None:
+        result = self.install()
+        self.assertEqual(result["workspace"], str(self.root))
+        self.assertTrue((self.root / ".claude" / "settings.json").is_file())
+
+    def test_a_git_vault_raises_no_workspace_advisory(self) -> None:
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True)
+        self.assertNotIn("workspace_advisory", self.install())
+
+    def test_an_adapter_without_a_workspace_falls_back_to_the_vault(self) -> None:
+        """Vaults installed before the field existed keep reporting correctly."""
+        self.install()
+        adapter = self.root / ".brain" / "agent-claude.json"
+        stored = json.loads(adapter.read_text(encoding="utf-8"))
+        del stored["workspace"]
+        adapter.write_text(json.dumps(stored), encoding="utf-8")
+        layers = {
+            layer["layer"]: layer
+            for layer in self.service.status()["enforcement"]["layers"]
+        }
+        self.assertTrue(layers["write_gate"]["active"])
 
 
 if __name__ == "__main__":

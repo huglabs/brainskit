@@ -4,9 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from brainkit.application.services import BrainkitService
-from brainkit.domain.model import ValidationError
+from brainkit.domain.model import DEFAULT_IGNORE_PATTERNS, ValidationError
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
 from brainkit.infrastructure.integrations import NativeIntegrations
@@ -201,7 +202,7 @@ class ObsidianConsumerTest(ServiceFixture):
         return Path(destination) / "brainkit"
 
     def test_unset_consumer_defaults_to_local_instead_of_human(self) -> None:
-        self.assertEqual(self.service._integration_consumer("obsidian"), "local")
+        self.assertEqual(self.service.projections._integration_consumer("obsidian"), "local")
         with tempfile.TemporaryDirectory() as destination:
             exported = self.sync_to(destination)
             graph = (exported / "graph/graph.json").read_text(encoding="utf-8")
@@ -275,7 +276,7 @@ class ObsidianConsumerTest(ServiceFixture):
 
     def test_database_integrations_still_require_an_explicit_consumer(self) -> None:
         with self.assertRaises(ValidationError):
-            self.service._integration_consumer("neo4j")
+            self.service.projections._integration_consumer("neo4j")
 
 
 class GeneratedViewsTest(ServiceFixture):
@@ -579,6 +580,171 @@ class OrphanedFreshnessTest(ServiceFixture):
         self.service.reconcile()
         codes = [item["code"] for item in self.service.lint()["findings"]]
         self.assertNotIn("freshness.orphaned", codes)
+
+
+class LintCostTest(ServiceFixture):
+    """A lint must not re-pay per page for something the vault has once.
+
+    `bk status` runs a full lint on every invocation, so anything that scales
+    with the page count here scales with every status call too.
+    """
+
+    def pages(self, count: int) -> None:
+        source = self.capture_into("20-research", text="evidence", title="evidence")
+        for index in range(count):
+            self.upsert_page(f"page-{index}", f"Page {index}", "Body ", source)
+
+    def test_the_vault_schema_is_read_once_per_lint(self) -> None:
+        self.pages(4)
+        reads = 0
+        original = self.vault.schema
+
+        def counting_schema() -> dict:
+            nonlocal reads
+            reads += 1
+            return original()
+
+        self.vault.schema = counting_schema  # type: ignore[method-assign]
+        try:
+            report = self.service.lint()
+        finally:
+            self.vault.schema = original  # type: ignore[method-assign]
+        self.assertTrue(report["ok"], report["findings"])
+        self.assertEqual(reads, 1)
+
+    def test_the_page_schema_is_still_enforced_on_every_page(self) -> None:
+        # Hoisting the read must not have hoisted the validation with it.
+        self.pages(3)
+        pages = sorted((self.root / "wiki" / "concepts").glob("page-*.md"))
+        self.assertEqual(len(pages), 3)
+        for page in pages:
+            body = page.read_text(encoding="utf-8")
+            page.write_text(
+                body.replace('type: "concept"', 'type: "bogus"'), encoding="utf-8"
+            )
+        findings = [
+            finding
+            for finding in self.service.lint()["findings"]
+            if finding["code"].startswith("schema.")
+        ]
+        self.assertEqual(
+            sorted({finding["path"] for finding in findings}),
+            [f"wiki/concepts/page-{index}.md" for index in range(3)],
+        )
+
+
+class WatchIgnoreTest(unittest.TestCase):
+    """A watch captures evidence, not the machinery sitting next to it.
+
+    Capture is irreversible by design — a source is identified by the hash of
+    its bytes and `raw/` is immutable — so a watch that walks a project folder
+    without an ignore list does not merely add noise, it permanently files a
+    dependency tree.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.work = Path(self.temporary.name)
+        self.source = self.work / "project"
+        for directory in ("node_modules/react", ".git", "docs", "build"):
+            (self.source / directory).mkdir(parents=True)
+        self.written = {
+            "node_modules/react/index.js": "bundled dependency",
+            ".git/config": "repository plumbing",
+            "build/out.o": "compiled artifact",
+            ".DS_Store": "finder metadata",
+            "docs/note.md": "durable evidence about retrieval",
+            "README.md": "durable evidence about the project",
+        }
+        for relative, body in self.written.items():
+            (self.source / relative).write_text(body, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def service(self, name: str, **overrides: Any) -> BrainkitService:
+        raw = policy()
+        raw["sources"] = [str(self.source)]
+        raw.update(overrides)
+        vault = FileVault.initialize(self.work / name, raw)
+        return BrainkitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+
+    def captured(self, service: BrainkitService) -> list[str]:
+        return sorted(
+            record.original_name for record in service.vault.registry().values()
+        )
+
+    def test_the_defaults_keep_dependency_trees_out_of_the_vault(self) -> None:
+        service = self.service("vault")
+        result = service.watch_once()
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(self.captured(service), ["README.md", "note.md"])
+        self.assertEqual(result["created"], 2)
+
+    def test_what_was_skipped_is_reported(self) -> None:
+        result = self.service("vault").watch_once()
+        # Four prunes: three directories and one dotfile. The files inside a
+        # pruned directory are never visited, so they are not counted --
+        # reporting per-file would mean walking what the policy excluded.
+        self.assertEqual(result["ignored"], 4)
+
+    def test_an_empty_list_is_honoured_as_ignore_nothing(self) -> None:
+        service = self.service("vault-open", ignore=[])
+        result = service.watch_once()
+        self.assertEqual(result["ignored"], 0)
+        self.assertIn("index.js", self.captured(service))
+        self.assertIn("config", self.captured(service))
+
+    def test_a_vault_written_before_ignore_existed_inherits_the_defaults(self) -> None:
+        # Upgrading the engine must not start capturing what a watch never did.
+        raw = policy()
+        raw["sources"] = [str(self.source)]
+        raw.pop("ignore", None)
+        vault = FileVault.initialize(self.work / "legacy", raw)
+        self.assertEqual(vault.config().ignore, DEFAULT_IGNORE_PATTERNS)
+
+    def test_operator_patterns_replace_the_defaults(self) -> None:
+        service = self.service("vault-custom", ignore=["docs"])
+        service.watch_once()
+        names = self.captured(service)
+        self.assertNotIn("note.md", names)
+        self.assertIn("index.js", names)
+
+    def test_the_vault_is_never_a_source_of_itself(self) -> None:
+        # A watch pointed at a parent of the vault would otherwise re-capture
+        # raw/ into itself on every tick.
+        nested = self.work / "project" / "brain"
+        raw = policy()
+        raw["sources"] = [str(self.source)]
+        vault = FileVault.initialize(nested, raw)
+        service = BrainkitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+        service.watch_once()
+        first = service.watch_once()
+        self.assertEqual(first["created"], 0)
+        for record in vault.registry().values():
+            self.assertNotIn("/brain/", record.original_name)
+
+    def test_a_configured_file_is_captured_directly(self) -> None:
+        raw = policy()
+        raw["sources"] = [str(self.source / "README.md")]
+        vault = FileVault.initialize(self.work / "vault-file", raw)
+        service = BrainkitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+        self.assertEqual(service.watch_once()["created"], 1)
+
+    def test_a_missing_source_folder_is_not_fatal(self) -> None:
+        raw = policy()
+        raw["sources"] = [str(self.work / "gone"), str(self.source)]
+        vault = FileVault.initialize(self.work / "vault-missing", raw)
+        service = BrainkitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+        self.assertEqual(service.watch_once()["created"], 2)
 
 
 if __name__ == "__main__":

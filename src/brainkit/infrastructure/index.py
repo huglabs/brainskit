@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterator, Sequence
 from contextlib import closing
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from brainkit.application.ports import VaultPort
 from brainkit.domain.model import SearchHit, SourceRecord, ValidationError, utc_now
 
+#: path, kind, title, body, content_hash — the FTS5 row shape.
+_Document = tuple[str, str, str, str, str]
+
 
 class SqliteFtsIndex:
-    def __init__(self, database_path):
+    def __init__(self, database_path: Path):
         self.database_path = database_path
 
     def rebuild(self, vault: VaultPort) -> int:
@@ -20,21 +24,22 @@ class SqliteFtsIndex:
     def rebuild_snapshot(
         self, vault: VaultPort, records: dict[str, SourceRecord]
     ) -> int:
+        """Rebuild the whole index, holding one document in memory at a time.
+
+        The bodies are streamed into `executemany` rather than collected first:
+        a vault is allowed to hold gigabytes of sources, and materialising every
+        extracted body in one list made the peak memory of a rebuild scale with
+        the size of the corpus rather than with its largest document.
+
+        The trade is that file reads now happen inside the write transaction,
+        so a rebuild holds the SQLite write lock for its whole duration. That is
+        the right way round here: WAL means readers are never blocked, the only
+        thing excluded is a concurrent write, and a rebuild racing a write was
+        already a contended operation.
+        """
+
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        records_by_path = {record.path: record for record in records.values()}
-        documents: list[tuple[str, str, str, str, str]] = []
-        for path in vault.raw_files():
-            record = records_by_path.get(path)
-            if not record:
-                continue
-            body = vault.raw_text(record)
-            documents.append(
-                (path, "raw", record.original_name, body, record.content_hash)
-            )
-        for path in vault.wiki_pages():
-            body = vault.read_text(path)
-            title = _markdown_title(body) or PurePosixPath(path).stem
-            documents.append((path, "wiki", title, body, ""))
+        counter = _Counter()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._ensure_schema(connection)
@@ -44,13 +49,13 @@ class SqliteFtsIndex:
                 INSERT INTO search_fts(path, kind, title, body, content_hash)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                documents,
+                counter.wrap(_iter_documents(vault, records)),
             )
             self._touch_metadata(connection)
             connection.commit()
-        return len(documents)
+        return counter.value
 
-    def upsert_raw(self, vault: VaultPort, record) -> None:
+    def upsert_raw(self, vault: VaultPort, record: SourceRecord) -> None:
         body = vault.raw_text(record)
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -69,7 +74,7 @@ class SqliteFtsIndex:
             self._touch_metadata(connection)
             connection.commit()
 
-    def upsert_wiki(self, vault: VaultPort, paths) -> None:
+    def upsert_wiki(self, vault: VaultPort, paths: Sequence[str]) -> None:
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._ensure_schema(connection)
@@ -91,7 +96,7 @@ class SqliteFtsIndex:
         self,
         vault: VaultPort,
         records: dict[str, SourceRecord],
-        wiki_paths,
+        wiki_paths: Sequence[str],
         raw_content_hash: str | None,
     ) -> int:
         if not self.database_path.exists():
@@ -231,6 +236,41 @@ class SqliteFtsIndex:
             """,
             (utc_now(),),
         )
+
+
+class _Counter:
+    """Counts rows as they stream past, since a generator has no length."""
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def wrap(self, rows: Iterator[_Document]) -> Iterator[_Document]:
+        for row in rows:
+            self.value += 1
+            yield row
+
+
+def _iter_documents(
+    vault: VaultPort, records: dict[str, SourceRecord]
+) -> Iterator[_Document]:
+    """Yield every indexable document without holding more than one at a time."""
+
+    records_by_path = {record.path: record for record in records.values()}
+    for path in vault.raw_files():
+        record = records_by_path.get(path)
+        if not record:
+            continue
+        yield (
+            path,
+            "raw",
+            record.original_name,
+            vault.raw_text(record),
+            record.content_hash,
+        )
+    for path in vault.wiki_pages():
+        body = vault.read_text(path)
+        title = _markdown_title(body) or PurePosixPath(path).stem
+        yield (path, "wiki", title, body, "")
 
 
 def _fts_query(query: str) -> str:

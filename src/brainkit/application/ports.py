@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Protocol
 
 from brainkit.domain.model import SearchHit, SourceRecord, VaultConfig
 
@@ -32,6 +33,16 @@ class VaultPort(Protocol):
     def read_text(self, relative_path: str) -> str: ...
 
     def content_hash(self, relative_path: str) -> str: ...
+
+    def code_root(self) -> Path: ...
+
+    #: A property rather than a method, matching the adapter. Declared here
+    #: because the application layer is what hands it to the extractor, and a
+    #: port that omits it forces the caller to reach past the boundary.
+    @property
+    def code_cache_dir(self) -> Path: ...
+
+    def code_hash(self, relative_path: str) -> str | None: ...
 
     def raw_text(self, record: SourceRecord, max_chars: int | None = None) -> str: ...
 
@@ -111,6 +122,18 @@ class GraphPort(Protocol):
     def build(self, vault: VaultPort) -> dict[str, Any]: ...
 
     def export(self, graph: dict[str, Any], target: str) -> str: ...
+
+
+class CodeExtractorPort(Protocol):
+    def extract(
+        self,
+        root: Path,
+        paths: list[Path] | None = None,
+        *,
+        cache_root: Path | None = None,
+    ) -> dict[str, Any]: ...
+
+    def available(self) -> bool: ...
 
 
 class IntegrationPort(Protocol):

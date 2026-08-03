@@ -1,26 +1,45 @@
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
+from fnmatch import fnmatch
+from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Any, NoReturn
 
 from jsonschema import FormatChecker  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
-from referencing import Registry  # type: ignore[import-untyped]
-from referencing.exceptions import (  # type: ignore[import-untyped]
+from referencing import Registry
+from referencing.exceptions import (
     NoSuchResource,
     Unresolvable,
 )
-
 
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)")
 CITATION_RE = re.compile(r"\[\^source:([0-9a-f]{64})\]")
+
+#: A claim about code, pinned to the exact bytes it was true of.
+#:
+#: The hash is a SHA-256 over the file's contents, which is the same identity
+#: `capture` gives a raw source — so the freshness rule the vault already runs
+#: applies unchanged: the file changes, the hash stops matching, and every page
+#: citing it goes to `review`. That is the whole reason to spell a code citation
+#: as a hash rather than as a path and a line number, which would silently point
+#: somewhere else after the next commit.
+#:
+#: The optional `#L17` or `#L17-L42` narrows the claim to a line range. It is
+#: deliberately outside the captured group: it locates the reader, it does not
+#: identify the source, and two claims about different lines of one file are two
+#: claims about the same source.
+CODE_CITATION_RE = re.compile(r"\[\^code:([0-9a-f]{64})(?:#L\d+(?:-L?\d+)?)?\]")
+
 INTEGRATION_NAMES = {"obsidian", "neo4j", "postgres", "web"}
 
 
@@ -126,6 +145,74 @@ class ContentHash:
 
     def __str__(self) -> str:
         return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class CodeSource:
+    """A file outside the vault that a page cites, and its hash at the time.
+
+    Unlike a raw source, the bytes are not copied in — a repository is not
+    evidence to be preserved, it is a moving thing to be pointed at. What makes
+    the pointer trustworthy is the hash: `lint` re-reads the file and compares,
+    so "this page describes code that has since changed" is a fact the vault can
+    state rather than a thing the reader has to remember to check.
+    """
+
+    path: str
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        ContentHash(self.content_hash)
+        if not self.path.strip():
+            raise ValidationError("Code source path cannot be empty")
+        candidate = PurePosixPath(self.path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValidationError(
+                "Code source paths must be relative to the code root and may not "
+                "escape it",
+                details={"path": self.path},
+            )
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> CodeSource:
+        if not isinstance(raw, dict):
+            raise ValidationError(
+                "Each code source must be an object with `path` and `hash`",
+                details={"value": raw},
+            )
+        missing = sorted({"path", "hash"} - raw.keys())
+        if missing:
+            raise ValidationError(
+                "Code source is missing required fields", details={"missing": missing}
+            )
+        return cls(path=str(raw["path"]), content_hash=str(raw["hash"]))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "hash": self.content_hash}
+
+
+def _code_root(raw: dict[str, Any]) -> str | None:
+    """Read an explicit code root, distinguishing absent from empty.
+
+    Absent means "discover it". An explicitly empty string means "the vault
+    root", which is the honest way to say a vault that sits at the top of the
+    repository it documents — the same absent-versus-empty rule the ignore
+    patterns follow.
+    """
+
+    if "code_root" not in raw:
+        return None
+    value = raw["code_root"]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError("code_root must be a string path")
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute():
+        raise ValidationError(
+            "code_root must be relative to the vault", details={"code_root": value}
+        )
+    return value
 
 
 def _branch_policy(raw: Any, *, source: str) -> BranchPolicy:
@@ -258,6 +345,120 @@ class IntegrationPolicy:
         }
 
 
+#: Patterns excluded from a watched source folder unless the vault overrides
+#: `ignore`. A watch walks a folder recursively and captures every file it
+#: finds, and capture is irreversible by design: a source is identified by the
+#: hash of its bytes and `raw/` is immutable. So the cost of a missing default
+#: is not noise, it is a vault permanently holding a dependency tree.
+#:
+#: These are the directories that are large, machine-generated and reproducible
+#: — never evidence — plus the editor and OS droppings that accompany them.
+DEFAULT_IGNORE_PATTERNS: tuple[str, ...] = (
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".gradle",
+    ".terraform",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".idea",
+    ".vscode",
+    ".DS_Store",
+    "Thumbs.db",
+    "*.pyc",
+    "*.pyo",
+    "*.so",
+    "*.o",
+    "*.class",
+    "*.lock",
+    "*.log",
+    "*.tmp",
+    "*.swp",
+)
+
+
+def _ignore_patterns(raw: dict[str, Any]) -> tuple[str, ...]:
+    """Read the vault's ignore list, distinguishing absent from empty.
+
+    An older vault has no `ignore` key at all and must inherit the defaults, or
+    upgrading the engine would start capturing dependency trees it never did.
+    A vault that stores `[]` has answered the question, and gets what it asked
+    for.
+    """
+
+    if "ignore" not in raw:
+        return DEFAULT_IGNORE_PATTERNS
+    value = raw["ignore"]
+    if not isinstance(value, list):
+        raise ValidationError(
+            "ignore must be a list of glob patterns",
+            details={"observed": type(value).__name__},
+        )
+    patterns: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValidationError(
+                "Each ignore pattern must be a string",
+                details={"observed": type(entry).__name__},
+            )
+        candidate = entry.strip().strip("/")
+        if candidate and candidate not in patterns:
+            patterns.append(candidate)
+    return tuple(patterns)
+
+
+def is_ignored(relative_path: str, patterns: Sequence[str]) -> bool:
+    """True when any segment of ``relative_path`` matches an ignore pattern.
+
+    Matching is per segment, the way a person means it: `node_modules` excludes
+    the whole tree beneath it rather than only a file with that exact name, and
+    one pattern therefore prunes a directory instead of being re-tested against
+    every file inside it. A pattern containing a separator is matched against
+    the whole relative path instead, so `docs/build` can be excluded without
+    also excluding every other `build`.
+
+    Patterns are shell globs, matched case-insensitively — the primary
+    deployment target is a case-insensitive filesystem, where `Node_Modules`
+    and `node_modules` name the same directory.
+    """
+
+    if not patterns:
+        return False
+    normalized = PurePosixPath(str(relative_path).replace("\\", "/"))
+    segments = [part for part in normalized.parts if part not in ("", ".", "/")]
+    if not segments:
+        return False
+    whole = "/".join(segments).casefold()
+    for pattern in patterns:
+        candidate = str(pattern).strip().strip("/")
+        if not candidate:
+            continue
+        folded = candidate.casefold()
+        if "/" in folded:
+            # A rooted pattern prunes a tree, so it has to match the directory
+            # itself *and* everything under it. Matching only the exact path
+            # would exclude `docs/build` while still capturing every file in it.
+            if fnmatch(whole, folded) or fnmatch(whole, f"{folded}/*"):
+                return True
+            continue
+        if any(fnmatch(segment.casefold(), folded) for segment in segments):
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class VaultConfig:
     wiki_language: str
@@ -270,6 +471,13 @@ class VaultConfig:
     taxonomy_seed: list[str]
     novelty: NoveltyPolicy
     integrations: dict[str, IntegrationPolicy]
+    #: Absent means "use the defaults", which is what an existing vault wants.
+    #: An explicitly empty list is honoured as a deliberate "ignore nothing".
+    ignore: tuple[str, ...] = DEFAULT_IGNORE_PATTERNS
+    #: Where `code_sources` paths resolve. Absent means "discover it": walk up
+    #: from the vault for a `.git` directory, since a vault at `repo/docs/brain`
+    #: wants repo-relative paths and nothing else in the layout says so.
+    code_root: str | None = None
     version: int = 3
 
     @classmethod
@@ -340,6 +548,8 @@ class VaultConfig:
             schedule={str(k): str(v) for k, v in raw["schedule"].items()},
             taxonomy_seed=[str(item) for item in raw["taxonomy_seed"]],
             novelty=NoveltyPolicy.from_dict(raw["novelty"]),
+            ignore=_ignore_patterns(raw),
+            code_root=_code_root(raw),
             integrations={
                 name: IntegrationPolicy.from_dict(name, value)
                 for name, value in raw_integrations.items()
@@ -368,6 +578,8 @@ class VaultConfig:
             "schedule": self.schedule,
             "taxonomy_seed": self.taxonomy_seed,
             "novelty": self.novelty.to_dict(),
+            "ignore": list(self.ignore),
+            **({"code_root": self.code_root} if self.code_root is not None else {}),
             "integrations": {
                 name: policy.to_dict()
                 for name, policy in sorted(self.integrations.items())
@@ -428,6 +640,8 @@ class PageOperation:
     links: tuple[str, ...]
     metadata: dict[str, Any]
     base_hash: str | None
+    #: Defaulted, so every existing caller and stored proposal stays valid.
+    code_sources: tuple[CodeSource, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> PageOperation:
@@ -444,6 +658,10 @@ class PageOperation:
                 metadata=dict(raw.get("metadata", {})),
                 base_hash=(
                     str(raw["base_hash"]) if raw.get("base_hash") is not None else None
+                ),
+                code_sources=tuple(
+                    CodeSource.from_dict(entry)
+                    for entry in raw.get("code_sources", [])
                 ),
             )
         except (KeyError, ValueError, TypeError) as exc:
@@ -474,12 +692,16 @@ class PageOperation:
             raise ValidationError("Page source hashes must be unique")
         if len(self.links) != len(set(self.links)):
             raise ValidationError("Page links must be unique")
+        code_paths = [entry.path for entry in self.code_sources]
+        if len(code_paths) != len(set(code_paths)):
+            raise ValidationError("Page code sources must be unique by path")
         reserved = {
             "id",
             "type",
             "title",
             "aliases",
             "sources",
+            "code_sources",
             "updated_at",
         }
         if reserved & self.metadata.keys():
@@ -493,6 +715,13 @@ class PageOperation:
             raise ValidationError(
                 "Every embedded wiki link must be declared in links",
                 details={"undeclared": sorted(embedded - declared)},
+            )
+        cited = set(CODE_CITATION_RE.findall(self.body))
+        declared_code = {entry.content_hash for entry in self.code_sources}
+        if not cited.issubset(declared_code):
+            raise ValidationError(
+                "Every code citation must be declared in code_sources",
+                details={"undeclared": sorted(cited - declared_code)},
             )
 
     @property
@@ -515,6 +744,7 @@ class PageOperation:
             "links": list(self.links),
             "metadata": self.metadata,
             "base_hash": self.base_hash,
+            "code_sources": [entry.to_dict() for entry in self.code_sources],
         }
 
 
@@ -652,7 +882,49 @@ def normalize_branch(value: str) -> str:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+@lru_cache(maxsize=32)
+def _compiled_validator(canonical: str) -> Any:
+    """Compile a validator once per distinct schema.
+
+    `lint` validates every wiki page against the same `.brain/schema.json`, and
+    compiling it per page made the cost of a lint scale with the page count for
+    no reason. Keyed on the canonical serialization rather than object identity
+    because the vault re-reads and re-parses the schema from disk, so the same
+    schema is a different object on every call.
+
+    A schema that fails `check_schema` raises here on every call: `lru_cache`
+    does not memoize exceptions, which is what we want — an invalid schema must
+    keep being reported, not be reported once and then silently pass.
+    """
+
+    schema = json.loads(canonical)
+    validator_class = validator_for(schema)
+    validator_class.check_schema(schema)
+    return validator_class(
+        schema,
+        format_checker=FormatChecker(),
+        registry=Registry(retrieve=_deny_remote_schema),  # type: ignore[call-arg]
+    )
+
+
+def _validator_for_schema(schema: dict[str, Any]) -> Any:
+    try:
+        canonical = json.dumps(schema, sort_keys=True)
+    except (TypeError, ValueError):
+        # Not serializable, so not cacheable. Compiling directly keeps the
+        # caller's behaviour identical rather than turning a validation
+        # question into a caching error.
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        return validator_class(
+            schema,
+            format_checker=FormatChecker(),
+            registry=Registry(retrieve=_deny_remote_schema),  # type: ignore[call-arg]
+        )
+    return _compiled_validator(canonical)
 
 
 def validate_schema(
@@ -661,13 +933,7 @@ def validate_schema(
     """Validate a value against its declared JSON Schema draft and formats."""
 
     try:
-        validator_class = validator_for(schema)
-        validator_class.check_schema(schema)
-        validator = validator_class(
-            schema,
-            format_checker=FormatChecker(),
-            registry=Registry(retrieve=_deny_remote_schema),  # type: ignore[call-arg]
-        )
+        validator = _validator_for_schema(schema)
         errors = sorted(
             validator.iter_errors(value),
             key=lambda error: (

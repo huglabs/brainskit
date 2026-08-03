@@ -5,7 +5,7 @@ import shutil
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -28,7 +28,7 @@ from brainkit.interfaces.mcp import (
     BrainkitMcpHttpServer,
     _handle,
 )
-from brainkit.interfaces.web import BrainkitWebHandler, BrainkitWebServer
+from brainkit.interfaces.web import build_server
 
 
 def policy() -> dict:
@@ -500,11 +500,13 @@ class EngineTest(unittest.TestCase):
             )
 
     def test_web_viewer_serves_health_graph_and_complete_html(self) -> None:
-        server = BrainkitWebServer(("127.0.0.1", 0), BrainkitWebHandler)
-        server.service = self.service
-        server.consumer = "human"
-        server.token = None
-        server.instance_id = "test-instance"
+        server = build_server(
+            self.service,
+            host="127.0.0.1",
+            port=0,
+            consumer="human",
+            instance_id="test-instance",
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base_url = f"http://127.0.0.1:{server.server_port}"
@@ -661,7 +663,7 @@ class EngineTest(unittest.TestCase):
         self.service.index.apply_snapshot = fail_index  # type: ignore[method-assign]
         try:
             with self.assertRaisesRegex(RuntimeError, "injected index failure"):
-                self.service._apply_transaction(
+                self.service.gate.commit(
                     proposal, raw_move=(content_hash, "20-research")
                 )
         finally:
@@ -675,7 +677,7 @@ class EngineTest(unittest.TestCase):
             any(hit.kind == "wiki" for hit in self.service.index.search("durable"))
         )
 
-        result = self.service._apply_transaction(
+        result = self.service.gate.commit(
             proposal, raw_move=(content_hash, "20-research")
         )
         record = self.vault.registry()[content_hash]
@@ -768,7 +770,7 @@ class EngineTest(unittest.TestCase):
 
         def age_state(state):
             state["pages"][page_path]["updated_at"] = (
-                datetime.now(timezone.utc) - timedelta(days=45)
+                datetime.now(UTC) - timedelta(days=45)
             ).isoformat()
             return state
 

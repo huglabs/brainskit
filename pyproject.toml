@@ -17,6 +17,33 @@ convert = ["markitdown"]
 neo4j = ["neo4j>=5.25,<7"]
 postgres = ["psycopg[binary]>=3.2,<4"]
 integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.2,<4"]
+# The code graph. Vendoring Graphify's source did not vendor a parser: the
+# tree-sitter grammars are compiled wheels and stay a real dependency, and they
+# are the reason this is an extra rather than a base requirement — roughly 70 MB
+# of them, for a capability most vaults never ask for. The core stays at one
+# dependency. `bk code` reports what to install when they are absent.
+#
+# Grammar versions are pinned to the ranges the vendored extractors were written
+# against; a grammar is a parser, and a newer one changes the shape of the tree
+# the extractors walk.
+code = [
+  "tree-sitter>=0.23.0,<0.26",
+  "tree-sitter-python>=0.23,<0.26",
+  "tree-sitter-javascript>=0.23,<0.26",
+  "tree-sitter-typescript>=0.23,<0.25",
+  "tree-sitter-go>=0.23,<0.26",
+  "tree-sitter-rust>=0.23,<0.25",
+  "tree-sitter-java>=0.23,<0.25",
+  "tree-sitter-c>=0.23,<0.25",
+  "tree-sitter-cpp>=0.23,<0.25",
+  "tree-sitter-c-sharp>=0.23,<0.25",
+  "tree-sitter-ruby>=0.23,<0.25",
+  "tree-sitter-php>=0.23,<0.25",
+  "tree-sitter-bash>=0.23,<0.27",
+  "tree-sitter-json>=0.23,<0.26",
+  # Community detection, hub ranking, import cycles and graph diff.
+  "networkx>=3.4",
+]
 
 [project.scripts]
 bk = "brainkit.interfaces.cli:main"
@@ -46,3 +73,72 @@ brainkit = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Ruff's default selection is E4/E7/E9 + F — undefined names and unused
+# imports, essentially. Passing it said much less about this codebase than the
+# README implied, so the gate now names what it actually enforces.
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+# Vendored third-party source. It is kept byte-identical to upstream so a
+# re-vendor is a copy rather than a merge, which means it cannot also satisfy a
+# lint contract it was never written against — and reformatting it would make
+# the next upstream diff unreadable. Scoped to the one path; everything
+# Brainkit wrote is still gated.
+# Provenance and the full reasoning: that directory's NOTICE.
+extend-exclude = ["src/brainkit/infrastructure/codeanalysis"]
+
+[tool.ruff.lint]
+select = [
+  "F",      # pyflakes
+  "E", "W", # pycodestyle
+  "I",      # import sorting
+  "UP",     # pyupgrade: keep the 3.11+ baseline honest
+  "B",      # bugbear
+  "S",      # bandit: this engine has a write gate and a privacy boundary
+  "A",      # builtin shadowing
+  "C4",     # comprehensions
+  "RUF",    # ruff's own checks
+]
+# Deliberately not selected: SIM. Its findings here are suggestions, not
+# defects — nested `with` in tests, and `SIM115` on the atomic-write idiom,
+# where `delete=False` is exactly the point and the handle is already cleaned
+# up in an `except`. A gate that reports those trains people to skim it.
+ignore = [
+  # Line length is a formatter's job, and `ruff format` has never been applied
+  # to this tree. Selecting E501 would report 100+ cosmetic findings that one
+  # formatter run fixes, drowning out the rules that mean something.
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on behaviour, and doing that needs the things bandit flags in
+# production code: constructed URLs, hardcoded fixture credentials, subprocess
+# calls, and asserts themselves.
+"tests/*" = ["S101", "S105", "S106", "S108", "S310", "S603", "S607", "S608"]
+# The managed-service adapter is a `docker` driver and a PostgreSQL client.
+#   S603/S607 — every call is a fixed argument vector with no shell, invoking
+#     `docker` by name on purpose: pinning an absolute path would break the
+#     Docker Desktop, Colima and rootless layouts this has to run against.
+#   S608 — PostgreSQL cannot bind an identifier as a parameter, so the schema
+#     name is interpolated. It is whitelist-validated by `_sql_identifier`
+#     first (`^[a-z_][a-z0-9_]{0,62}$`); every value is bound normally.
+#   S104 — "0.0.0.0" appears in a published-port comparison, not in a bind.
+#   S105 — the flagged constant is a redaction placeholder, not a credential.
+"src/brainkit/infrastructure/integrations.py" = ["S104", "S105", "S603", "S607", "S608"]
+# The flagged strings are the literal key name "token", used to look up an
+# environment variable's name — never a value.
+"src/brainkit/interfaces/cli.py" = ["S105"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+strict = true
+# `jsonschema`, `referencing`, `neo4j` and `psycopg` are optional or untyped;
+# the modules that touch them already carry explicit ignores.
+warn_unused_ignores = true
+disallow_any_generics = true
+# Vendored third-party source: byte-identical to upstream, so it cannot satisfy
+# a strict contract it was never written against. The adapter that calls it is
+# checked, which is where the boundary that matters actually is.
+exclude = ["^src/brainkit/infrastructure/codeanalysis/"]

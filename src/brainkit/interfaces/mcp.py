@@ -7,15 +7,15 @@ import re
 import ssl
 import sys
 import traceback
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from brainkit import __version__
 from brainkit.application.services import BrainkitService
 from brainkit.domain.model import BrainkitError, ValidationError
-
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SUPPORTED_VERSIONS = {MCP_PROTOCOL_VERSION}
@@ -56,7 +56,7 @@ def run_stdio(service: BrainkitService) -> None:
                 str(exc),
                 {"code": exc.code, **exc.details},
             )
-        except Exception as exc:  # noqa: BLE001 - transport-level safety net
+        except Exception as exc:
             _report_internal_error("stdio request", exc)
             response = _error(
                 request.get("id") if isinstance(request, dict) else None,
@@ -126,7 +126,7 @@ class BrainkitMcpHttpServer(ThreadingHTTPServer):
 class BrainkitMcpHttpHandler(BaseHTTPRequestHandler):
     server: BrainkitMcpHttpServer
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if urlparse(self.path).path != "/mcp":
             self._send_http_error(HTTPStatus.NOT_FOUND, "not_found")
             return
@@ -205,7 +205,7 @@ class BrainkitMcpHttpHandler(BaseHTTPRequestHandler):
                 str(exc),
                 {"code": exc.code, **exc.details},
             )
-        except Exception as exc:  # noqa: BLE001 - transport-level safety net
+        except Exception as exc:
             _report_internal_error("http request", exc)
             status = HTTPStatus.INTERNAL_SERVER_ERROR
             response = _error(
@@ -222,7 +222,7 @@ class BrainkitMcpHttpHandler(BaseHTTPRequestHandler):
             return
         self._send_json(response, status=status)
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if urlparse(self.path).path != "/mcp":
             self._send_http_error(HTTPStatus.NOT_FOUND, "not_found")
             return
@@ -242,7 +242,7 @@ class BrainkitMcpHttpHandler(BaseHTTPRequestHandler):
             allow="POST",
         )
 
-    def do_DELETE(self) -> None:  # noqa: N802
+    def do_DELETE(self) -> None:
         if urlparse(self.path).path != "/mcp":
             self._send_http_error(HTTPStatus.NOT_FOUND, "not_found")
             return
@@ -262,7 +262,8 @@ class BrainkitMcpHttpHandler(BaseHTTPRequestHandler):
             allow="POST",
         )
 
-    def log_message(self, format: str, *args: Any) -> None:
+    # `format` is BaseHTTPRequestHandler's parameter name, not ours.
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
 
     def _authorized(self) -> bool:

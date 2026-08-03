@@ -5,9 +5,9 @@ import json
 from pathlib import PurePosixPath
 from typing import Any
 
+from brainkit.application.pages import parse_frontmatter
 from brainkit.application.ports import VaultPort
-from brainkit.application.services import WIKI_LINK_RE, parse_frontmatter
-from brainkit.domain.model import ValidationError
+from brainkit.domain.model import WIKI_LINK_RE, ValidationError
 
 
 class MarkdownGraph:

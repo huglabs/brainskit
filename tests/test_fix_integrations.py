@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,12 +25,14 @@ from brainkit.infrastructure.integrations import (
     _container_name,
     _container_status,
     _managed_container_spec,
+    _postgres_schema_statements,
     _postgres_secrets,
     _postgres_target,
     _publish_arguments,
     _published_ports,
     _ready_timeout,
     _redact_secrets,
+    _vault_id,
     _vendor_boundary,
     _vendor_stage,
     _wait_database_ready,
@@ -177,9 +180,61 @@ def fake_neo4j_module() -> dict[str, types.ModuleType]:
     return {"neo4j": module, "neo4j.exceptions": exceptions}
 
 
+_INSERT_RE = re.compile(r'INSERT INTO "(\w+)"\.(\w+)\s*\(([^)]*)\)', re.S)
+_DELETE_RE = re.compile(r'DELETE FROM "(\w+)"\.(\w+)(.*)', re.S)
+
+
+class FakePostgresStore:
+    """Just enough of a table store to observe what a sync leaves behind.
+
+    It applies only the two statements whose effect this suite reasons about --
+    the scoped delete and the insert -- and ignores DDL. The delete predicate is
+    honoured literally rather than assumed: a statement with no `WHERE` empties
+    the table, exactly as PostgreSQL would. That is what lets a test assert the
+    user-facing outcome (another vault's rows survive) instead of only asserting
+    that the right SQL was typed.
+    """
+
+    def __init__(self) -> None:
+        self.statements: list[tuple[str, Any]] = []
+        self.tables: dict[str, list[dict[str, Any]]] = {"nodes": [], "edges": []}
+
+    def record(self, statement: str, parameters: Any) -> None:
+        self.statements.append((statement, parameters))
+
+    def apply_delete(self, statement: str, parameters: Any) -> None:
+        match = _DELETE_RE.search(statement)
+        if match is None:
+            return
+        table, remainder = match.group(2), match.group(3)
+        rows = self.tables.setdefault(table, [])
+        if "vault_id = %s" not in remainder:
+            rows.clear()
+            return
+        vault_id = next(iter(parameters or ()))
+        self.tables[table] = [row for row in rows if row.get("vault_id") != vault_id]
+
+    def apply_insert(self, statement: str, rows: list[Any]) -> None:
+        match = _INSERT_RE.search(statement)
+        if match is None:
+            return
+        table = match.group(2)
+        columns = [column.strip() for column in match.group(3).split(",")]
+        self.tables.setdefault(table, []).extend(
+            dict(zip(columns, row, strict=False)) for row in rows
+        )
+
+    def rows(self, table: str) -> list[dict[str, Any]]:
+        return self.tables.setdefault(table, [])
+
+    def statements_matching(self, fragment: str) -> list[tuple[str, Any]]:
+        return [item for item in self.statements if fragment in item[0]]
+
+
 class FakePostgresConnection:
-    def __init__(self, error: BaseException | None):
+    def __init__(self, error: BaseException | None, store: FakePostgresStore):
         self.error = error
+        self.store = store
 
     def __enter__(self) -> FakePostgresConnection:
         return self
@@ -190,13 +245,22 @@ class FakePostgresConnection:
     def cursor(self) -> FakePostgresConnection:
         return self
 
-    def execute(self, *_: object, **__: object) -> None:
+    def execute(
+        self, statement: object = "", parameters: object = None, *_: object, **__: object
+    ) -> None:
+        self.store.record(str(statement), parameters)
         if self.error is not None:
             raise self.error
+        self.store.apply_delete(str(statement), parameters)
 
-    def executemany(self, *_: object, **__: object) -> None:
+    def executemany(
+        self, statement: object = "", parameters: object = None, *_: object, **__: object
+    ) -> None:
+        rows = list(parameters) if parameters is not None else []
+        self.store.record(str(statement), rows)
         if self.error is not None:
             raise self.error
+        self.store.apply_insert(str(statement), rows)
 
 
 def fake_psycopg_module() -> types.ModuleType:
@@ -213,17 +277,21 @@ def fake_psycopg_module() -> types.ModuleType:
         sqlstate = "42601"
 
     failures: dict[str, BaseException | None] = {"connect": None, "query": None}
+    # One store across connections: a schema outlives the sync that opened it,
+    # which is the whole point when a second vault connects later.
+    store = FakePostgresStore()
 
     def connect(_: str) -> FakePostgresConnection:
         if failures["connect"] is not None:
             raise failures["connect"]
-        return FakePostgresConnection(failures["query"])
+        return FakePostgresConnection(failures["query"], store)
 
     module.Error = Error  # type: ignore[attr-defined]
     module.OperationalError = OperationalError  # type: ignore[attr-defined]
     module.ProgrammingError = ProgrammingError  # type: ignore[attr-defined]
     module.failures = failures  # type: ignore[attr-defined]
     module.connect = connect  # type: ignore[attr-defined]
+    module.store = store  # type: ignore[attr-defined]
     return module
 
 
@@ -454,6 +522,217 @@ class VendorErrorContractTest(VaultFixture):
 
     def test_postgres_target_ignores_non_uri_dsn_forms(self) -> None:
         self.assertEqual(_postgres_target("host=127.0.0.1 port=5432 dbname=brainkit"), {})
+
+
+def shared_graph() -> dict:
+    """The natural ids two vaults collide on: every vault has a `wiki/index.md`."""
+    return {
+        "nodes": [
+            {
+                "id": "page:wiki/index.md",
+                "label": "index",
+                "kind": "wiki",
+                "path": "wiki/index.md",
+            },
+            {
+                "id": "raw:c0ffee",
+                "label": "c0ffee",
+                "kind": "source",
+                "path": "raw/c0ffee.md",
+            },
+        ],
+        "edges": [
+            {
+                "source": "page:wiki/index.md",
+                "target": "raw:c0ffee",
+                "type": "sourced_from",
+            }
+        ],
+    }
+
+
+class PostgresVaultScopeTest(unittest.TestCase):
+    """One PostgreSQL schema holds many vaults, so a refresh must not be a wipe.
+
+    The delete was unscoped while the ids it deleted were not namespaced at all,
+    unlike the Neo4j export's. Syncing any vault therefore discarded every other
+    vault's subgraph -- another application's data, not a stale copy of our own.
+    """
+
+    def setUp(self) -> None:
+        self.temporaries: list[tempfile.TemporaryDirectory] = []
+
+    def tearDown(self) -> None:
+        for temporary in self.temporaries:
+            temporary.cleanup()
+
+    def make_vault(self, prefix: str) -> NativeIntegrations:
+        temporary = tempfile.TemporaryDirectory(prefix=prefix)
+        self.temporaries.append(temporary)
+        vault = FileVault.initialize(Path(temporary.name), policy())
+        integrations = NativeIntegrations(vault)
+        integrations.configure(
+            "postgres",
+            enabled=True,
+            managed=False,
+            options={
+                "consumer": "local",
+                "schema": "brainkit",
+                "dsn_env": "BRAINKIT_TEST_PG_DSN",
+            },
+        )
+        return integrations
+
+    def sync(
+        self, integrations: NativeIntegrations, module: types.ModuleType
+    ) -> dict:
+        environment = {
+            "BRAINKIT_TEST_PG_DSN": "postgresql://brainkit@127.0.0.1:5999/brainkit"
+        }
+        with patch.dict(os.environ, environment):
+            with patch.dict(sys.modules, {"psycopg": module}):
+                return integrations.sync("postgres", shared_graph())
+
+    def test_the_refresh_deletes_only_the_syncing_vaults_rows(self) -> None:
+        module = fake_psycopg_module()
+        integrations = self.make_vault("scope-a-")
+        vault_id = self.sync(integrations, module)["vault_id"]
+        deletes = module.store.statements_matching("DELETE FROM")  # type: ignore[attr-defined]
+        self.assertEqual(len(deletes), 2)
+        for statement, parameters in deletes:
+            self.assertIn("WHERE vault_id = %s", statement)
+            self.assertEqual(parameters, (vault_id,))
+
+    def test_edges_are_deleted_before_the_nodes_they_reference(self) -> None:
+        module = fake_psycopg_module()
+        self.sync(self.make_vault("scope-order-"), module)
+        deleted = [
+            statement for statement, _ in module.store.statements_matching("DELETE FROM")  # type: ignore[attr-defined]
+        ]
+        self.assertIn("edges", deleted[0])
+        self.assertIn("nodes", deleted[1])
+
+    def test_the_vault_id_reaches_both_insert_statements(self) -> None:
+        module = fake_psycopg_module()
+        integrations = self.make_vault("scope-insert-")
+        vault_id = self.sync(integrations, module)["vault_id"]
+        inserts = module.store.statements_matching("INSERT INTO")  # type: ignore[attr-defined]
+        self.assertEqual(len(inserts), 2)
+        for statement, rows in inserts:
+            self.assertIn("vault_id", statement)
+            self.assertTrue(rows)
+            for row in rows:
+                self.assertIn(vault_id, row)
+        for table in ("nodes", "edges"):
+            for row in module.store.rows(table):  # type: ignore[attr-defined]
+                self.assertEqual(row["vault_id"], vault_id)
+
+    def test_stored_ids_are_namespaced_and_keep_the_natural_id_reachable(self) -> None:
+        module = fake_psycopg_module()
+        integrations = self.make_vault("scope-ids-")
+        vault_id = self.sync(integrations, module)["vault_id"]
+        stored = module.store.rows("nodes")  # type: ignore[attr-defined]
+        self.assertEqual(
+            sorted(row["id"] for row in stored),
+            [f"{vault_id}:page:wiki/index.md", f"{vault_id}:raw:c0ffee"],
+        )
+        # A prefixed primary key is only tolerable while the natural id stays
+        # queryable, so properties must remain the untouched node.
+        self.assertEqual(
+            sorted(json.loads(row["properties"])["id"] for row in stored),
+            ["page:wiki/index.md", "raw:c0ffee"],
+        )
+        edge = module.store.rows("edges")[0]  # type: ignore[attr-defined]
+        self.assertEqual(edge["source"], f"{vault_id}:page:wiki/index.md")
+        self.assertEqual(json.loads(edge["properties"])["source"], "page:wiki/index.md")
+
+    def test_a_second_vault_sync_leaves_the_first_vaults_rows_in_place(self) -> None:
+        """The outcome the mechanism exists for -- this is what used to fail."""
+        module = fake_psycopg_module()
+        first = self.make_vault("scope-first-")
+        second = self.make_vault("scope-second-")
+        first_id = self.sync(first, module)["vault_id"]
+        second_id = self.sync(second, module)["vault_id"]
+        self.assertNotEqual(first_id, second_id)
+        for table, per_vault in (("nodes", 2), ("edges", 1)):
+            rows = module.store.rows(table)  # type: ignore[attr-defined]
+            surviving = [row for row in rows if row["vault_id"] == first_id]
+            self.assertEqual(len(surviving), per_vault)
+            # The sum, not the max: the second sync added to the schema rather
+            # than replacing it.
+            self.assertEqual(len(rows), per_vault * 2)
+
+    def test_resyncing_one_vault_replaces_only_its_own_subgraph(self) -> None:
+        module = fake_psycopg_module()
+        first = self.make_vault("scope-resync-a-")
+        second = self.make_vault("scope-resync-b-")
+        first_id = self.sync(first, module)["vault_id"]
+        self.sync(second, module)
+        self.sync(first, module)
+        rows = module.store.rows("nodes")  # type: ignore[attr-defined]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len([row for row in rows if row["vault_id"] == first_id]), 2)
+
+    def test_the_schema_adds_the_vault_column_to_an_already_deployed_table(self) -> None:
+        """`CREATE TABLE IF NOT EXISTS` cannot add a column to an existing table."""
+        statements = _postgres_schema_statements("brainkit", "vault-abc")
+        text = [statement for statement, _ in statements]
+        for table in ("nodes", "edges"):
+            self.assertTrue(
+                any(
+                    f'ALTER TABLE "brainkit".{table} '
+                    "ADD COLUMN IF NOT EXISTS vault_id text" in statement
+                    for statement in text
+                ),
+                f"{table} has no migration for a table that already exists",
+            )
+            self.assertTrue(
+                any(
+                    f'ALTER TABLE "brainkit".{table} '
+                    "ALTER COLUMN vault_id SET NOT NULL" in statement
+                    for statement in text
+                )
+            )
+            self.assertIn(
+                (
+                    f'UPDATE "brainkit".{table} SET vault_id = %s '
+                    "WHERE vault_id IS NULL",
+                    ("vault-abc",),
+                ),
+                statements,
+            )
+
+    def test_the_migration_backfills_before_it_demands_a_value(self) -> None:
+        text = [
+            statement
+            for statement, _ in _postgres_schema_statements("brainkit", "vault-abc")
+        ]
+        added = next(i for i, s in enumerate(text) if "ADD COLUMN IF NOT EXISTS" in s)
+        filled = next(i for i, s in enumerate(text) if "SET vault_id = %s" in s)
+        required = next(i for i, s in enumerate(text) if "SET NOT NULL" in s)
+        self.assertLess(added, filled)
+        self.assertLess(filled, required)
+
+    def test_both_tables_index_the_column_every_query_filters_on(self) -> None:
+        text = [
+            statement
+            for statement, _ in _postgres_schema_statements("brainkit", "vault-abc")
+        ]
+        for table in ("nodes", "edges"):
+            self.assertTrue(
+                any(
+                    "CREATE INDEX IF NOT EXISTS" in statement
+                    and f'"brainkit".{table}(vault_id)' in statement
+                    for statement in text
+                ),
+                f"{table}.vault_id is unindexed",
+            )
+
+    def test_both_graph_targets_derive_the_same_vault_namespace(self) -> None:
+        module = fake_psycopg_module()
+        integrations = self.make_vault("scope-shared-")
+        result = self.sync(integrations, module)
+        self.assertEqual(result["vault_id"], _vault_id(integrations.vault.root))
 
 
 class ManagedContainerReconciliationTest(VaultFixture):
@@ -751,7 +1030,7 @@ class ReadinessProbeTest(unittest.TestCase):
         def fake_sleep(seconds: float) -> None:
             clock["now"] += seconds
 
-        def fake_run(argv, **kwargs):  # noqa: ANN001 - subprocess signature
+        def fake_run(argv, **kwargs):
             code = 0 if next(answers, False) else 1
             return subprocess.CompletedProcess(argv, code, "", "")
 
@@ -774,7 +1053,7 @@ class ReadinessProbeTest(unittest.TestCase):
         """The initdb temporary server listens on the socket only."""
         seen: list[list[str]] = []
 
-        def fake_run(argv, **kwargs):  # noqa: ANN001 - subprocess signature
+        def fake_run(argv, **kwargs):
             seen.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, "", "")
 

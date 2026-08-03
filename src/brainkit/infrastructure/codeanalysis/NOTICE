@@ -1,0 +1,90 @@
+Vendored from Graphify
+======================
+
+  Upstream:  https://github.com/Graphify-Labs/graphify
+  Revision:  00efd6e7969837ae4a9f11d8d504dcd3b20b09df  (2026-08-01)
+  Version:   0.9.32
+  Copyright: 2026 Safi Shamsi and the Graphify contributors
+  License:   Apache License, Version 2.0 — see ../../../../LICENSE
+
+Portions of Graphify were contributed under the MIT License prior to its
+relicensing and remain available under those terms; that text is in LICENSE-MIT
+alongside this file.
+
+Apache-2.0 section 4(b) requires that modified files carry prominent notices
+stating that they were changed, and 4(c) that attribution notices are retained.
+Both are satisfied here rather than file by file: nothing in this directory is
+edited in place.
+
+
+Why it is vendored rather than imported
+---------------------------------------
+
+Brainkit does not parse code and should not learn to. What it has, and what a
+code-graph tool generally does not, is a way to say when a derived artefact
+stopped being true and who is allowed to read it. Vendoring keeps that division
+intact while removing the process boundary that used to sit between them: the
+extractor is now called in-process, and its output never round-trips through a
+file that something else could have written.
+
+
+What is vendored
+----------------
+
+The import closure of `graphify.extract`, measured rather than guessed, plus the
+analysis modules Brainkit has no equivalent for (`cluster`, `analyze`, and the
+`build`/`validate` pair those import at module level). Everything else in
+Graphify — its CLI, LLM backends, report and export renderers, watch mode, MCP
+server, HTML visualisers, database exporters — is deliberately absent, because
+Brainkit already answers those questions its own way or does not ask them.
+
+"Measured rather than guessed" is not a flourish. A static read of the imports
+gives 39 modules; the real closure is 41. `detect` and `google_workspace` are
+imported inside function bodies, so nothing that only reads top-level imports
+can see them. After any re-vendor, grep the copied tree for `from graphify.` and
+import it for real.
+
+
+Two upstream modules are deliberately absent
+--------------------------------------------
+
+`dedup` and `export` are NOT vendored, and the gap is on purpose rather than an
+oversight. `build.py` imports them, but only inside two function bodies:
+
+    build()        line 1126   imports graphify.dedup
+    build_merge()  line 1538   imports graphify.export
+
+Brainkit calls neither. It constructs the NetworkX graph the analysis modules
+want from its own already-normalised `graph/code.json`, so Graphify's builder
+never runs. Vendoring the two would add 1,861 lines and, more to the point, a
+`rapidfuzz` dependency — for code paths that are never reached.
+
+The consequence, stated so nobody has to rediscover it: **calling
+`graphify.build.build()` or `build_merge()` from this vendored copy will raise
+`ModuleNotFoundError`, at call time rather than import time.** If a future
+change needs either function, vendor those two modules and add `rapidfuzz` to
+the `code` extra. Do not work around it by editing anything in this directory.
+
+
+What was changed
+----------------
+
+Nothing inside this directory. The files are byte-identical to upstream so that
+a future re-vendor is a copy rather than a merge, and so that any behaviour seen
+here can be reported against Graphify without first subtracting our edits.
+
+Adaptation lives outside this directory, in the adapter that implements
+Brainkit's `CodeExtractorPort`. That is also where Brainkit's own rules are
+applied — the vault is excluded from its own graph, prose nodes are dropped, and
+the result is normalised to Brainkit's node shape.
+
+
+Consequences that are not obvious
+---------------------------------
+
+- This directory is excluded from `ruff` and `mypy` in `pyproject.toml`. It does
+  not meet Brainkit's lint contract and reformatting it would make the next
+  upstream diff unreadable. The exclusion is scoped to this path only.
+- The third-party runtime it needs (tree-sitter grammars, and networkx for the
+  analysis modules) is an optional dependency group. Vendoring source does not
+  vendor a parser: `pip install brainkit[code]` is still required.

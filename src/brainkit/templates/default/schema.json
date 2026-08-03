@@ -19,6 +19,19 @@
       "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
       "uniqueItems": true
     },
+    "code_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "hash"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "additionalProperties": false
+      },
+      "uniqueItems": true
+    },
     "updated_at": { "type": "string", "format": "date-time" }
   },
   "additionalProperties": true

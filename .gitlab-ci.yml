@@ -1,0 +1,73 @@
+# The gate the README asks every contributor to run by hand, run automatically.
+#
+# Order matters and is deliberate. `lint` and `types` are fast and fail on the
+# whole tree, so they gate the slower jobs. `wheel` is last because it is the
+# only job that proves what actually ships: packaged prompt specs, output
+# schemas and templates cannot be verified from the source tree, where they
+# exist regardless of what the wheel contains.
+#
+# `ruff format --check` is intentionally absent. This project is lint-clean,
+# not format-clean; adding it here would fail every pipeline on a pre-existing
+# diff rather than on anything a contributor did.
+
+default:
+  image: python:3.13-slim
+  interruptible: true
+  before_script:
+    - pip install --quiet --root-user-action=ignore uv
+    - uv sync --all-extras --group dev
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .venv/
+      - .cache/uv/
+
+variables:
+  UV_CACHE_DIR: .cache/uv
+  # The engine's mechanical half never calls a model, and the suite is built to
+  # keep it that way. An accidental network read should fail, not quietly pass.
+  UV_NO_PROGRESS: "1"
+
+stages:
+  - check
+  - test
+  - deliver
+
+lint:
+  stage: check
+  script:
+    - uv run ruff check
+
+types:
+  stage: check
+  script:
+    - uv run mypy
+
+tests:
+  stage: test
+  script:
+    - uv run pytest -q
+
+# The interpreter the project pins is 3.13; `requires-python` allows 3.11+.
+# An installed `bk` has to work on the floor of that range, not only on the
+# version the maintainer happens to develop on.
+tests:oldest-supported:
+  stage: test
+  image: python:3.11-slim
+  script:
+    - uv run --python 3.11 --all-extras --group dev pytest -q
+
+wheel:
+  stage: deliver
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+    - pip install --quiet --root-user-action=ignore uv
+  script:
+    - ./scripts/verify-wheel.sh
+  artifacts:
+    when: on_failure
+    paths:
+      - dist/
+    expire_in: 1 week

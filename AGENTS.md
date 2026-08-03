@@ -281,3 +281,220 @@ Two process lessons from the repair round itself:
   Publishing to the GitLab PyPI registry therefore needs a separate token with
   `write_package_registry`, plus the numeric project id the API would return —
   a working `git clone` proves nothing about the package registry.
+
+## Agent workspace learnings (2026-08-02)
+
+- **The vault is not the agent's workspace.** `hooks install` resolved every
+  agent-facing path from `vault.root`, so a vault nested in a project wrote
+  `.claude/` and `CLAUDE.md` *inside the vault*, where no agent ever reads
+  them. This is the worst shape a defect can take here: every file lands, the
+  enforcement summary reports success, and the gate never runs once. `--root`
+  now names the workspace; the default stays the vault for standalone use.
+  Every helper already took `(root, vault)` separately — only the call site
+  conflated them, which is why the fix is small and the bug lasted.
+- **A silent wrong default needs a loud warning, not just a flag.** Adding
+  `--root` alone would have left the old invocation silently broken. An install
+  that fits the mistake's shape — a vault with no agent configuration of its
+  own, nested inside a directory that has some — now prints a `WORKSPACE` block
+  on stderr naming the directory and the exact flag to re-run with.
+- **Compute a diagnostic before the side effect it inspects.** The first
+  version of that check ran after the installer had already created `.claude/`
+  in the workspace, so it observed its own output and concluded all was well.
+  It fired only for the case that needed no warning. Any "does this look
+  wrong?" check must read the pre-install state.
+- **Two consumers, one bug.** `bk status` resolved enforcement from
+  `vault.root` too, so a *correctly* installed gate still reported every layer
+  off. The workspace is therefore persisted in `.brain/agent-<agent>.json`
+  (`version` 2) rather than recomputed — nothing else on disk remembers it. A
+  v1 adapter without the field falls back to the vault, so existing installs
+  report unchanged. When fixing a path-resolution bug, grep every *reader* of
+  that path, not just the writer.
+- **A path under another path defeats a substring assertion.** The test for
+  "the hook still governs the vault" used `assertNotIn("VAULT=<project>")`
+  while the correct value is `VAULT=<project>/docs/brain` — which contains it.
+  It failed against correct code. Compare whole assignment lines, not
+  substrings, whenever one candidate value is a prefix of another.
+- **A store documented as per-vault namespaced had the namespace in its ids but
+  not in its delete predicate.** The PostgreSQL export prefixed nothing and ran
+  `DELETE FROM edges` / `DELETE FROM nodes` with no `WHERE`, so syncing any
+  vault destroyed every other vault's subgraph in that schema — another
+  application's data, not a stale copy of our own. Neo4j, the same feature one
+  method away, scoped its delete correctly (`MATCH (n {vault_id: $vault_id})`),
+  which is what made the gap invisible: the design was right, one of its two
+  implementations was not. When a guarantee is claimed for a capability, check
+  it once per backend; a correct sibling is evidence about intent, never about
+  the code you have not read.
+- **Read where a value is defined, not where it looks defined.** The namespacing
+  `hashlib.sha256(...)[:24]` sat in `_sync_neo4j`, close enough to `_sync_postgres`
+  to be misread as shared by both. It was not, so the natural ids
+  (`page:<path>`, `raw:<hash>`) went to PostgreSQL unprefixed and collided
+  across vaults. Both backends now derive it from one `_vault_id()`; two
+  implementations of one guarantee should not each own a copy of the rule.
+- **Fixing half of this defect is worse than shipping it.** Scoping the delete
+  alone would have left `id text PRIMARY KEY` receiving colliding natural ids —
+  silent data loss becoming a duplicate-key crash on the second vault. The
+  unscoped wipe was the only reason the collision never fired. Before scoping a
+  delete, check what the full-table delete was masking: uniqueness constraints
+  are held up by the very statement you are about to constrain.
+- **`CREATE TABLE IF NOT EXISTS` cannot add a column to a table that exists.**
+  Deployed schemas would have kept a shape the new code assumed. Every column
+  the code depends on is also stated as `ALTER ... ADD COLUMN IF NOT EXISTS`,
+  then backfilled, then `SET NOT NULL` — inert on a fresh table, the actual
+  migration on an old one, and idempotent either way. Backfill adopts existing
+  rows into the syncing vault rather than a sentinel: the old truncating refresh
+  guarantees those rows are one vault's last complete sync, and the scoped
+  delete then reclaims them. A sentinel no vault ever names is permanent debris.
+- **Assert the outcome, not only the mechanism.** Tests that the SQL contains
+  `WHERE vault_id = %s` pass against code that emits the right string and still
+  loses data. `FakePostgresStore` applies the statements to a dict — honouring a
+  missing `WHERE` by emptying the table, as PostgreSQL would — so a test can say
+  what the user cares about: after vault B syncs, vault A's rows are still there
+  and the row count is the sum, not the max. That is the test that fails against
+  the old code.
+
+## Provider drift, lint config and the viewer boundary (2026-08-03)
+
+- **A provider request shape rots even though nothing in the repo changed.**
+  The Anthropic driver sent `temperature: 0`; sampling parameters were removed
+  on the current frontier models and are now rejected with a 400, so every
+  judgment job would have failed against the flagship provider while the suite
+  stayed green — the tests exercised the driver against a fake `urlopen`, which
+  accepts anything. One of them asserted `temperature == 0` for Anthropic *and*
+  OpenAI, so the suite was pinning the defect in place. When a test asserts a
+  provider's wire format, it is only as current as the day it was written.
+- **Read `stop_reason` before `content`.** Both terminal cases produce a
+  response that parses fine and answers nothing: a refusal carries an empty
+  content list, and a `max_tokens` truncation carries JSON that stops
+  mid-token. Returning either sends the repair loop after output that no retry
+  can fix — three attempts, three identical outcomes, and a final error naming
+  the schema rather than the cause. `max_tokens` now also bounds thinking,
+  which is on by default, so a budget that fit before can truncate now.
+- **Constrained decoding cannot express a free-form object.** Strict structured
+  output requires every object to close `additionalProperties`, and the ingest
+  schema's `metadata` is deliberately open — closing it would forbid exactly
+  the custom frontmatter `.brain/schema.json` exists to let a vault declare. So
+  the projection sent to a provider is an allow-list of keywords (unverified
+  ones degrade to "not sent", never to "rejected"), and a schema that cannot be
+  expressed exactly drops to guidance rather than being silently narrowed. The
+  repair loop validates the full schema either way, so the provider projection
+  can only cost a retry.
+- **`bk status` runs a full lint, so anything per-page in lint is per-page in
+  status.** `schema()` re-reads and re-parses `.brain/schema.json` on every
+  call and was called once per page, and the JSON Schema validator was
+  recompiled each time with it. Hoisting the read and memoizing compilation on
+  the schema's canonical serialization (not its identity — the vault hands back
+  a new object every call) made lint 6× faster at 200 pages, and the gap widens
+  with the page count.
+- **Origin does not stop DNS rebinding; Host does.** The MCP endpoint has
+  checked `Origin` since it shipped and the viewer checked nothing, which reads
+  as an oversight rather than a decision. Origin is the wrong instrument
+  anyway: a same-origin GET carries none at all, so a rebound page passes the
+  check trivially. What it cannot forge is `Host`, which still names the
+  attacker's domain. Both are now enforced, ahead of `/api/health`, because a
+  loopback viewer needs no token and answers at `--consumer human`, which
+  withholds nothing.
+- **A test that assembles a server by hand cannot see a check added to it.**
+  The web test built `BrainkitWebServer` field by field, so a handler that
+  began reading two new attributes failed with `AttributeError` instead of
+  exercising them. `build_server()` is now the only way in, tests included.
+- **Ruff's default is four rule groups.** With no `[tool.ruff]` section the gate
+  meant roughly "no undefined names, no unused imports", and with no
+  `[tool.mypy]` section `mypy src` never checked an untyped function's body.
+  Turning both up found a `.docx` entity-expansion path, a `urlopen` that would
+  honour `file:`, and 13 unannotated definitions — under 40 real findings
+  total, which is the argument for having done it earlier. Deliberately not
+  selected: `SIM` (its findings here are the atomic-write idiom and nested
+  `with` in tests) and `E501` (a formatter's job; this tree is lint-clean, not
+  format-clean, and selecting it would bury the rules that matter).
+- **Check for a second writer before trusting `git diff --stat` as your own.**
+  This round's tree also grew a Postgres vault-scoping feature and its tests
+  from a concurrent session. The tell was arithmetic: the suite went 356 → 400
+  while the changes made here account for ~34. Read-modify-write patches over
+  whole files are unsafe under that condition; targeted edits are not.
+- **A loop over many vaults is a different command from the one it calls, and
+  the difference is entirely in what it refuses.** `bk vaults sync` (400 → 429)
+  syncs every registered vault into the shared store, so the three decisions
+  that matter are all negative: a vault that has not enabled the target is
+  *skipped* rather than enabled on its behalf, a vault that fails is reported
+  and the loop continues (the exit status carries it, since nothing is raised),
+  and `--consumer` is refused outright — `export` already refuses it per vault
+  because the policy owns the boundary, and here a refresh deletes the vault's
+  rows before reinserting, so a narrowed run would silently replace what the
+  store holds with less, for every vault at once. The registry itself is
+  declared, never discovered: a scan would be slow, would miss vaults outside
+  the trees it was given, and would find checkouts and backups that must never
+  write into a shared schema under their own `vault_id`. Store the path
+  `expanduser().resolve()`d exactly as `FileVault` does — the id is a hash of
+  that string, so an entry differing by a symlink reports an id no row carries.
+
+## Splitting the service, and the watch ignore list (2026-08-03)
+
+- **Draw the seams from the call graph, not from the headings.** The 2,500-line
+  `BrainkitService` looked entangled because the methods sat in one file, but
+  almost every private helper had one or two callers inside a single cluster.
+  Walking `self.<attr>` references with `ast` produced the decomposition in one
+  pass — and named the only genuinely shared machinery, the judgment repair
+  loop and the apply gate. Reading the file top to bottom would have suggested
+  the opposite.
+- **Extract leaves first and the layering falls out.** `compilation`,
+  `retrieval` and `judgment` need only ports, so they moved with no rewiring at
+  all. Everything above them then had something to depend on, and the finished
+  layer is an import DAG with `services` as the only module that sees all of
+  it. A cycle check on the import graph is worth keeping — it is the property
+  that makes the split real rather than cosmetic.
+- **Facade methods must survive the move.** `apply`, `search`, `status`,
+  `ingest` and the rest are called by the CLI, MCP and the viewer. Moving the
+  body and leaving a one-line delegation kept every call site and the whole
+  suite unchanged, which is what let the refactor be verified rather than
+  believed. mypy's `has no attribute` errors enumerated the list for free.
+- **Do not "fix" indentation with a regex, and never with a heuristic.**
+  Deleting a line with `re.sub(r"x = y\(\)\n(\s*)", r"\1", s)` leaves the next
+  statement carrying both indents. The repair pass I then wrote — re-indent any
+  line deeper than its predecessor allows — flattened bullet lists inside
+  docstrings, because a docstring's continuation lines are not statements. Two
+  lessons: prefer exact-string edits when removing a line, and if a mechanical
+  pass touches whole files, re-scan the result for the damage it can cause
+  (`ast.get_docstring` against each node's `col_offset` found it immediately).
+- **An AST extractor must carry decorators.** `node.lineno` points at `def`,
+  not at `@staticmethod`, so a moved method arrived without its decorator and
+  the orphan stayed behind. mypy caught it as "invalid self argument", which is
+  a confusing symptom for a missing line; `grep -n "@staticmethod"` across the
+  new modules is the direct check.
+- **A watch that captures everything is worse than noisy — it is permanent.**
+  `_watch` walked `rglob("*")` over every configured folder, so pointing it at
+  a project filed `node_modules` and `.git` into `raw/`, where identity is the
+  hash of the bytes and nothing can be removed. The ignore list prunes at the
+  directory level (`os.walk` + `directories[:] = kept`), so an excluded tree
+  costs one comparison rather than a stat per file inside it.
+- **Absent and empty are different answers.** A vault written before `ignore`
+  existed must inherit the defaults, or upgrading the engine silently starts
+  capturing what it never did; a vault storing `[]` has answered the question.
+  Reading `"ignore" not in raw` rather than a falsy check is the whole
+  difference, and it is the same distinction `--consumer` needed.
+- **Selection is a vault rule, so it does not live in the CLI.** The walk moved
+  to `BrainkitService.watch_once()`; the CLI keeps only the loop and the
+  interval. Any second caller that walked a folder its own way would file what
+  the policy excluded.
+
+## Vendored code-analysis subset (2026-08-03)
+
+- `src/brainkit/infrastructure/codeanalysis/` is vendored from Graphify
+  (Apache-2.0, upstream `00efd6e`, v0.9.32). It is the **only** directory in this
+  repo excluded from Ruff and mypy, and the only place a stdlib-plus-jsonschema
+  claim does not hold. Both exclusions are scoped to that path and stated in
+  `pyproject.toml` next to the setting.
+- Keep it **byte-identical to upstream**. A re-vendor should be a copy, not a
+  merge, and a behaviour seen there should be reportable against Graphify
+  without first subtracting our edits. Every adaptation belongs in the adapter
+  that implements `CodeExtractorPort`.
+- Vendoring source did not vendor a parser. The tree-sitter grammars are
+  compiled wheels and remain a real dependency, which is why the code graph is
+  the `code` extra rather than a base requirement: ~70 MB for a capability most
+  vaults never use. The core stays at one dependency.
+- Attribution is not optional and not decorative: Apache-2.0 §4 requires the
+  retained `NOTICE`, the copyright line, and a statement of changes. They live in
+  `NOTICE` and `src/brainkit/infrastructure/codeanalysis/NOTICE`.
+- Brainkit keeps its own traversal (`affected`/`path`/`hubs`) rather than the
+  vendored networkx one. It needs no dependency and already answers under a
+  `--consumer`. Take vendored analysis only for what Brainkit cannot do:
+  community detection, import cycles, graph diff.

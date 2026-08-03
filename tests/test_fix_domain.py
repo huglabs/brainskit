@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 from brainkit.application.services import BrainkitService
@@ -17,18 +20,25 @@ from brainkit.domain.model import (
     WIKI_DIRECTORIES,
     PageKind,
     PageOperation,
+    PolicyError,
     ValidationError,
     VaultConfig,
+    _compiled_validator,
+    validate_schema,
 )
 from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
+from brainkit.infrastructure.index import SqliteFtsIndex, _iter_documents
 from brainkit.infrastructure.integrations import NativeIntegrations
 from brainkit.infrastructure.llm import (
+    DEFAULT_ANTHROPIC_MAX_TOKENS,
     DEFAULT_OLLAMA_OPTIONS,
+    AnthropicDriver,
     JobSpecs,
     OllamaDriver,
     PolicyJudgmentRouter,
     _create_driver,
+    _strictly_expressible,
+    _structured_schema,
 )
 from brainkit.infrastructure.vault import FileVault
 
@@ -113,11 +123,42 @@ def _wire_capture(response: dict) -> tuple[list[dict], object]:
     sent: list[dict] = []
     encoded = json.dumps(response).encode("utf-8")
 
-    def fake_urlopen(request, timeout=None):  # noqa: ANN001 - urlopen signature
+    def fake_urlopen(request, timeout=None):
         sent.append(json.loads(request.data.decode("utf-8")))
         return _FakeResponse(encoded)
 
     return sent, fake_urlopen
+
+
+def _wire_sequence(*responses: object) -> tuple[list[dict], object]:
+    """Like `_wire_capture`, but serves one reply per call.
+
+    An `HTTPError` in the sequence is raised instead of returned, which is how
+    a rejected request reaches the driver. Needed to exercise the paths where
+    the first attempt is refused and the driver has to retry differently.
+    """
+
+    sent: list[dict] = []
+    queue = list(responses)
+
+    def fake_urlopen(request, timeout=None):
+        sent.append(json.loads(request.data.decode("utf-8")))
+        reply = queue.pop(0) if queue else {}
+        if isinstance(reply, Exception):
+            raise reply
+        return _FakeResponse(json.dumps(reply).encode("utf-8"))
+
+    return sent, fake_urlopen
+
+
+def _http_error(status: int, body: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://api.example/v1/messages",
+        status,
+        "Bad Request",
+        {},  # type: ignore[arg-type]
+        io.BytesIO(body.encode("utf-8")),
+    )
 
 
 class PageDirectoryTest(unittest.TestCase):
@@ -564,7 +605,217 @@ class OllamaContextOptionTest(unittest.TestCase):
                 with mock.patch("urllib.request.urlopen", fake_urlopen):
                     driver.complete("prompt", model="m", output_schema=None)
                 self.assertNotIn("options", sent[0])
-                self.assertEqual(sent[0]["temperature"], 0)
+        # `temperature` is an OpenAI-only field now: the Anthropic frontier
+        # models reject it outright, so asserting it for both providers would
+        # be asserting the defect. See AnthropicRequestShapeTest.
+        self.assertEqual(sent[0]["temperature"], 0)
+
+
+class AnthropicRequestShapeTest(unittest.TestCase):
+    """The Messages API request must be one the current models accept.
+
+    Every assertion here corresponds to a way the previous request shape
+    failed against a frontier model: a rejected sampling parameter, a schema
+    described in prose instead of enforced, and two terminal responses that
+    parsed cleanly while carrying no answer.
+    """
+
+    def driver(self, **kwargs: object) -> AnthropicDriver:
+        return AnthropicDriver(
+            base_url="https://api.example/v1", api_key="k", **kwargs
+        )
+
+    def send(
+        self, *responses: object, schema: dict | None = None
+    ) -> tuple[list[dict], str]:
+        sent, fake_urlopen = _wire_sequence(*responses)
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            text = self.driver().complete("prompt", model="m", output_schema=schema)
+        return sent, text
+
+    def test_no_sampling_parameter_is_sent(self) -> None:
+        sent, _ = self.send({"content": [{"type": "text", "text": "{}"}]})
+        for parameter in ("temperature", "top_p", "top_k"):
+            self.assertNotIn(parameter, sent[0])
+
+    def test_max_tokens_leaves_room_for_thinking(self) -> None:
+        sent, _ = self.send({"content": [{"type": "text", "text": "{}"}]})
+        self.assertEqual(sent[0]["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS)
+        self.assertGreater(sent[0]["max_tokens"], 8192)
+
+    def test_a_schema_is_enforced_not_described(self) -> None:
+        schema = JobSpecs().schema("query")
+        sent, _ = self.send(
+            {"content": [{"type": "text", "text": "{}"}]}, schema=schema
+        )
+        self.assertEqual(
+            sent[0]["output_config"]["format"]["type"], "json_schema"
+        )
+        self.assertNotIn("Return only JSON", sent[0]["messages"][0]["content"])
+
+    def test_a_free_form_object_falls_back_to_the_described_schema(self) -> None:
+        # The ingest schema carries a free-form `metadata` object, which
+        # constrained decoding cannot express without forbidding exactly the
+        # custom frontmatter a vault is allowed to declare.
+        sent, _ = self.send(
+            {"content": [{"type": "text", "text": "{}"}]},
+            schema=JobSpecs().schema("ingest"),
+        )
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("output_config", sent[0])
+        self.assertIn("Return only JSON", sent[0]["messages"][0]["content"])
+
+    def test_a_model_without_structured_output_degrades_instead_of_failing(
+        self,
+    ) -> None:
+        sent, text = self.send(
+            _http_error(400, '{"error":{"message":"output_config: unsupported"}}'),
+            {"content": [{"type": "text", "text": "{}"}]},
+            schema=JobSpecs().schema("query"),
+        )
+        self.assertEqual(len(sent), 2)
+        self.assertIn("output_config", sent[0])
+        self.assertNotIn("output_config", sent[1])
+        self.assertIn("Return only JSON", sent[1]["messages"][0]["content"])
+        self.assertEqual(text, "{}")
+
+    def test_an_unrelated_400_is_not_retried_in_a_weaker_mode(self) -> None:
+        sent, fake_urlopen = _wire_sequence(
+            _http_error(400, '{"error":{"message":"model: not_found"}}')
+        )
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(ValidationError) as caught:
+                self.driver().complete(
+                    "prompt", model="m", output_schema=JobSpecs().schema("query")
+                )
+        self.assertEqual(len(sent), 1)
+        self.assertIn("not_found", str(caught.exception.details))
+
+    def test_a_refusal_is_a_policy_denial_not_an_empty_answer(self) -> None:
+        sent, fake_urlopen = _wire_sequence(
+            {
+                "content": [],
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": "cyber"},
+            }
+        )
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(PolicyError) as caught:
+                self.driver().complete("prompt", model="m", output_schema=None)
+        self.assertEqual(caught.exception.details["category"], "cyber")
+
+    def test_truncated_output_names_the_budget_that_truncated_it(self) -> None:
+        sent, fake_urlopen = _wire_sequence(
+            {
+                "content": [{"type": "text", "text": '{"answer": "half'}],
+                "stop_reason": "max_tokens",
+            }
+        )
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(ValidationError) as caught:
+                self.driver(max_tokens=64).complete(
+                    "prompt", model="m", output_schema=None
+                )
+        self.assertEqual(caught.exception.details["max_tokens"], 64)
+        self.assertIn("max_tokens", str(caught.exception))
+
+    def test_an_answer_with_no_text_is_rejected(self) -> None:
+        sent, fake_urlopen = _wire_sequence(
+            {"content": [{"type": "thinking", "thinking": ""}], "stop_reason": "end_turn"}
+        )
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(ValidationError):
+                self.driver().complete("prompt", model="m", output_schema=None)
+
+    def test_the_token_budget_is_configurable_per_vault(self) -> None:
+        with mock.patch.dict("os.environ", {"BRAINKIT_TEST_ANTHROPIC_KEY": "k"}):
+            driver = _create_driver(
+                "anthropic",
+                {
+                    "base_url": "https://api.example/v1",
+                    "api_key_env": "BRAINKIT_TEST_ANTHROPIC_KEY",
+                    "max_tokens": 32000,
+                },
+            )
+        assert isinstance(driver, AnthropicDriver)
+        self.assertEqual(driver.max_tokens, 32000)
+
+    def test_a_mistyped_budget_is_rejected_rather_than_defaulted(self) -> None:
+        for value in ("32000", 0, -1, True):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    "os.environ", {"BRAINKIT_TEST_ANTHROPIC_KEY": "k"}
+                ):
+                    with self.assertRaises(ValidationError):
+                        _create_driver(
+                            "anthropic",
+                            {
+                                "base_url": "https://api.example/v1",
+                                "api_key_env": "BRAINKIT_TEST_ANTHROPIC_KEY",
+                                "max_tokens": value,
+                            },
+                        )
+
+
+class StructuredSchemaProjectionTest(unittest.TestCase):
+    """Constrained decoding accepts a narrower schema than the vault enforces.
+
+    The projection may only ever *widen* what a provider will emit — the full
+    schema still runs locally in the repair loop, so a dropped keyword costs a
+    retry, while a wrongly narrowed one would reject valid output forever.
+    """
+
+    def objects(self, node: object):
+        if isinstance(node, dict):
+            if "properties" in node:
+                yield node
+            for value in node.values():
+                yield from self.objects(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from self.objects(value)
+
+    def test_every_shipped_schema_projects_to_a_closed_object_graph(self) -> None:
+        for job in ("ingest", "query", "digest", "resurface", "lint-semantic"):
+            with self.subTest(job=job):
+                projected = _structured_schema(JobSpecs().schema(job))
+                for node in self.objects(projected):
+                    self.assertIs(node["additionalProperties"], False)
+                    self.assertEqual(
+                        sorted(node["required"]), sorted(node["properties"])
+                    )
+
+    def test_unsupported_keywords_are_dropped(self) -> None:
+        projected = json.dumps(_structured_schema(JobSpecs().schema("ingest")))
+        for keyword in ("minLength", "pattern", "minItems", "uniqueItems"):
+            self.assertNotIn(keyword, projected)
+
+    def test_an_optional_property_becomes_required_and_nullable(self) -> None:
+        # Dropping it instead would forbid a field the vault permits.
+        projected = _structured_schema(JobSpecs().schema("ingest"))
+        operation = projected["properties"]["operations"]["items"]
+        self.assertIn("metadata", operation["required"])
+        self.assertEqual(operation["properties"]["metadata"]["type"], ["object", "null"])
+
+    def test_a_free_form_object_disqualifies_strict_mode(self) -> None:
+        self.assertFalse(
+            _strictly_expressible(_structured_schema(JobSpecs().schema("ingest")))
+        )
+        for job in ("query", "digest", "resurface", "lint-semantic"):
+            with self.subTest(job=job):
+                self.assertTrue(
+                    _strictly_expressible(_structured_schema(JobSpecs().schema(job)))
+                )
+
+    def test_a_free_form_object_is_found_at_any_depth(self) -> None:
+        closed = {"type": "object", "properties": {}, "additionalProperties": False}
+        for nesting in (
+            {"type": "array", "items": {"type": "object"}},
+            {"anyOf": [closed, {"type": "object"}]},
+            {"$defs": {"loose": {"type": "object"}}, **closed},
+        ):
+            with self.subTest(nesting=sorted(nesting)):
+                self.assertFalse(_strictly_expressible(nesting))
 
 
 class BranchPolicyDetailTest(unittest.TestCase):
@@ -620,6 +871,104 @@ class BranchPolicyDetailTest(unittest.TestCase):
     def test_a_valid_policy_is_still_accepted(self) -> None:
         config = VaultConfig.from_dict(policy())
         self.assertIn("20-research", config.branches)
+
+
+class ValidatorCompilationTest(unittest.TestCase):
+    """Compiling a JSON Schema is the expensive half of validating against it."""
+
+    SCHEMA: ClassVar[dict[str, object]] = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["id"],
+        "properties": {"id": {"type": "string", "minLength": 1}},
+    }
+
+    def test_an_equal_schema_read_again_reuses_the_compiled_validator(self) -> None:
+        # The vault re-reads schema.json from disk per call, so the cache has
+        # to key on the schema's content, not on object identity.
+        _compiled_validator.cache_clear()
+        validate_schema({"id": "a"}, json.loads(json.dumps(self.SCHEMA)))
+        first = _compiled_validator.cache_info()
+        validate_schema({"id": "b"}, json.loads(json.dumps(self.SCHEMA)))
+        second = _compiled_validator.cache_info()
+        self.assertEqual(second.misses, first.misses)
+        self.assertEqual(second.hits, first.hits + 1)
+
+    def test_key_order_does_not_defeat_the_cache(self) -> None:
+        _compiled_validator.cache_clear()
+        reordered = dict(reversed(list(self.SCHEMA.items())))
+        validate_schema({"id": "a"}, self.SCHEMA)
+        validate_schema({"id": "a"}, reordered)
+        self.assertEqual(_compiled_validator.cache_info().misses, 1)
+
+    def test_an_invalid_schema_keeps_being_reported(self) -> None:
+        # lru_cache does not memoize exceptions; a schema that fails to compile
+        # must fail on the second call too, not pass silently.
+        broken = {"type": "not-a-type"}
+        for _ in range(2):
+            failures = validate_schema({"id": "a"}, broken)
+            self.assertEqual([failure["code"] for failure in failures], ["schema.invalid"])
+
+    def test_an_unserializable_schema_still_validates(self) -> None:
+        # A set cannot be cache-keyed. The schema must still be enforced —
+        # a caching problem must never be answered with "valid".
+        schema = {
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "string"}},
+            "x-annotation": {1, 2},
+        }
+        self.assertEqual(validate_schema({"id": "a"}, schema), [])
+        self.assertEqual(
+            [failure["code"] for failure in validate_schema({}, schema)],
+            ["schema.required"],
+        )
+
+
+class IndexStreamingTest(unittest.TestCase):
+    """A rebuild must not hold the whole corpus in memory to count it."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.service = BrainkitService(self.vault, self.index, graph=MarkdownGraph())
+        for number in range(4):
+            record, _ = self.vault.capture_text(f"body {number}", f"note-{number}")
+            self.vault.file_source(record.content_hash, "20-research")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_documents_are_produced_lazily(self) -> None:
+        reads: list[str] = []
+        original = self.vault.raw_text
+
+        def counting_raw_text(record, max_chars=None):
+            reads.append(record.path)
+            return original(record, max_chars)
+
+        self.vault.raw_text = counting_raw_text  # type: ignore[method-assign]
+        try:
+            documents = _iter_documents(self.vault, self.vault.registry())
+            self.assertEqual(reads, [])
+            next(documents)
+            self.assertEqual(len(reads), 1)
+        finally:
+            self.vault.raw_text = original  # type: ignore[method-assign]
+
+    def test_a_streamed_rebuild_indexes_and_counts_every_document(self) -> None:
+        counted = self.index.rebuild(self.vault)
+        self.assertEqual(counted, len(list(_iter_documents(self.vault, self.vault.registry()))))
+        self.assertEqual(self.index.stats()["documents"], counted)
+        self.assertEqual(len(self.index.search("body", limit=10)), 4)
+
+    def test_a_rebuild_replaces_rather_than_appends(self) -> None:
+        first = self.index.rebuild(self.vault)
+        second = self.index.rebuild(self.vault)
+        self.assertEqual(first, second)
+        self.assertEqual(self.index.stats()["documents"], second)
 
 
 if __name__ == "__main__":

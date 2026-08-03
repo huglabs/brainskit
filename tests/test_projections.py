@@ -23,17 +23,18 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brainkit.application.services import (
+from brainkit.application.codegraph import CODE_PROJECTION
+from brainkit.application.freshness import (
     GRAPH_PROJECTION,
     PROJECTION_RAW_FIELDS,
     VIEWS_PROJECTION,
-    BrainkitService,
     _fingerprint_row,
     _projection_source_hash,
 )
+from brainkit.application.services import BrainkitService
 from brainkit.domain.model import SourceRecord
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
@@ -291,7 +292,7 @@ class IdempotencyTest(ProjectionFixture):
 
         def age(state: dict) -> dict:
             state["pages"][page]["updated_at"] = (
-                datetime.now(timezone.utc) - timedelta(days=45)
+                datetime.now(UTC) - timedelta(days=45)
             ).isoformat()
             return state
 
@@ -325,7 +326,7 @@ class MtimeIndependenceTest(ProjectionFixture):
         self.service.views()
 
     def touch(self, relative: str, *, days: int) -> None:
-        stamp = (datetime.now(timezone.utc) + timedelta(days=days)).timestamp()
+        stamp = (datetime.now(UTC) + timedelta(days=days)).timestamp()
         os.utime(self.root / relative, (stamp, stamp))
 
     def test_touching_the_projections_keeps_them_fresh(self) -> None:
@@ -574,7 +575,7 @@ class SourceHashTest(ProjectionFixture):
     def hash_in_subprocess(self, seed: str, artifact: str) -> str:
         program = (
             "import json, sys;"
-            "from brainkit.application.services import"
+            "from brainkit.application.freshness import"
             " _projection_source_hash, PROJECTION_RAW_FIELDS;"
             "from brainkit.domain.model import SourceRecord;"
             "pages = json.load(open(sys.argv[1]))['pages'];"
@@ -737,9 +738,13 @@ class StatusBlockTest(ProjectionFixture):
         self.source = self.capture(text="Evidencia para o status.", title="status")
         self.apply_page("pagina-status", self.source)
 
-    def test_the_block_covers_exactly_the_two_artefacts(self) -> None:
+    def test_the_block_covers_exactly_the_known_artefacts(self) -> None:
+        # The code graph joined the block rather than getting a key of its own:
+        # it is derived, regenerable and worthless once its inputs move, which
+        # is the definition the other two already satisfy.
         self.assertEqual(
-            set(self.projections()), {GRAPH_PROJECTION, VIEWS_PROJECTION}
+            set(self.projections()),
+            {GRAPH_PROJECTION, VIEWS_PROJECTION, CODE_PROJECTION},
         )
 
     def test_each_entry_carries_the_contracted_fields(self) -> None:
@@ -761,7 +766,7 @@ class StatusBlockTest(ProjectionFixture):
 
         def backdate(state: dict) -> dict:
             state["projections"][GRAPH_PROJECTION]["generated_at"] = (
-                datetime.now(timezone.utc) - timedelta(days=28)
+                datetime.now(UTC) - timedelta(days=28)
             ).isoformat()
             return state
 

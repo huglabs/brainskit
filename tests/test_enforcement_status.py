@@ -16,12 +16,12 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from test_engine import policy
+
 from brainkit.application.services import BrainkitService
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
 from brainkit.infrastructure.vault import FileVault
-
-from test_engine import policy
 
 GATE = "brainkit-gate.sh"
 STATUS = "brainkit-status.sh"

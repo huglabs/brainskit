@@ -18,6 +18,11 @@
 set -u
 
 VAULT={{vault}}
+# Where the agent's configuration was installed, which is not always the vault:
+# the hooks, the instruction file and the git repository that tracks the vault
+# all belong to the workspace. Checking the vault for them reports a live layer
+# as OFF, which is the exact failure this script exists to surface.
+WORKSPACE={{workspace}}
 
 note() {
     printf 'brainkit-status: %s\n' "$*" >&2
@@ -77,9 +82,9 @@ else
     WRITE_GATE='OFF (brainkit-gate.sh is missing; re-run bk hooks install)'
 fi
 
-if [ ! -d "$VAULT/.git" ]; then
-    COMMIT_LINT='OFF (the vault is not a git repository)'
-elif [ ! -f "$VAULT/.git/hooks/pre-commit" ]; then
+if [ ! -d "$WORKSPACE/.git" ]; then
+    COMMIT_LINT='OFF (the workspace is not a git repository)'
+elif [ ! -f "$WORKSPACE/.git/hooks/pre-commit" ]; then
     COMMIT_LINT='OFF (no pre-commit hook is installed)'
 else
     COMMIT_LINT=active

@@ -28,6 +28,7 @@ from brainkit.interfaces.mcp import (
     _tool_definitions,
     run_stdio,
 )
+from brainkit.interfaces.web import build_server
 
 
 def policy() -> dict:
@@ -613,6 +614,95 @@ class AgentInstallTest(unittest.TestCase):
     def test_an_unknown_template_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             cli._agent_template("does-not-exist", self.root)
+
+
+class WebViewerBoundaryTest(unittest.TestCase):
+    """The viewer answers only to the names and origins it was bound for.
+
+    A loopback viewer needs no token — that is the documented default — so the
+    only thing keeping a web page out of the vault is that it cannot reach
+    127.0.0.1. DNS rebinding removes that, and at `--consumer human` the API
+    withholds nothing, `never-ingest` bodies included. The MCP endpoint has
+    checked Origin since it shipped; this covers the same ground for the
+    viewer, plus the Host check that rebinding actually turns on.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.service = BrainkitService(
+            self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
+        )
+        self.service.reindex()
+        self.server = build_server(
+            self.service, host="127.0.0.1", port=0, consumer="human"
+        )
+        self.port = self.server.server_port
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def get(self, path: str, **headers: str) -> tuple[int, str]:
+        request = Request(f"http://127.0.0.1:{self.port}{path}", headers=headers)
+        try:
+            with urlopen(request, timeout=3) as response:
+                return response.status, response.read().decode("utf-8")
+        except HTTPError as error:
+            return error.code, error.read().decode("utf-8")
+
+    def test_the_configured_host_is_served(self) -> None:
+        for path in ("/", "/api/health", "/api/status"):
+            with self.subTest(path=path):
+                status, _ = self.get(path)
+                self.assertEqual(status, HTTPStatus.OK)
+
+    def test_the_loopback_alias_is_served(self) -> None:
+        status, _ = self.get("/api/status", Host=f"localhost:{self.port}")
+        self.assertEqual(status, HTTPStatus.OK)
+
+    def test_a_rebound_name_reaches_nothing(self) -> None:
+        # Health included: a rebound page must not even learn a viewer is here.
+        for path in ("/", "/api/health", "/api/status", "/api/resource?id=x"):
+            with self.subTest(path=path):
+                status, body = self.get(path, Host="attacker.example")
+                self.assertEqual(status, HTTPStatus.FORBIDDEN)
+                self.assertEqual(json.loads(body)["error"]["code"], "host_denied")
+
+    def test_a_foreign_origin_is_refused(self) -> None:
+        status, body = self.get("/api/status", Origin="http://attacker.example")
+        self.assertEqual(status, HTTPStatus.FORBIDDEN)
+        self.assertEqual(json.loads(body)["error"]["code"], "origin_denied")
+
+    def test_the_viewers_own_origin_is_allowed(self) -> None:
+        status, _ = self.get("/api/status", Origin=f"http://127.0.0.1:{self.port}")
+        self.assertEqual(status, HTTPStatus.OK)
+
+    def test_a_named_origin_whitelists_its_host_too(self) -> None:
+        server = build_server(
+            self.service,
+            host="127.0.0.1",
+            port=0,
+            consumer="local",
+            allowed_origins=["https://brain.example"],
+        )
+        try:
+            self.assertIn("brain.example", server.allowed_hosts)
+            self.assertIn("127.0.0.1", server.allowed_hosts)
+            self.assertEqual(server.allowed_origins, {"https://brain.example"})
+        finally:
+            server.server_close()
+
+    def test_a_remote_bind_still_requires_a_token(self) -> None:
+        with self.assertRaises(ValidationError):
+            build_server(
+                self.service, host="0.0.0.0", port=0, consumer="local"  # noqa: S104
+            )
 
 
 if __name__ == "__main__":

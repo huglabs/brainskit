@@ -7,24 +7,29 @@ import shlex
 import sys
 import time
 import traceback
+from collections import Counter
+from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, NamedTuple, Sequence
+from typing import Any, NamedTuple
 
 from brainkit import __version__
 from brainkit.application.services import BrainkitService
 from brainkit.domain.model import (
+    DEFAULT_IGNORE_PATTERNS,
     BrainkitError,
     FilingMode,
     PolicyError,
     PrivacyMode,
     ValidationError,
 )
+from brainkit.infrastructure.extractor import GraphifyExtractor
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.integrations import NativeIntegrations
+from brainkit.infrastructure.integrations import NativeIntegrations, vault_id
 from brainkit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainkit.infrastructure.vault import FileVault
+from brainkit.infrastructure.vaults import RegisteredVault, VaultRegistry
 
 
 class InternalError(BrainkitError):
@@ -96,6 +101,88 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("views", help="Regenerate Obsidian views")
     graph = commands.add_parser("graph", help="Regenerate the knowledge graph")
     graph.add_argument("--html", action="store_true")
+
+    # `build` extracts in-process (the vendored Graphify closure, gated on the
+    # `code` extra); `import` accepts a graph produced any other way. Both are
+    # normalised and bounded by the same `CodeGraph.import_graph` seam, so
+    # neither path is more trusted than the other.
+    code = commands.add_parser("code", help="The repository graph and queries over it")
+    code_commands = code.add_subparsers(dest="code_command", required=True)
+
+    code_build = code_commands.add_parser(
+        "build", help="Extract the repository graph in-process and import it"
+    )
+    code_build.add_argument(
+        "paths",
+        nargs="*",
+        metavar="PATH",
+        help="Scope the scan to these files/directories (default: the whole code root)",
+    )
+
+    code_import = code_commands.add_parser(
+        "import", help="Import an extractor's graph as graph/code.json"
+    )
+    code_import.add_argument("graph", metavar="GRAPH_JSON")
+
+    code_commands.add_parser(
+        "status", help="Whether the graph still describes the repository"
+    )
+
+    code_affected = code_commands.add_parser(
+        "affected", help="What breaks if this symbol changes"
+    )
+    code_affected.add_argument("symbol")
+    code_affected.add_argument("--depth", type=int, default=2)
+
+    code_path = code_commands.add_parser(
+        "path", help="Shortest chain of edges between two symbols"
+    )
+    code_path.add_argument("source")
+    code_path.add_argument("target")
+
+    code_hubs = code_commands.add_parser("hubs", help="The most connected symbols")
+    code_hubs.add_argument("--top", type=int, default=10)
+
+    code_communities = code_commands.add_parser(
+        "communities", help="Group the graph into structurally cohesive clusters"
+    )
+    code_communities.add_argument(
+        "--resolution",
+        type=float,
+        default=1.0,
+        help="Higher = more, smaller communities; lower = fewer, larger ones",
+    )
+
+    code_cycles = code_commands.add_parser("cycles", help="Import cycles among files")
+    code_cycles.add_argument(
+        "--max-length", type=int, default=5, dest="max_length",
+        help="Longest cycle (in files) worth reporting",
+    )
+    code_cycles.add_argument("--top", type=int, default=20)
+
+    code_diff = code_commands.add_parser(
+        "diff", help="What changed structurally since the stored graph"
+    )
+    code_diff.add_argument(
+        "graph",
+        nargs="?",
+        metavar="GRAPH_JSON",
+        help=(
+            "Diff against this extractor-shaped graph (same shape as `code "
+            "import`, not brainkit's own stored graph/code.json) instead of "
+            "extracting the repository fresh"
+        ),
+    )
+
+    for reader in (
+        code_affected, code_path, code_hubs, code_communities, code_cycles, code_diff,
+    ):
+        reader.add_argument(
+            "--consumer",
+            choices=["human", "local", "cloud"],
+            default="local",
+            help="The code graph carries repository paths and never leaves the machine",
+        )
 
     export = commands.add_parser("export", help="Export the graph")
     export.add_argument(
@@ -174,6 +261,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["claude", "codex", "gemini", "opencode"],
     )
     hooks_install.add_argument(
+        "--root",
+        help=(
+            "Directory that owns the agent's configuration -- .claude/, "
+            "CLAUDE.md and the git pre-commit hook. Defaults to the vault, "
+            "which is right only when the vault is itself the project the "
+            "agent opens"
+        ),
+    )
+    hooks_install.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -231,6 +327,67 @@ def build_parser() -> argparse.ArgumentParser:
             "name", choices=["obsidian", "neo4j", "postgres", "web"]
         )
 
+    vaults = commands.add_parser(
+        "vaults",
+        help="Register the vaults on this machine and sync them as one set",
+    )
+    vaults_sub = vaults.add_subparsers(dest="vaults_command", required=True)
+    vaults_register = vaults_sub.add_parser(
+        "register", help="Add a vault to this machine's registry"
+    )
+    vaults_register.add_argument(
+        "path",
+        nargs="?",
+        help=(
+            "Vault root. Defaults to --vault, and otherwise to the vault "
+            "discovered from the current directory"
+        ),
+    )
+    vaults_register.add_argument(
+        "--label",
+        default="",
+        help="Name for this vault; defaults to its directory name",
+    )
+    vaults_sub.add_parser(
+        "list",
+        help=(
+            "Show every registered vault: label, path, whether it is still "
+            "there, and the vault id its rows carry in a shared store"
+        ),
+    )
+    vaults_forget = vaults_sub.add_parser(
+        "forget",
+        help=(
+            "Remove a vault from the registry. This unregisters only: the "
+            "vault's pages, raw evidence and configuration are never touched, "
+            "and registering it again restores the entry"
+        ),
+    )
+    vaults_forget.add_argument(
+        "selector", metavar="PATH|LABEL", help="Registered path or label"
+    )
+    vaults_sync = vaults_sub.add_parser(
+        "sync",
+        help=(
+            "Run one integration's sync for every registered vault. A vault "
+            "that fails does not stop the rest; exit is non-zero if any did"
+        ),
+    )
+    vaults_sync.add_argument(
+        "--target",
+        choices=["postgres", "neo4j", "obsidian"],
+        default="postgres",
+        help="Integration to sync into; defaults to the shared PostgreSQL graph",
+    )
+    vaults_sync.add_argument(
+        "--consumer",
+        choices=["human", "local", "cloud"],
+        help=(
+            "Refused on purpose. Each vault's privacy boundary comes from its "
+            "own integration policy; see bk integration configure --consumer"
+        ),
+    )
+
     web = commands.add_parser("web", help="Run the complete local web viewer")
     web_sub = web.add_subparsers(dest="web_command", required=True)
     web_serve = web_sub.add_parser("serve")
@@ -238,6 +395,17 @@ def build_parser() -> argparse.ArgumentParser:
     web_serve.add_argument("--port", type=int)
     web_serve.add_argument("--consumer", choices=["human", "local", "cloud"])
     web_serve.add_argument("--token-env")
+    web_serve.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        help=(
+            "Browser origin permitted to call the API, repeatable. Its hostname "
+            "is also accepted in the Host header, so a viewer fronted by a real "
+            "name needs this flag once rather than twice. Defaults to the "
+            "loopback origins the viewer is served from"
+        ),
+    )
     web_serve.add_argument("--instance-id", help=argparse.SUPPRESS)
     return parser
 
@@ -261,6 +429,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit(result, json_mode=args.json)
         if args.command == "lint" and isinstance(result, dict) and not result["ok"]:
             return 1
+        if (
+            args.command == "vaults"
+            and args.vaults_command == "sync"
+            and isinstance(result, dict)
+            and result["failed"]
+        ):
+            # A failure inside the loop is reported, not raised, so the status
+            # is the only thing a scheduler can branch on. Skipped vaults are
+            # not failures: declining an integration is the policy working.
+            return 1
         return 0
     except PolicyError as exc:
         _emit_error(exc, json_mode=args.json)
@@ -275,7 +453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         _emit_error(BrainkitError("Interrupted"), json_mode=args.json)
         return 130
-    except Exception as exc:  # noqa: BLE001 - top-level safety net
+    except Exception as exc:
         # An adapter raised something brainkit does not model. Never let a raw
         # traceback replace the machine-readable envelope on stdout.
         _emit_error(_internal_error(exc), json_mode=args.json)
@@ -295,6 +473,7 @@ def create_service(vault_path: str | None) -> BrainkitService:
         jobs=jobs,
         graph=graph,
         integrations=NativeIntegrations(vault),
+        extractor=GraphifyExtractor(),
     )
 
 
@@ -313,6 +492,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
             **indexed,
             "views": views["written"],
         }
+
+    # Registry commands span vaults, so they must not be gated on the current
+    # directory being one: `bk vaults list` has to work from anywhere, and
+    # `bk vaults sync` builds a service per registered vault instead.
+    if args.command == "vaults":
+        return _vaults(args)
 
     service = create_service(args.vault)
     if args.command == "capture":
@@ -348,6 +533,32 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.views()
     if args.command == "graph":
         return service.graph(html=args.html)
+    if args.command == "code":
+        if args.code_command == "build":
+            return service.code_build(args.paths or None)
+        if args.code_command == "import":
+            return service.code_import(_read_json(args.graph))
+        if args.code_command == "status":
+            return service.code_status()
+        if args.code_command == "affected":
+            return service.code_affected(
+                args.symbol, depth=args.depth, consumer=args.consumer
+            )
+        if args.code_command == "path":
+            return service.code_path(args.source, args.target, consumer=args.consumer)
+        if args.code_command == "hubs":
+            return service.code_hubs(top=args.top, consumer=args.consumer)
+        if args.code_command == "communities":
+            return service.code_communities(
+                resolution=args.resolution, consumer=args.consumer
+            )
+        if args.code_command == "cycles":
+            return service.code_cycles(
+                max_length=args.max_length, top=args.top, consumer=args.consumer
+            )
+        if args.code_command == "diff":
+            against = _read_json(args.graph) if args.graph else None
+            return service.code_diff(against, consumer=args.consumer)
     if args.command == "export":
         return service.export(args.target, consumer=args.consumer or "local")
     if args.command == "ingest":
@@ -387,7 +598,9 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "watch":
         return _watch(service, once=args.once, interval=args.interval, json_mode=args.json)
     if args.command == "hooks":
-        return _install_hooks(service, args.agent, force=args.force)
+        return _install_hooks(
+            service, args.agent, root=args.root, force=args.force
+        )
     if args.command == "schedule":
         return _schedule(service)
     if args.command == "integration":
@@ -442,6 +655,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 details={"hint": "Run bk integration configure web --enable"},
             )
         options = policy.options
+        configured_origins = options.get("allowed_origins", [])
         run_web(
             service,
             host=args.host or str(options.get("host", "127.0.0.1")),
@@ -449,6 +663,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
             consumer=args.consumer or str(options.get("consumer", "human")),
             token_env=args.token_env or str(options.get("token_env", "")),
             instance_id=args.instance_id or "",
+            allowed_origins=list(args.allowed_origin)
+            or (
+                [str(origin) for origin in configured_origins]
+                if isinstance(configured_origins, list)
+                else []
+            ),
         )
         return None
     raise ValidationError("Unknown command")
@@ -497,6 +717,15 @@ def _interactive_policy_wizard() -> dict[str, Any]:
         },
     )
     sources = _comma_values(_ask("Source folders/files (comma-separated)", ""))
+    # Offered with the defaults filled in rather than as "anything to add?":
+    # the operator has to see what is already excluded to judge it, and a
+    # capture cannot be taken back once a watch has made it.
+    ignore = _comma_values(
+        _ask(
+            "Ignore patterns for watched folders (comma-separated)",
+            ",".join(DEFAULT_IGNORE_PATTERNS),
+        )
+    )
     digest_schedule = _ask("Morning digest cron schedule", "0 8 * * *")
     taxonomy = _comma_values(
         _ask("Taxonomy seed (comma-separated)", ",".join(branch_names))
@@ -534,6 +763,7 @@ def _interactive_policy_wizard() -> dict[str, Any]:
         "providers": providers,
         "job_models": job_models,
         "sources": sources,
+        "ignore": ignore,
         "schedule": {"digest": digest_schedule},
         "taxonomy_seed": taxonomy,
         "novelty": novelty,
@@ -600,37 +830,18 @@ def _consumer_for_args(args: argparse.Namespace) -> str:
 def _watch(
     service: BrainkitService, *, once: bool, interval: float, json_mode: bool
 ) -> dict[str, Any] | None:
+    """Drive the watch loop; which files it may capture is a vault rule.
+
+    The CLI owns only the loop and the interval. Selection lives in the
+    application layer, because `bk watch` and any other caller must exclude the
+    same paths — a capture is irreversible, so an interface that walked a
+    folder its own way would file a dependency tree the vault said to skip.
+    """
+
     if interval <= 0:
         raise ValidationError("Watch interval must be positive")
-    source_paths = [
-        Path(value).expanduser().resolve() for value in service.vault.config().sources
-    ]
-    if not source_paths:
-        raise ValidationError("No source folders/files are configured")
     while True:
-        created = 0
-        duplicates = 0
-        failures: list[dict[str, str]] = []
-        for source in source_paths:
-            candidates = [source] if source.is_file() else (
-                [path for path in source.rglob("*") if path.is_file()]
-                if source.is_dir()
-                else []
-            )
-            for candidate in candidates:
-                if service.vault.root == candidate or service.vault.root in candidate.parents:
-                    continue
-                try:
-                    result = service.capture(str(candidate))
-                    created += int(result["created"])
-                    duplicates += int(not result["created"])
-                except (BrainkitError, OSError) as exc:
-                    failures.append({"path": str(candidate), "error": str(exc)})
-        result = {
-            "created": created,
-            "duplicates": duplicates,
-            "failures": failures,
-        }
+        result = service.watch_once()
         if once:
             return result
         _emit(result, json_mode=json_mode)
@@ -676,16 +887,22 @@ GATE_REMEDIATION: dict[str, str] = {
 }
 
 
-def _agent_policy(agent: str) -> dict[str, Any]:
+def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
     """The adapter file, written as policy the gate reads rather than prose.
 
     `rules` stays for the human who opens the vault. `gate` is what code reads,
     which is the whole point: metadata with a consumer stays accurate, and
     metadata without one rots into something that merely looks like enforcement.
+
+    `workspace` records where the agent's configuration was installed, because
+    that is not always the vault and nothing else on disk remembers it. Without
+    it `bk status` would look for hooks beside the vault, find none, and report
+    every layer off while they are in fact guarding the project correctly.
     """
     return {
         "agent": agent,
-        "version": 1,
+        "version": 2,
+        "workspace": str(workspace),
         "gate": {
             "deny_prefixes": list(GATE_DENY_PREFIXES),
             "remediation": dict(GATE_REMEDIATION),
@@ -708,12 +925,17 @@ def _agent_template(name: str, vault: Path) -> str:
     return resource.read_text(encoding="utf-8").replace("{{vault}}", str(vault))
 
 
-def _hook_script(name: str, vault: Path) -> str:
-    """Render a shipped hook script with the vault path baked in.
+def _hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
+    """Render a shipped hook script with the vault and workspace baked in.
 
-    The path is shell-quoted, not interpolated raw: real vault paths carry
-    spaces and non-ASCII, and a hook that cannot parse its own argument would
-    fail open on every write it was installed to govern.
+    Both paths are shell-quoted, not interpolated raw: real paths carry spaces
+    and non-ASCII, and a hook that cannot parse its own argument would fail
+    open on every write it was installed to govern.
+
+    The workspace is separate because the git repository, the instruction file
+    and the hooks live with the project, not with the vault. A script that
+    looked for them beside the vault would report a live enforcement layer as
+    OFF for every vault nested inside the project it guards.
     """
     resource = files("brainkit").joinpath("templates", "agents", f"{name}.sh")
     if not resource.is_file():
@@ -721,8 +943,10 @@ def _hook_script(name: str, vault: Path) -> str:
             "Agent hook script is missing from the installation",
             details={"script": name},
         )
-    return resource.read_text(encoding="utf-8").replace(
-        "{{vault}}", shlex.quote(str(vault))
+    return (
+        resource.read_text(encoding="utf-8")
+        .replace("{{vault}}", shlex.quote(str(vault)))
+        .replace("{{workspace}}", shlex.quote(str(workspace or vault)))
     )
 
 
@@ -777,19 +1001,26 @@ COMMIT_LINT_OFF = (
 
 
 def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
-    """Install the lint hook when the vault is a git repository.
+    """Install the lint hook when the workspace is a git repository.
 
     A missing repository is reported rather than raised: the skill and the
     instructions are useful on their own and have nothing to do with git. It is
     reported *loudly* — a bare `{"state": "skipped"}` reads as a detail, and the
     detail it hides is that a whole enforcement layer does not exist.
+
+    The repository that matters is the workspace's, not the vault's: a vault
+    nested in a project is committed through that project, so its pre-commit
+    hook is the one a wiki write actually passes through.
     """
     git_dir = root / ".git"
     if not git_dir.is_dir():
         return {
             "state": "skipped",
-            "reason": "vault is not a git repository",
-            "hint": "Run git init in the vault, then install again",
+            "reason": f"{root} is not a git repository",
+            "hint": (
+                "Run git init there, or point --root at the repository that "
+                "tracks the vault, then install again"
+            ),
             "enforcement": "off",
             "consequence": COMMIT_LINT_OFF,
         }
@@ -822,7 +1053,7 @@ def _write_hook_script(
     ours to replace, and a script without it belongs to the operator.
     """
     target = root / ".claude" / "hooks" / f"{hook.template}.sh"
-    content = _hook_script(hook.template, vault)
+    content = _hook_script(hook.template, vault, root)
     existed = target.is_file()
     if existed:
         existing = target.read_text(encoding="utf-8")
@@ -1030,10 +1261,19 @@ def _enforcement_summary(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _warn_about_inactive_enforcement(enforcement: dict[str, Any]) -> None:
+def _warn_about_inactive_enforcement(
+    enforcement: dict[str, Any], advisory: dict[str, Any] | None = None
+) -> None:
     """Put every missing enforcement layer on stderr, where it cannot be piped away."""
+    if advisory is not None:
+        print("", file=sys.stderr)
+        print("bk: WORKSPACE - everything installed, nothing will load:", file=sys.stderr)
+        print(f"      {advisory['reason']}", file=sys.stderr)
+        print(f"      {advisory['hint']}", file=sys.stderr)
     inactive = [layer for layer in enforcement["layers"] if not layer["active"]]
     if not inactive:
+        if advisory is not None:
+            print("", file=sys.stderr)
         return
     print("", file=sys.stderr)
     print("bk: ENFORCEMENT GAP - these layers are NOT active:", file=sys.stderr)
@@ -1045,26 +1285,185 @@ def _warn_about_inactive_enforcement(enforcement: dict[str, Any]) -> None:
     print("", file=sys.stderr)
 
 
+def _resolve_workspace(vault: Path, root: str | None) -> Path:
+    """Where the agent's configuration belongs, which is not always the vault.
+
+    An agent reads `.claude/` and `CLAUDE.md` from the project it was opened
+    on. A vault nested inside that project is a different directory, and
+    installing into it produces the worst possible outcome: every file lands,
+    the installer reports success, and not one hook is ever loaded. So the
+    caller may name the workspace, and the default stays the vault because
+    that is what a standalone vault wants.
+    """
+    if root is None:
+        return vault
+    candidate = Path(root).expanduser()
+    if not candidate.is_dir():
+        raise ValidationError(
+            "The --root workspace must be an existing directory",
+            details={"root": str(candidate)},
+        )
+    return candidate.resolve()
+
+
+def _workspace_advisory(vault: Path, workspace: Path) -> dict[str, Any] | None:
+    """Warn when the vault was used as a workspace it does not look like.
+
+    Silence here is what the separation exists to prevent, so this fires on
+    the shape of the mistake rather than on certainty about it: a vault with
+    no agent configuration of its own, sitting inside a directory that has
+    some. Advisory only -- a standalone vault is a legitimate workspace, and
+    an operator who passed --root has already answered the question.
+    """
+    if workspace != vault:
+        return None
+    if (vault / ".claude").is_dir() or (vault / ".git").is_dir():
+        return None
+    for parent in vault.parents:
+        if (parent / ".claude").is_dir() or (parent / ".git").is_dir():
+            return {
+                "state": "advisory",
+                "reason": (
+                    "The vault is not a project root, so an agent opened on "
+                    f"{parent} will never load what was just installed here."
+                ),
+                "hint": f"Reinstall with --root {parent}",
+            }
+    return None
+
+
 def _install_hooks(
-    service: BrainkitService, agent: str, *, force: bool = False
+    service: BrainkitService,
+    agent: str,
+    *,
+    root: str | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
-    root = service.vault.root
+    vault = service.vault.root
+    workspace = _resolve_workspace(vault, root)
+    # Decided before anything is written: the installer creates `.claude/` in
+    # the workspace, and reading that back afterwards would be this check
+    # observing its own side effect and concluding all is well.
+    advisory = _workspace_advisory(vault, workspace)
     adapter_path = f".brain/agent-{agent}.json"
     service.vault.write_generated(
-        adapter_path, json.dumps(_agent_policy(agent), indent=2) + "\n"
+        adapter_path, json.dumps(_agent_policy(agent, workspace), indent=2) + "\n"
     )
     result: dict[str, Any] = {
         "agent": agent,
         "adapter": adapter_path,
-        "instructions": _install_instructions(root, root, agent),
-        "pre_commit": _install_pre_commit(root, root, force=force),
+        "workspace": str(workspace),
+        "instructions": _install_instructions(workspace, vault, agent),
+        "pre_commit": _install_pre_commit(workspace, vault, force=force),
     }
     if agent == "claude":
-        result["skill"] = _install_skill(root, root, force=force)
-        result["claude_hook"] = _install_claude_hook(root, root, force=force)
+        result["skill"] = _install_skill(workspace, vault, force=force)
+        result["claude_hook"] = _install_claude_hook(workspace, vault, force=force)
+    if advisory is not None:
+        result["workspace_advisory"] = advisory
     result["enforcement"] = _enforcement_summary(result)
-    _warn_about_inactive_enforcement(result["enforcement"])
+    _warn_about_inactive_enforcement(result["enforcement"], advisory)
     return result
+
+
+def _vaults(args: argparse.Namespace) -> dict[str, Any]:
+    registry = VaultRegistry()
+    if args.vaults_command == "register":
+        return registry.register(_vault_to_register(args), label=args.label)
+    if args.vaults_command == "list":
+        return registry.describe()
+    if args.vaults_command == "forget":
+        return registry.forget(args.selector)
+    if args.vaults_command == "sync":
+        if args.consumer:
+            # The same position `export` takes for a single vault, and the
+            # stakes are higher here: a sync refreshes by deleting the vault's
+            # rows first, so a narrowed run would quietly replace what a shared
+            # store already holds with less, across every registered vault at
+            # once. The boundary stays where it is declared.
+            raise ValidationError(
+                "bk vaults sync takes each vault's consumer from its own policy",
+                details={
+                    "consumer": args.consumer,
+                    "hint": (
+                        "Set it per vault with bk --vault <path> integration "
+                        f"configure {args.target} --consumer"
+                    ),
+                },
+            )
+        return _sync_registered_vaults(registry, args.target)
+    raise ValidationError("Unknown vaults command")
+
+
+def _vault_to_register(args: argparse.Namespace) -> Path:
+    named = args.path or args.vault
+    return Path(named) if named else FileVault.discover().root
+
+
+def _sync_registered_vaults(
+    registry: VaultRegistry, target: str
+) -> dict[str, Any]:
+    """Sync every registered vault, letting each one succeed or fail alone.
+
+    This exists to refresh a shared store from many applications in one run, so
+    a single vault must not decide the fate of the others: an unmounted disk, a
+    service that is down, a project deleted without being unregistered. Each
+    vault is reported with its own outcome and the summary carries the counts
+    the exit status is derived from.
+    """
+    results = [_sync_one_vault(entry, target) for entry in registry.entries()]
+    counts = Counter(str(result["status"]) for result in results)
+    return {
+        "target": target,
+        "registry": str(registry.path),
+        "count": len(results),
+        "ok": counts["ok"],
+        "skipped": counts["skipped"],
+        "failed": counts["failed"],
+        "vaults": results,
+    }
+
+
+def _sync_one_vault(entry: RegisteredVault, target: str) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "vault": str(entry.path),
+        "label": entry.label,
+        "vault_id": vault_id(entry.path),
+    }
+    try:
+        service = create_service(str(entry.path))
+        if not service.vault.config().integrations[target].enabled:
+            # A vault that has not opted into this integration is skipped, not
+            # failed. Enabling it here would make a machine-level command
+            # override a decision the vault owns, and writing its evidence into
+            # a store it deliberately stayed out of is not a recoverable
+            # mistake.
+            return {
+                **report,
+                "status": "skipped",
+                "reason": f"{target} is not enabled in this vault's policy",
+            }
+        result = service.integration_sync(target)
+    except BrainkitError as exc:
+        return {
+            **report,
+            "status": "failed",
+            "code": exc.code,
+            "reason": str(exc),
+            "details": exc.details,
+        }
+    except Exception as exc:
+        # Whatever an adapter raises, it belongs to one vault. The loop is the
+        # feature; a traceback that escaped it would cancel every vault behind
+        # this one.
+        return {
+            **report,
+            "status": "failed",
+            "code": "internal_error",
+            "reason": f"{type(exc).__name__}: {exc}".strip(),
+            "details": {},
+        }
+    return {**report, "status": "ok", "result": result}
 
 
 def _schedule(service: BrainkitService) -> dict[str, Any]:

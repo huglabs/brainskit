@@ -3,7 +3,6 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
-import mimetypes
 import os
 import re
 import shutil
@@ -11,11 +10,12 @@ import sqlite3
 import tempfile
 import unicodedata
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from copy import deepcopy
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterator
+from typing import Any, ClassVar
 
 from brainkit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
@@ -27,13 +27,18 @@ from brainkit.domain.model import (
     normalize_branch,
     utc_now,
 )
-from brainkit.infrastructure.converters import extract_document
+from brainkit.infrastructure.converters import extract_document, guess_media_type
 
 
 class FileVault:
     """Filesystem adapter for the Markdown source of truth."""
 
-    STATE_NAMES = {"applied", "freshness", "proposals", "integration-state"}
+    STATE_NAMES: ClassVar[set[str]] = {
+        "applied",
+        "freshness",
+        "proposals",
+        "integration-state",
+    }
 
     def __init__(self, root: Path):
         self.root = root.expanduser().resolve()
@@ -92,7 +97,8 @@ class FileVault:
             ".brain/index.db-shm\n"
             ".brain/index.db-wal\n"
             ".brain/*.lock\n"
-            ".brain/services/\n",
+            ".brain/services/\n"
+            ".brain/code-cache/\n",
         )
         index_page = _system_page("index", "Brainkit index")
         log_page = _system_page("log", "Brainkit log")
@@ -116,6 +122,31 @@ class FileVault:
     @property
     def index_path(self) -> Path:
         return self.root / ".brain" / "index.db"
+
+    @property
+    def code_cache_dir(self) -> Path:
+        """Persistent home for the code extractor's own AST cache.
+
+        The vendored Graphify extraction (`infrastructure/extractor.py`) keeps
+        a per-file parse cache that skips reparsing files whose content hash
+        it has already seen — a real win on a large repository, but only if
+        it is given somewhere durable to write between calls. `.brain/` is
+        already where this vault keeps every other piece of its own private
+        state (`index_path` above, the registry, freshness); nesting the code
+        cache there rather than in the scanned repository or the process cwd
+        follows that precedent: it can never be mistaken for the user's own
+        files, and `FileVault.initialize` already git-ignores it. A caller
+        that does not have a vault handy (or does not want persistence) can
+        still call the extractor without this — it just gets a cold,
+        throwaway cache instead, same as before this existed.
+
+        Deliberately unrelated to `CodeGraph.staleness`'s freshness fingerprint
+        (`application/codegraph.py`) even though both hash file content — see
+        `infrastructure/extractor.py`'s module docstring for why re-reading
+        content on every staleness check is not the same job as memoising a
+        parse, and must not be merged into it.
+        """
+        return self.root / ".brain" / "code-cache"
 
     def config(self) -> VaultConfig:
         raw = json.loads(
@@ -164,8 +195,7 @@ class FileVault:
                     content_hash=content_hash,
                     path=destination.relative_to(self.root).as_posix(),
                     original_name=source.name,
-                    media_type=mimetypes.guess_type(source.name)[0]
-                    or "application/octet-stream",
+                    media_type=guess_media_type(source.name),
                     size=size,
                     captured_at=utc_now(),
                 )
@@ -191,7 +221,7 @@ class FileVault:
                 content_hash=content_hash,
                 path=destination.relative_to(self.root).as_posix(),
                 original_name=name,
-                media_type=mimetypes.guess_type(name)[0] or "text/markdown",
+                media_type=guess_media_type(name, default="text/markdown"),
                 size=len(payload),
                 captured_at=utc_now(),
             )
@@ -225,8 +255,7 @@ class FileVault:
                     content_hash=content_hash,
                     path=relative,
                     original_name=path.name,
-                    media_type=mimetypes.guess_type(path.name)[0]
-                    or "application/octet-stream",
+                    media_type=guess_media_type(path.name),
                     size=size,
                     captured_at=utc_now(),
                 )
@@ -284,6 +313,42 @@ class FileVault:
 
     def content_hash(self, relative_path: str) -> str:
         content_hash, _ = _hash_file(self._resolve_relative(relative_path))
+        return content_hash
+
+    def code_root(self) -> Path:
+        """Directory that `code_sources` paths are relative to.
+
+        Configured, or discovered by walking up for a `.git` directory. The
+        common layout puts a vault inside the repository it documents
+        (`repo/docs/brain`), and nothing else about that layout says where the
+        repository starts — so the marker git already maintains is a better
+        answer than counting `..` segments and hoping.
+        """
+
+        configured = self.config().code_root
+        if configured is not None:
+            return (self.root / configured).resolve()
+        for candidate in (self.root, *self.root.parents):
+            if (candidate / ".git").exists():
+                return candidate
+        return self.root.parent
+
+    def code_hash(self, relative_path: str) -> str | None:
+        """SHA-256 of a file under the code root, or None when it is not there.
+
+        Missing is a legitimate answer rather than an error: a cited file being
+        deleted is exactly the kind of drift lint exists to report, and raising
+        here would stop the whole lint on the first one.
+        """
+
+        root = self.code_root()
+        candidate = (root / relative_path).resolve()
+        # A path that escapes the root reads a file the vault never sanctioned.
+        # `CodeSource` rejects `..` on the way in; this is the second lock, for
+        # symlinks and for any path that reached the registry another way.
+        if not candidate.is_relative_to(root) or not candidate.is_file():
+            return None
+        content_hash, _ = _hash_file(candidate)
         return content_hash
 
     def raw_text(self, record: SourceRecord, max_chars: int | None = None) -> str:

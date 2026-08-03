@@ -353,7 +353,7 @@ my-vault/
 ├── graph/                   generated graph.json
 ├── output/                  digests/, reports/, answers/
 └── .brain/                  policy and durable state
-    ├── config.json          branches, providers, integrations (no secrets)
+    ├── config.json          branches, providers, ignore, integrations (no secrets)
     ├── schema.json          human-owned page schema, enforced by apply/lint
     ├── registry.json        source hash → path and status
     ├── freshness.json       applied page hashes and lifecycle state
@@ -392,7 +392,7 @@ switches to machine-readable output.
 | `integration configure\|status\|up\|down\|sync NAME` | Persistent integration lifecycle |
 | `web serve [--host H] [--port P] [--consumer C] [--token-env V]` | Foreground web viewer |
 | `serve --mcp [--transport stdio\|http] …` | MCP transports |
-| `watch [--once] [--interval S]` | Watch configured source folders |
+| `watch [--once] [--interval S]` | Capture new files under the configured source folders, minus `ignore` |
 | `schedule` | Show configured habit job registrations |
 | `hooks install --agent claude\|codex\|gemini\|opencode [--force]` | Install the agent contract |
 
@@ -490,6 +490,33 @@ a graph extension. Managed mode runs PostgreSQL in Docker with durable data at
 `.brain/services/postgres/data`; external mode reads a DSN from the named
 environment variable.
 
+One schema holds as many vaults as you point at it. Every row carries the
+`vault_id` of the vault that wrote it, and a sync deletes only that vault's
+rows, so refreshing one vault never touches another's — including a vault owned
+by a different application sharing the schema. Both tables index `vault_id`.
+
+Because the schema is shared, the stored `id` is namespaced the same way the
+Neo4j export namespaces its own: `<vault_id>:<natural id>`. The natural id is
+not lost — `properties` holds the untouched node, so `properties->>'id'` is the
+unprefixed id (`page:wiki/index.md`, `raw:<content hash>`), and on `edges`,
+`properties->>'source'` and `properties->>'target'` likewise. Filter by column
+and read the natural key from JSONB:
+
+```sql
+SELECT properties->>'id' AS id, label, path
+FROM brainkit.nodes WHERE vault_id = $1 AND kind = 'wiki';
+```
+
+`graph_walk` needs no vault argument and takes none: since every id carries its
+vault's prefix, a walk cannot leave the vault it started in. Pass it the stored
+prefixed id, not the natural one.
+
+Upgrading an existing deployment needs no manual migration. The sync adds the
+`vault_id` column if the tables predate it, adopts the rows already there into
+the vault performing that first sync — safe because the previous behaviour
+truncated both tables on every refresh, so what is on disk is exactly one
+vault's last complete sync — and replaces them on the same run.
+
 ```bash
 export BRAINKIT_POSTGRES_PASSWORD='use-a-secret-manager-in-production'
 bk --vault ./my-vault integration configure postgres \
@@ -518,6 +545,58 @@ which then shuts down and restarts. A first boot also has to chown the
 vault-local data directory, which is slow on macOS bind mounts, so the deadline
 is 300 seconds and can be raised per integration with
 `ready_timeout_seconds` in its stored options.
+
+### Many vaults, one store
+
+`bk integration sync` syncs the one vault it was pointed at. When an operator
+runs several applications, each with its own vault, `bk vaults` keeps the list
+and syncs them as a set, so the shared graph is the union of all of them.
+
+There is no discovery step, and that is deliberate: vaults live in unrelated
+projects, and a filesystem scan would be slow, would miss anything outside the
+trees it was pointed at, and would find checkouts, copies and backups that must
+never be synced into a shared store under their own identity. The list is
+declared once and lives at `$XDG_CONFIG_HOME/brainkit/vaults.json` (default
+`~/.config/brainkit/vaults.json`), file `0600` inside a `0700` directory. It
+holds paths and labels and nothing else — the same rule vault configuration
+follows, where only the *name* of an environment variable is ever stored.
+
+```bash
+bk vaults register ./app-one --label app-one   # PATH defaults to the vault found from the cwd
+bk vaults register ./app-two
+bk vaults list                                 # label, path, whether it is still there, vault_id
+bk vaults sync --target postgres               # --target defaults to postgres
+bk vaults forget app-two                       # unregisters only; the vault's files are untouched
+```
+
+Each vault keeps its own policy. A vault that has not enabled the target is
+**skipped**, not enabled on its behalf, and one vault failing does not stop the
+rest — an unmounted disk or a service that is down is reported against that
+vault alone:
+
+```json
+{"target": "postgres", "count": 4, "ok": 2, "skipped": 1, "failed": 1,
+ "vaults": [{"label": "app-one", "vault_id": "2e2389340edfb82b1fe52ba9", "status": "ok", "result": {}},
+            {"label": "app-optout", "status": "skipped", "reason": "postgres is not enabled in this vault's policy"},
+            {"label": "app-gone", "status": "failed", "code": "not_found", "reason": "Not a brainkit vault"}]}
+```
+
+Exit is `1` when any vault failed and `0` when every vault succeeded or was
+skipped, so a scheduled run can branch on the status alone. `list` reports a
+vault whose directory has been deleted rather than failing, and still prints its
+`vault_id` — which is what you need to find the rows it left behind in a shared
+schema before running `bk vaults forget`.
+
+`bk vaults sync` takes no `--consumer`, for the reason `export` refuses one on
+an integration target, and one more: a sync refreshes by deleting the vault's
+rows first, so a narrowed run would quietly replace what a shared store already
+holds with less, across every registered vault at once. Set the boundary per
+vault with `bk --vault <path> integration configure <target> --consumer`.
+
+This group is CLI-only. Unlike the `integration_*` tools, it is not exposed over
+MCP: an MCP server is started for one vault and answers under that vault's
+declared boundary, so a tool that reached into unrelated vaults would widen the
+boundary the caller was granted.
 
 ### Egress carries the boundary
 
@@ -640,13 +719,76 @@ It installs `.claude/skills/brainkit/SKILL.md`, appends a managed block to the
 agent's instruction file (`CLAUDE.md`, or `AGENTS.md`/`GEMINI.md` for the other
 agents) covering how the graph is formed, where the privacy boundary applies and
 which commands may write, and installs a `pre-commit` hook running `bk lint`
-when the vault is a git repository.
+when the workspace is a git repository.
 
 Everything it writes is safe to re-run. The instruction block is fenced by
 `<!-- brainkit:start -->` / `<!-- brainkit:end -->` and replaced in place, so
 your own instructions keep their content and their position. An existing skill
 or a pre-existing `pre-commit` hook is reported rather than overwritten; pass
-`--force` to replace them. A vault without git still installs everything else.
+`--force` to replace them. A workspace without git still installs everything
+else.
+
+### The vault is not always the workspace
+
+An agent reads `.claude/` and its instruction file from the **project it was
+opened on**. When the vault is a directory inside that project, those are two
+different places, so name the project with `--root`:
+
+```bash
+bk --vault ./docs/brain hooks install --agent claude --root .
+```
+
+`--root` receives the agent configuration — `.claude/`, the instruction file
+and the git `pre-commit` hook — while the vault keeps `.brain/` and the vault
+path baked into the hook scripts. The default is the vault itself, which is
+what a standalone vault wants.
+
+Getting this wrong used to be silent, and silence is the expensive part: every
+file lands, the summary reads like success, and not one hook is ever loaded.
+So an install that would repeat that mistake — a vault with no agent
+configuration of its own, nested inside a directory that has some — says so on
+stderr and names the flag that fixes it:
+
+```text
+bk: WORKSPACE - everything installed, nothing will load:
+      The vault is not a project root, so an agent opened on /path/to/project
+      will never load what was just installed here.
+      Reinstall with --root /path/to/project
+```
+
+The resolved workspace is recorded in `.brain/agent-<agent>.json`, because
+nothing else on disk remembers it and `bk status` has to look in the same place
+the installer wrote to. An adapter written before that field existed falls back
+to the vault, so an existing install keeps reporting exactly as it did.
+
+## What a watch will not capture
+
+`bk watch` walks every configured source folder and captures what it finds, and
+a capture cannot be taken back: a source is identified by the hash of its bytes
+and `raw/` is immutable. So the walk is filtered by `ignore` in
+`.brain/config.json`, a list of shell globs matched against each path segment:
+
+```json
+{
+  "ignore": ["node_modules", ".git", "__pycache__", "dist", "*.log", "docs/build"]
+}
+```
+
+A pattern without a separator prunes that directory anywhere it appears, so
+`node_modules` costs one comparison rather than a stat per file inside it. A
+pattern with one is anchored to the source folder, so `docs/build` excludes
+that tree and leaves every other `build` alone. Matching is case-insensitive,
+because the primary target is a case-insensitive filesystem.
+
+`bk init` offers the defaults — version-control metadata, dependency and build
+directories, editor and OS droppings — prefilled, so they can be edited rather
+than discovered later. A vault created before this field existed inherits those
+defaults; a vault that stores `[]` has said "ignore nothing" and gets it.
+`watch --json` reports `ignored` alongside `created`, counting pruned trees
+once rather than per file inside them.
+
+The vault's own directory is always excluded, so a source folder that contains
+the vault cannot re-capture `raw/` into itself.
 
 ## Freshness and integrity
 
@@ -674,6 +816,26 @@ infrastructure (vault, FTS5, LLM and persistent integration adapters)
 ```
 
 The domain has no dependency on the CLI, filesystem, SQLite or an LLM vendor.
+
+Inside the application layer, `BrainkitService` is a facade that owns nothing:
+it composes the collaborators below and delegates. Their imports form a DAG —
+each depends only on the ones above it — so any of them can be read, tested or
+replaced without loading the rest.
+
+| Module | Owns |
+|---|---|
+| `pages` | The page document format: render, parse, and the text helpers derived from it |
+| `privacy` | The one answer to "may this consumer see this?" |
+| `freshness` | Applied-page state and derived-artefact fingerprints |
+| `judgment` | The bounded repair loop every schema-bound job shares |
+| `compilation` | The apply gate — the only path that writes `wiki/` |
+| `retrieval` | BM25 search and the bounded evidence bundle, filtered after expansion |
+| `health` | Structural lint, `status`, and the projection report |
+| `filing` | Propose a branch, then wait or execute per branch policy |
+| `projections` | Views, graph, exports and integrations — every path out of the vault |
+| `jobs` | `ask`, `digest`, `resurface`: model output that never reaches `wiki/` |
+| `reader` | The read-only, consumer-scoped surface the web viewer is built on |
+| `gate` | The pre-write hook's decision, standard library only |
 
 When evidence spans branches, the judgment router applies the strictest policy:
 `never-ingest` denies the call, `local-only` requires Ollama, and cloud routing
