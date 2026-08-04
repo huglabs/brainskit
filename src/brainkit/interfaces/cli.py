@@ -66,6 +66,21 @@ def build_parser() -> argparse.ArgumentParser:
     file_command.add_argument("item", help="Full/prefix hash or raw path")
     file_command.add_argument("--to", required=True, dest="branch")
 
+    forget_command = commands.add_parser(
+        "forget",
+        help=(
+            "Drop one source record from this vault's registry (not to be "
+            "confused with `bk vaults forget`, which unregisters a whole "
+            "vault from this machine)"
+        ),
+    )
+    forget_command.add_argument("item", help="Full/prefix hash or raw path")
+    forget_command.add_argument(
+        "--force",
+        action="store_true",
+        help="Forget it even though the raw file is still on disk",
+    )
+
     lint = commands.add_parser("lint", help="Validate registry and wiki contracts")
     lint.add_argument("--changed", action="store_true")
     lint.add_argument("--semantic", action="store_true")
@@ -103,9 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--html", action="store_true")
 
     # `build` extracts in-process (the vendored Graphify closure, gated on the
-    # `code` extra); `import` accepts a graph produced any other way. Both are
-    # normalised and bounded by the same `CodeGraph.import_graph` seam, so
-    # neither path is more trusted than the other.
+    # `code` extra); `import` accepts a graph produced any other way. Both
+    # normalise through the same `nodes`/`edges` boundary and the same write,
+    # so neither path is more trusted than the other. `build` alone can be
+    # scoped to a subset of paths, in which case that subset is merged into
+    # whatever graph is already stored (`CodeGraph._merge_scoped`) rather than
+    # replacing it.
     code = commands.add_parser("code", help="The repository graph and queries over it")
     code_commands = code.add_subparsers(dest="code_command", required=True)
 
@@ -116,7 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="*",
         metavar="PATH",
-        help="Scope the scan to these files/directories (default: the whole code root)",
+        help=(
+            "Scope the scan to these files/directories (default: the whole "
+            "code root). Merged into the stored graph rather than replacing it"
+        ),
     )
 
     code_import = code_commands.add_parser(
@@ -510,6 +531,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.reindex()
     if args.command == "file":
         return service.file(args.item, args.branch)
+    if args.command == "forget":
+        return service.forget(args.item, force=args.force)
     if args.command == "lint":
         return service.lint(semantic=args.semantic)
     if args.command == "search":

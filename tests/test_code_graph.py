@@ -568,6 +568,38 @@ class BuildTest(CodeBuildFixture):
         self.assertEqual(paths, {"src/db.py"})
         self.assertGreater(result["nodes"], 0)
 
+    def test_a_scoped_build_after_a_full_one_merges_rather_than_replaces(self) -> None:
+        full = self.service.code_build()
+
+        scoped = self.service.code_build(["src/db.py"])
+
+        paths = {node["path"] for node in self.graph_file()["nodes"]}
+        self.assertEqual(paths, {"src/db.py", "src/app.py"})
+        self.assertEqual(scoped["files"], full["files"])
+        self.assertEqual(scoped["nodes"], full["nodes"])
+        self.assertEqual(scoped["edges"], full["edges"])
+        status = self.service.code_status()
+        self.assertEqual(status["state"], "fresh")
+        self.assertEqual(status["files"], full["files"])
+
+    def test_a_scoped_rebuild_drops_the_in_scope_file_s_stale_nodes(self) -> None:
+        self.service.code_build()
+        (self.repo / "src" / "db.py").write_text("class Db:\n    pass\n", encoding="utf-8")
+
+        self.service.code_build(["src/db.py"])
+
+        graph = self.graph_file()
+        paths = {node["path"] for node in graph["nodes"]}
+        self.assertEqual(paths, {"src/db.py", "src/app.py"})  # out-of-scope file kept
+        # `Db` survived the edit; its two now-deleted methods did not, and
+        # nothing stale stands in for them.
+        db_labels = {
+            node["label"] for node in graph["nodes"] if node["path"] == "src/db.py"
+        }
+        self.assertIn("Db", db_labels)
+        self.assertNotIn(".connect()", db_labels)
+        self.assertNotIn(".get_db()", db_labels)
+
     def test_drops_prose_nodes_on_the_build_path_too(self) -> None:
         self.service.code_build()
         paths = {node["path"] for node in self.graph_file()["nodes"]}

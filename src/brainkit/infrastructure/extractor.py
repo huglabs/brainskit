@@ -49,7 +49,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import sys
 import tempfile
+from contextlib import redirect_stdout
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
@@ -266,7 +268,17 @@ class GraphifyExtractor:
         root: Path,
     ) -> dict[str, Any]:
         try:
-            result = extract_fn(files, cache_dir, root=root)
+            # The vendored extractor prints its own cold-cache progress lines
+            # straight to stdout (no `file=sys.stderr`) once a scan crosses its
+            # internal batch-size threshold. Brainkit's CLI also writes to
+            # stdout -- the JSON result of `bk code build --json` among it --
+            # so an unredirected call interleaves plain-text progress into that
+            # payload and corrupts it. Redirecting here, at the one call site
+            # that invokes vendored code, keeps the fix off `codeanalysis/`
+            # (which stays byte-identical to upstream) while still surfacing
+            # the progress lines on stderr instead of discarding them.
+            with redirect_stdout(sys.stderr):
+                result = extract_fn(files, cache_dir, root=root)
         except ImportError as exc:
             raise ValidationError(
                 "Code extraction requires the optional tree-sitter grammars",

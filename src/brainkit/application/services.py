@@ -200,6 +200,28 @@ class BrainkitService:
         self.vault.mutate_state("freshness", mutate)
         return dropped
 
+    def forget(self, identifier: str, *, force: bool = False) -> dict[str, Any]:
+        record = self.vault.forget(identifier, force=force)
+        self.index.rebuild(self.vault)
+        return {
+            "forgotten": record.to_dict(),
+            "still_cited_by": self._pages_citing(record.content_hash),
+        }
+
+    def _pages_citing(self, content_hash: str) -> list[str]:
+        """Wiki pages whose frontmatter still declares this source.
+
+        Informational only: forgetting the source does not touch these pages,
+        and the next `bk lint` reports them as `wiki.unknown_source` — this
+        just surfaces that up front instead of leaving it to be discovered.
+        """
+        citing = []
+        for path in self.vault.wiki_pages():
+            metadata, _ = parse_frontmatter(self.vault.read_text(path))
+            if content_hash in metadata.get("sources", []):
+                citing.append(path)
+        return citing
+
     def file(self, identifier: str, branch: str) -> dict[str, Any]:
         record = self.vault.file_source(identifier, normalize_branch(branch))
         self.index.rebuild(self.vault)

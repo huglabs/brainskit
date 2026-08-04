@@ -230,6 +230,14 @@ class FileVault:
             return record, True
 
     def reconcile(self) -> dict[str, int]:
+        """Heal paths after manual moves; add untracked raw files.
+
+        Reports `missing` (registered files no longer on disk) but never
+        removes those entries — a moved file is indistinguishable from a
+        briefly-absent one mid-move, so deleting on sight would be a race.
+        `forget` is the explicit, one-record way to drop a genuinely gone
+        source.
+        """
         scanned = 0
         added = 0
         moved = 0
@@ -273,6 +281,28 @@ class FileVault:
             "duplicates": duplicates,
             "missing": len(missing),
         }
+
+    def forget(self, identifier: str, *, force: bool = False) -> SourceRecord:
+        """Drop one source record from the registry.
+
+        The supported exit for `registry.missing_file`: a record whose raw
+        file is gone stays in the registry forever otherwise, since
+        `reconcile` only ever heals paths and additions, never removes an
+        entry (see its docstring). Refuses to drop a record whose raw file
+        is still on disk unless `force` is set, so this cannot be used to
+        silently lose a source that is still captured.
+        """
+        with self._registry_lock(shared=False):
+            records = self._read_registry_unlocked()
+            record = _resolve_record(records, identifier)
+            if not force and (self.root / record.path).is_file():
+                raise ValidationError(
+                    "Source is still on disk; pass force to forget it anyway",
+                    details={"path": record.path},
+                )
+            del records[record.content_hash]
+            self._write_registry_unlocked(records)
+            return record
 
     def file_source(self, identifier: str, branch: str) -> SourceRecord:
         branch = normalize_branch(branch)

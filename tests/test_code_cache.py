@@ -29,6 +29,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -253,3 +254,48 @@ class VaultStateFilterTest(CodeCacheFixture):
             any(".brain" in Path(p).parts for p in _node_paths(result)),
             "a vault state file reached the graph",
         )
+
+
+class StdoutIsolationTest(unittest.TestCase):
+    """The vendored extractor's own progress lines must never land on stdout.
+
+    `codeanalysis/extract.py` prints cold-cache "AST extraction: N/M uncached
+    files" progress with no `file=sys.stderr` once a scan crosses its internal
+    batch threshold. `bk code build --json` also writes to stdout — its JSON
+    result — so an unredirected call interleaves plain text into that payload
+    and breaks every parser reading it. Stubs the vendored call rather than
+    needing a 100+ file real scan to cross that threshold; this exercises the
+    same `GraphifyExtractor._run` call site regardless of what the vendored
+    code happens to print or when.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        (self.root / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_a_noisy_vendored_call_never_reaches_real_stdout(self) -> None:
+        def noisy_extract(
+            files: list[Path], cache_root: Path | None = None, *, root: Path | None = None
+        ) -> dict[str, Any]:
+            print("  AST extraction: 100/580 uncached files (17%) [12 workers]")
+            return {"nodes": [], "edges": []}
+
+        def collect_one(target: Path, *, root: Path | None = None) -> list[Path]:
+            return [self.root / "a.py"]
+
+        stdout_buffer, stderr_buffer = io.StringIO(), io.StringIO()
+        with unittest.mock.patch(
+            "brainkit.infrastructure.extractor._load",
+            return_value=(noisy_extract, collect_one),
+        ):
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+                stderr_buffer
+            ):
+                GraphifyExtractor().extract(self.root, [self.root])
+
+        self.assertEqual(stdout_buffer.getvalue(), "")
+        self.assertIn("AST extraction", stderr_buffer.getvalue())

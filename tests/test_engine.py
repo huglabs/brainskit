@@ -198,6 +198,56 @@ class EngineTest(unittest.TestCase):
         record = self.vault.registry()[captured["source"]["content_hash"]]
         self.assertEqual(record.path, "raw/20-research/manual-name.md")
 
+    def test_forget_drops_missing_registry_entry(self) -> None:
+        captured = self.service.capture(None, text="Gone soon", title="Gone soon")
+        content_hash = captured["source"]["content_hash"]
+        (self.root / captured["source"]["path"]).unlink()
+        self.assertFalse(self.service.lint()["ok"])
+
+        result = self.service.forget(content_hash[:12])
+
+        self.assertEqual(result["forgotten"]["content_hash"], content_hash)
+        self.assertNotIn(content_hash, self.vault.registry())
+        findings = {finding["code"] for finding in self.service.lint()["findings"]}
+        self.assertNotIn("registry.missing_file", findings)
+
+    def test_forget_refuses_present_file_without_force(self) -> None:
+        captured = self.service.capture(None, text="Still here", title="Still here")
+        content_hash = captured["source"]["content_hash"]
+
+        with self.assertRaises(ValidationError):
+            self.service.forget(content_hash)
+        self.assertIn(content_hash, self.vault.registry())
+
+        self.service.forget(content_hash, force=True)
+        self.assertNotIn(content_hash, self.vault.registry())
+
+    def test_forget_reports_pages_still_citing_it(self) -> None:
+        captured = self.service.capture(None, text="Cited", title="Cited")
+        content_hash = captured["source"]["content_hash"]
+        proposal = {
+            "operations": [
+                {
+                    "action": "upsert",
+                    "kind": "concept",
+                    "slug": "cited-page",
+                    "title": "Cited page",
+                    "aliases": [],
+                    "source_hashes": [content_hash],
+                    "body": f"Supported.[^source:{content_hash}]",
+                    "links": [],
+                }
+            ]
+        }
+        self.service.apply(proposal)
+        (self.root / captured["source"]["path"]).unlink()
+
+        result = self.service.forget(content_hash)
+
+        self.assertIn("wiki/concepts/cited-page.md", result["still_cited_by"])
+        findings = {finding["code"] for finding in self.service.lint()["findings"]}
+        self.assertIn("wiki.unknown_source", findings)
+
     def test_lint_detects_raw_content_mutation(self) -> None:
         captured = self.service.capture(None, text="Immutable", title="Immutable")
         raw_path = self.root / captured["source"]["path"]

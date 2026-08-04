@@ -92,9 +92,17 @@ class CodeGraph:
         """Extract in-process, then import the result through the same seam.
 
         Extraction is entirely the port's job — this method never touches a
-        node or an edge before `import_graph` does, so `build` and `bk code
+        node or an edge before normalisation does, so `build` and `bk code
         import` share every boundary rule by construction rather than by two
         implementations agreeing to.
+
+        A scoped build (`paths` given) only re-extracts that subset, so its
+        result is merged into whatever graph is already stored rather than
+        replacing it outright: without that, `bk code build one/file.py`
+        would silently shrink a whole-repository graph down to one file, and
+        every reader after it (`status`, `hubs`, `affected`, …) would report
+        that narrowed graph as complete rather than as a graph missing
+        everything outside the scope just asked for.
         """
 
         if self.extractor is None:
@@ -110,7 +118,90 @@ class CodeGraph:
         payload = self.extractor.extract(
             self.vault.code_root(), paths, cache_root=self.vault.code_cache_dir
         )
-        return self.import_graph(payload)
+        nodes, dropped = self._nodes(payload)
+        edges = self._edges(payload, known=set(nodes))
+        if paths is not None:
+            nodes, edges = self._merge_scoped(nodes, edges, paths)
+        if not nodes:
+            raise ValidationError(
+                "No code nodes in the imported graph",
+                details={
+                    "dropped_non_code_nodes": dropped,
+                    "hint": "Extract with --code-only; prose belongs in the wiki",
+                },
+            )
+        return self._write(nodes, edges, dropped)
+
+    def _merge_scoped(
+        self,
+        nodes: dict[str, dict[str, Any]],
+        edges: list[dict[str, Any]],
+        paths: list[Path],
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        """Fold a scoped extraction into the stored graph, not over it.
+
+        Everything the stored graph knows about files outside `paths` is kept
+        untouched; everything it knew about files inside `paths` is dropped
+        and replaced wholesale by this run's result, including a file that
+        now contributes zero nodes (its old ones are stale, not merely
+        unmentioned). Nothing to merge into (no stored graph, or `paths`
+        resolved to nothing recognisable) is not an error — it is the first
+        build, scoped or not, and the fresh result stands on its own.
+        """
+
+        stored = self._maybe_read()
+        if stored is None:
+            return nodes, edges
+        scope_roots = self._scope_roots(paths)
+        if not scope_roots:
+            return nodes, edges
+
+        def in_scope(path: str) -> bool:
+            return any(
+                path == root or path.startswith(f"{root}/") for root in scope_roots
+            )
+
+        merged_nodes = {
+            str(node["id"]): node
+            for node in stored.get("nodes", [])
+            if isinstance(node, dict) and not in_scope(str(node.get("path", "")))
+        }
+        merged_nodes.update(nodes)
+
+        combined_edges = [
+            *edges,
+            *(
+                edge
+                for edge in stored.get("edges", [])
+                if isinstance(edge, dict) and not in_scope(str(edge.get("path", "")))
+            ),
+        ]
+        seen: set[tuple[str, str, str]] = set()
+        merged_edges = []
+        for edge in combined_edges:
+            source, target = str(edge.get("source")), str(edge.get("target"))
+            if source not in merged_nodes or target not in merged_nodes:
+                continue
+            key = (source, target, str(edge.get("type")))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_edges.append(edge)
+        merged_edges.sort(key=lambda item: (item["source"], item["target"], item["type"]))
+        return merged_nodes, merged_edges
+
+    def _scope_roots(self, paths: list[Path]) -> list[str]:
+        """`paths`, as code-root-relative posix strings a node path can match."""
+
+        root = self.vault.code_root().resolve()
+        roots = []
+        for target in paths:
+            candidate = (target if target.is_absolute() else root / target).resolve()
+            try:
+                roots.append(candidate.relative_to(root).as_posix())
+            except ValueError:
+                continue  # Outside code_root; the extractor already ignored it.
+        return roots
 
     def import_graph(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Normalise an extractor's graph and record what it was built from."""
@@ -125,7 +216,14 @@ class CodeGraph:
                 },
             )
         edges = self._edges(payload, known=set(nodes))
+        return self._write(nodes, edges, dropped)
 
+    def _write(
+        self,
+        nodes: dict[str, dict[str, Any]],
+        edges: list[dict[str, Any]],
+        dropped: int,
+    ) -> dict[str, Any]:
         # Hashed at import, compared at status. This is the artefact's input
         # set, and the only reason the graph can ever be called stale.
         files = {

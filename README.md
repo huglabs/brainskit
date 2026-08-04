@@ -398,13 +398,14 @@ switches to machine-readable output.
 | `reconcile` | Heal registry paths after manual moves; drop orphaned freshness |
 | `reindex` | Rebuild the disposable FTS5 index |
 | `file` | Move a raw source to a branch |
+| `forget ITEM [--force]` | Drop one source record whose raw file is gone from the registry |
 | `lint [--changed]` | Validate registry and wiki contracts |
 | `search QUERY [--limit N] [--consumer C]` | FTS5 BM25 search |
 | `context QUERY [--limit N] [--max-chars N] [--consumer C]` | Bounded evidence bundle |
 | `apply PROPOSAL\|-` | Validate and atomically commit wiki writes |
 | `gate check-write PATH [--agent A]` | Whether a direct write to `PATH` is permitted |
 | `views` · `graph [--html]` | Regenerate views and the knowledge graph |
-| `code build [PATH …]` · `code import` · `code status` | Extract the repository graph, import one, re-check it — `build` needs `[code]` |
+| `code build [PATH …]` · `code import` · `code status` | Extract the repository graph, import one, re-check it — `build` needs `[code]`. Given `PATH`s, merges that subset into the stored graph instead of replacing it |
 | `code affected` · `code path` · `code hubs` | Queries over that graph, on the base install |
 | `code communities` · `code cycles` · `code diff` | Delegated to the vendored analysis — needs `[code]` |
 | `export --target T [--consumer C]` | Export to `json`, `graphml`, `cypher`, `obsidian`, `neo4j`, `postgres`, `kuzu`, `llms-txt` |
