@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -30,6 +30,7 @@ from brainkit.infrastructure.integrations import NativeIntegrations, vault_id
 from brainkit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainkit.infrastructure.vault import FileVault
 from brainkit.infrastructure.vaults import RegisteredVault, VaultRegistry
+from brainkit.interfaces import console
 
 
 class InternalError(BrainkitError):
@@ -431,10 +432,85 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Every top-level command, grouped for `bk --help`. A command absent from
+#: every tuple here still appears (see `_grouped_help`'s "Other" fallback),
+#: so a future command can go unlisted in a *section* but never vanish
+#: entirely -- and the mechanical test in test_fix_interfaces.py asserts the
+#: stronger claim, that nothing ever lands in "Other" unnoticed.
+HELP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Vault & capture",
+        ("init", "capture", "status", "reconcile", "reindex", "file", "forget", "watch", "lint"),
+    ),
+    ("Search & context", ("search", "context", "ask")),
+    ("Code graph", ("code",)),
+    ("Filing & review", ("ingest", "proposals", "approve", "reject", "apply")),
+    ("Automation", ("digest", "resurface", "views", "graph", "schedule")),
+    ("Governance", ("gate", "hooks")),
+    ("Integrations & registry", ("export", "integration", "vaults")),
+    ("Serve", ("serve", "web")),
+)
+
+
+def _wants_top_level_help(argv: Sequence[str]) -> bool:
+    """Is this `-h`/`--help` for `bk` itself, rather than for a subcommand?
+
+    Scans left to right and stops at the first token that could be the
+    command: if that token is the help flag, this is top-level help; if it
+    is anything else (the command name), argparse's own per-subcommand help
+    already handles it correctly and is left untouched.
+    """
+
+    for token in argv:
+        if token in ("-h", "--help"):
+            return True
+        if not token.startswith("-"):
+            return False
+    return False
+
+
+def _command_help_index(parser: argparse.ArgumentParser) -> dict[str, str]:
+    """The one-line help string each top-level command was registered with.
+
+    Argparse keeps this only on the subparsers action's `_choices_actions`,
+    with no public accessor -- reading it here avoids hand-duplicating every
+    command's description a second time in `HELP_CATEGORIES`.
+    """
+
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return {
+                choice.dest: choice.help or "" for choice in action._choices_actions
+            }
+    return {}
+
+
+def _grouped_help(parser: argparse.ArgumentParser) -> str:
+    help_index = _command_help_index(parser)
+    lines = [console.banner(), "", parser.format_usage().strip(), ""]
+    grouped = {name for _, names in HELP_CATEGORIES for name in names}
+    for title, names in HELP_CATEGORIES:
+        lines.append(console.style(title, console.BOLD, console.ACCENT))
+        for name in names:
+            lines.append(f"  {name:<12} {help_index.get(name, '')}".rstrip())
+        lines.append("")
+    leftover = sorted(set(help_index) - grouped)
+    if leftover:
+        lines.append(console.style("Other", console.BOLD, console.ACCENT))
+        for name in leftover:
+            lines.append(f"  {name:<12} {help_index.get(name, '')}".rstrip())
+        lines.append("")
+    lines.append("Run `bk <command> --help` for that command's own flags.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     effective_argv = list(argv if argv is not None else sys.argv[1:])
     effective_argv, global_values = _extract_global_options(effective_argv)
     parser = build_parser()
+    if _wants_top_level_help(effective_argv):
+        print(_grouped_help(parser))
+        return 0
     args = parser.parse_args(effective_argv)
     if global_values["vault"] is not None:
         args.vault = global_values["vault"]
@@ -447,7 +523,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             # for a model rather than the ok/result envelope.
             return _emit_gate(result, json_mode=args.json)
         if result is not None:
-            _emit(result, json_mode=args.json)
+            _emit(
+                result,
+                args.command,
+                code_command=getattr(args, "code_command", None),
+                json_mode=args.json,
+            )
         if args.command == "lint" and isinstance(result, dict) and not result["ok"]:
             return 1
         if (
@@ -710,7 +791,15 @@ def _interactive_policy_wizard() -> dict[str, Any]:
         raise ValidationError(
             "Interactive init needs a terminal; use --config with a complete policy"
         )
-    print("brainkit policy wizard — every question must be answered.")
+    print(console.banner())
+    print(
+        "The compilation gate between raw evidence and knowledge an agent "
+        "may act on. Every question has a sensible default -- press Enter "
+        "to accept it."
+    )
+
+    print()
+    print(console.step_header(1, 4, "Language & branches"))
     wiki_language = _ask("Wiki language", "Portuguese (Brazil)")
     branch_names = [
         item.strip()
@@ -722,6 +811,9 @@ def _interactive_policy_wizard() -> dict[str, Any]:
     ]
     inbox_policy = _ask_policy("_inbox")
     branches = {branch: _ask_policy(branch) for branch in branch_names}
+
+    print()
+    print(console.step_header(2, 4, "Providers & models"))
     providers = _ask_json(
         "Provider configuration JSON",
         {
@@ -739,6 +831,9 @@ def _interactive_policy_wizard() -> dict[str, Any]:
             "resurface": {"provider": "ollama", "model": "qwen3:8b"},
         },
     )
+
+    print()
+    print(console.step_header(3, 4, "Sources & schedule"))
     sources = _comma_values(_ask("Source folders/files (comma-separated)", ""))
     # Offered with the defaults filled in rather than as "anything to add?":
     # the operator has to see what is already excluded to judge it, and a
@@ -753,6 +848,9 @@ def _interactive_policy_wizard() -> dict[str, Any]:
     taxonomy = _comma_values(
         _ask("Taxonomy seed (comma-separated)", ",".join(branch_names))
     )
+
+    print()
+    print(console.step_header(4, 4, "Novelty & integrations"))
     novelty = _ask_json(
         "Novelty and freshness policy JSON",
         {
@@ -778,6 +876,21 @@ def _interactive_policy_wizard() -> dict[str, Any]:
             },
         },
     )
+
+    print()
+    print(console.rule("Creating vault with"))
+    print(
+        console.kv_panel(
+            [
+                ("language", wiki_language),
+                ("branches", ", ".join(branch_names) or "-"),
+                ("providers", ", ".join(providers) or "-"),
+                ("digest schedule", digest_schedule),
+            ]
+        )
+    )
+    print()
+
     return {
         "version": 3,
         "wiki_language": wiki_language,
@@ -809,8 +922,9 @@ def _ask_policy(branch: str) -> dict[str, str]:
 
 
 def _ask(prompt: str, suggestion: str) -> str:
-    suffix = f" [{suggestion}]" if suggestion else ""
-    value = input(f"{prompt}{suffix}: ").strip()
+    label = console.style(prompt, console.BOLD)
+    suffix = console.style(f" [{suggestion}]", console.MUTED) if suggestion else ""
+    value = input(f"{label}{suffix}: ").strip()
     return value or suggestion
 
 
@@ -819,20 +933,32 @@ def _ask_choice(prompt: str, values: list[str], suggestion: str) -> str:
         value = _ask(f"{prompt} ({'/'.join(values)})", suggestion)
         if value in values:
             return value
-        print(f"Choose one of: {', '.join(values)}")
+        print(console.style(f"Choose one of: {', '.join(values)}", console.WARN))
 
 
 def _ask_json(prompt: str, suggestion: dict[str, Any]) -> dict[str, Any]:
+    """Ask for a JSON object, showing the suggestion pretty-printed above.
+
+    Inlining the suggestion into the prompt's `[...]` bracket -- what this
+    used to do -- meant reading a wall of compact JSON on one line before
+    deciding whether to accept it. Printing it expanded first is the same
+    accept-on-Enter contract, just legible.
+    """
+
+    print(console.style(f"{prompt}:", console.MUTED))
+    print(console.indent(json.dumps(suggestion, indent=2, ensure_ascii=False)))
     while True:
-        raw = _ask(prompt, json.dumps(suggestion, ensure_ascii=False))
+        raw = _ask("Press Enter to accept, or paste replacement JSON", "")
+        if not raw:
+            return suggestion
         try:
             value = json.loads(raw)
         except json.JSONDecodeError:
-            print("Enter a valid JSON object.")
+            print(console.style("Enter a valid JSON object.", console.WARN))
             continue
         if isinstance(value, dict):
             return value
-        print("Enter a JSON object.")
+        print(console.style("Enter a JSON object.", console.WARN))
 
 
 def _comma_values(value: str) -> list[str]:
@@ -867,7 +993,7 @@ def _watch(
         result = service.watch_once()
         if once:
             return result
-        _emit(result, json_mode=json_mode)
+        _emit(result, "watch", json_mode=json_mode)
         time.sleep(interval)
 
 
@@ -1529,20 +1655,431 @@ def _extract_global_options(argv: list[str]) -> tuple[list[str], dict[str, Any]]
     return result, values
 
 
-def _emit(value: Any, *, json_mode: bool) -> None:
+def _scalar(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _render_auto(value: Any) -> str:
+    """The fallback for every command without a renderer below.
+
+    A flat dict becomes a panel; a dict with exactly one list-valued key
+    (and no nested dicts otherwise) adds a table or a bullet list for it.
+    Anything shaped differently falls through to the same indented JSON dump
+    `_emit` always printed -- this never raises on a shape it does not
+    recognise, so no command can regress by gaining a worse rendering than
+    it had before.
+    """
+
+    if not isinstance(value, dict):
+        return json.dumps(value, indent=2, ensure_ascii=False)
+    list_items = [(key, item) for key, item in value.items() if isinstance(item, list)]
+    has_nested_dict = any(isinstance(item, dict) for item in value.values())
+    if len(list_items) > 1 or has_nested_dict:
+        return json.dumps(value, indent=2, ensure_ascii=False)
+    scalars = [
+        (key, _scalar(item)) for key, item in value.items() if not isinstance(item, list)
+    ]
+    parts = [console.kv_panel(scalars)] if scalars else []
+    for key, items in list_items:
+        if not items:
+            continue
+        parts.append("")
+        parts.append(console.rule(key.replace("_", " ")))
+        if all(isinstance(item, dict) for item in items):
+            headers = list(items[0].keys())
+            rows = [[_scalar(item.get(header)) for header in headers] for item in items]
+            parts.append(console.table(headers, rows))
+        else:
+            parts.append("\n".join(f"{console.BULLET} {_scalar(item)}" for item in items))
+    return "\n".join(part for part in parts if part) or console.style(
+        "(empty)", console.MUTED
+    )
+
+
+def _render_status(value: dict[str, Any]) -> str:
+    healthy = value["healthy"]
+    headline = "vault healthy" if healthy else f"{value['lint_errors']} lint error(s)"
+    parts = [
+        console.status_line(healthy, headline),
+        "",
+        console.kv_panel(
+            [
+                ("vault", value["vault"]),
+                ("sources", str(value["sources"])),
+                ("pending", str(value["pending"])),
+                ("wiki pages", str(value["wiki_pages"])),
+                (
+                    "indexed",
+                    f"{value['index']['documents']} documents"
+                    + (
+                        f" (updated {value['index']['updated_at']})"
+                        if value["index"]["updated_at"]
+                        else ""
+                    ),
+                ),
+            ]
+        ),
+    ]
+    by_branch = value.get("by_branch") or {}
+    if by_branch:
+        parts += [
+            "",
+            console.rule("by branch"),
+            console.table(
+                ["branch", "sources"], [[b, str(n)] for b, n in by_branch.items()]
+            ),
+        ]
+    freshness = value.get("freshness") or {}
+    if freshness:
+        parts += [
+            "",
+            console.rule("wiki freshness"),
+            console.kv_panel([(state, str(n)) for state, n in freshness.items()]),
+        ]
+    projections = value.get("projections") or {}
+    if projections:
+        rows = [
+            [name, console.state_tag(info.get("state", "?")), info.get("generated_at") or "-"]
+            for name, info in projections.items()
+        ]
+        parts += [
+            "",
+            console.rule("projections"),
+            console.table(["artifact", "state", "generated_at"], rows),
+        ]
+    layers = (value.get("enforcement") or {}).get("layers") or []
+    if layers:
+        rows = [
+            [layer["layer"], console.status_line(layer["active"], layer.get("detail", ""))]
+            for layer in layers
+        ]
+        parts += ["", console.rule("enforcement"), console.table(["layer", "status"], rows)]
+    return "\n".join(parts)
+
+
+def _render_search(value: dict[str, Any]) -> str:
+    hits = value.get("hits") or []
+    header = console.status_line(True, f"{value['count']} hit(s) for \"{value['query']}\"")
+    if value.get("redacted"):
+        header += "  " + console.style(f"({value['redacted']} redacted)", console.WARN)
+    if not hits:
+        return header
+    rows = [
+        [hit["title"] or hit["path"], hit["kind"], f"{hit['score']:.3f}", hit["excerpt"]]
+        for hit in hits
+    ]
+    return "\n".join([header, "", console.table(["title", "kind", "score", "excerpt"], rows)])
+
+
+def _render_context(value: dict[str, Any]) -> str:
+    evidence = value.get("evidence") or []
+    header = console.status_line(
+        True, f"{len(evidence)} evidence item(s) for \"{value['query']}\""
+    )
+    if value.get("redacted"):
+        header += "  " + console.style(f"({value['redacted']} redacted)", console.WARN)
+    blocks = [header]
+    for item in evidence:
+        blocks.append("")
+        blocks.append(console.rule(item["citation"]))
+        blocks.append(
+            console.kv_panel(
+                [("path", item["path"]), ("kind", item["kind"]), ("privacy", item["privacy"])]
+            )
+        )
+        blocks.append("")
+        blocks.append(item.get("content", ""))
+    return "\n".join(blocks)
+
+
+def _render_lint(value: dict[str, Any]) -> str:
+    findings = value.get("findings") or []
+    if not findings:
+        return console.status_line(True, "no lint findings")
+    errors = sum(finding["severity"] == "error" for finding in findings)
+    warnings = len(findings) - errors
+    summary = ", ".join(
+        part
+        for part in (
+            f"{errors} error(s)" if errors else "",
+            f"{warnings} warning(s)" if warnings else "",
+        )
+        if part
+    )
+    header = console.status_line(value["ok"], summary)
+    rows = [
+        [
+            console.style(
+                finding["severity"],
+                console.ERR if finding["severity"] == "error" else console.WARN,
+            ),
+            finding["code"],
+            finding.get("path") or "-",
+            finding["message"],
+        ]
+        for finding in findings
+    ]
+    return "\n".join([header, "", console.table(["severity", "code", "path", "message"], rows)])
+
+
+def _render_proposals(value: dict[str, Any]) -> str:
+    proposals = value.get("proposals") or []
+    header = console.status_line(True, f"{value['count']} proposal(s)")
+    if not proposals:
+        return header
+    rows = [
+        [p["proposal_id"], p["destination_branch"], p["filing_mode"], p["status"], p["created_at"]]
+        for p in proposals
+    ]
+    return "\n".join(
+        [header, "", console.table(["id", "branch", "mode", "status", "created"], rows)]
+    )
+
+
+def _render_ingest(value: dict[str, Any]) -> str:
+    results = value.get("results") or []
+    header = console.status_line(True, f"{value['ingested']} source(s) ingested")
+    if not results:
+        return header
+    rows = []
+    for result in results:
+        proposal = result.get("proposal") or {}
+        state = "queued for approval" if result.get("queued") else "applied"
+        rows.append([result["source"][:12], proposal.get("destination_branch", "-"), state])
+    return "\n".join([header, "", console.table(["source", "branch", "state"], rows)])
+
+
+def _render_approve(value: dict[str, Any]) -> str:
+    proposal = value.get("proposal") or {}
+    note = "already applied" if value.get("idempotent") else "applied"
+    return console.status_line(True, f"proposal {proposal.get('proposal_id', '?')} {note}")
+
+
+def _render_reject(value: dict[str, Any]) -> str:
+    proposal = value.get("proposal") or {}
+    return console.status_line(True, f"proposal {proposal.get('proposal_id', '?')} rejected")
+
+
+def _render_forget(value: dict[str, Any]) -> str:
+    forgotten = value.get("forgotten") or {}
+    lines = [console.status_line(True, f"forgot {forgotten.get('path', '?')}")]
+    still_cited = value.get("still_cited_by") or []
+    if still_cited:
+        lines.append(console.style(f"still cited by {len(still_cited)} page(s):", console.WARN))
+        lines.append("\n".join(f"{console.BULLET} {p}" for p in still_cited))
+    return "\n".join(lines)
+
+
+def _render_file(value: dict[str, Any]) -> str:
+    source = value.get("source") or {}
+    return console.status_line(
+        True, f"moved {source.get('original_name', '?')} to {source.get('path', '?')}"
+    )
+
+
+#: Shown after `bk init`, whether it ran the interactive wizard or took
+#: `--config` -- the celebratory banner belongs to "a vault now exists",
+#: not to the Q&A that may or may not have produced it.
+_INIT_NEXT_STEPS: tuple[tuple[str, str], ...] = (
+    ("bk status", "see vault health"),
+    ("bk capture <file>", "add your first note"),
+    ('bk ask "..."', "ask a question"),
+)
+
+
+def _render_init(value: dict[str, Any]) -> str:
+    config = value.get("config") or {}
+    parts = [
+        console.banner(),
+        "",
+        console.status_line(True, f"vault initialized at {value['vault']}"),
+        console.kv_panel(
+            [
+                ("wiki language", str(config.get("wiki_language", "-"))),
+                ("branches", ", ".join(config.get("branches", {})) or "-"),
+                ("indexed", str(value.get("indexed_documents", 0))),
+                ("views written", str(len(value.get("views", [])))),
+            ]
+        ),
+        "",
+        console.style("Next", console.BOLD, console.ACCENT),
+    ]
+    for command, description in _INIT_NEXT_STEPS:
+        parts.append(f"  {console.ARROW} {command:<20} {console.style(description, console.MUTED)}")
+    return "\n".join(parts)
+
+
+def _render_ask(value: dict[str, Any]) -> str:
+    parts = [console.rule("answer"), value["answer"]]
+    citations = value.get("citations") or []
+    if citations:
+        parts += ["", console.style("citations", console.BOLD, console.ACCENT)]
+        parts.append("\n".join(f"{console.BULLET} {c}" for c in citations))
+    if value.get("uncertainty"):
+        parts += ["", console.style(f"uncertainty: {value['uncertainty']}", console.WARN)]
+    if value.get("saved_to"):
+        parts += ["", console.style(f"Saved to {value['saved_to']}", console.MUTED)]
+    return "\n".join(parts)
+
+
+def _render_digest(value: dict[str, Any]) -> str:
+    parts = [console.rule("digest"), value["digest"]]
+    actions = value.get("actions") or []
+    if actions:
+        parts += ["", console.style("actions", console.BOLD, console.ACCENT)]
+        parts.append("\n".join(f"{console.BULLET} {a}" for a in actions))
+    if value.get("resurfaced"):
+        parts += ["", console.style(f"resurfaced: {value['resurfaced']}", console.MUTED)]
+    parts += ["", console.style(f"Saved to {value['path']}", console.MUTED)]
+    return "\n".join(parts)
+
+
+def _render_resurface(value: dict[str, Any]) -> str:
+    parts = [console.rule(value.get("page", "resurfaced")), value["markdown"]]
+    if value.get("question"):
+        parts += ["", console.style(f"question: {value['question']}", console.MUTED)]
+    parts += ["", console.style(f"Saved to {value['path']}", console.MUTED)]
+    return "\n".join(parts)
+
+
+def _render_code_affected(value: dict[str, Any]) -> str:
+    affected = value.get("affected") or []
+    header = console.status_line(True, f"{value['count']} symbol(s) affected by {value['symbol']}")
+    if not affected:
+        return header
+    rows = [
+        [node.get("label", node.get("id")), node.get("path", "-"), str(node.get("via", "-")), str(node.get("depth", ""))]
+        for node in affected
+    ]
+    return "\n".join([header, "", console.table(["symbol", "path", "via", "depth"], rows)])
+
+
+def _render_code_path(value: dict[str, Any]) -> str:
+    if not value.get("found"):
+        return console.status_line(False, f"no path from {value['from']} to {value['to']}")
+    chain = value.get("path") or []
+    tokens = []
+    for node in chain:
+        via = node.get("via")
+        if via:
+            tokens.append(console.style(f"--{via}-->", console.MUTED))
+        tokens.append(str(node.get("label", node.get("id", "?"))))
+    return "\n".join(
+        [console.status_line(True, f"{value['hops']} hop(s)"), "  " + " ".join(tokens)]
+    )
+
+
+def _render_code_hubs(value: dict[str, Any]) -> str:
+    hubs = value.get("hubs") or []
+    header = console.status_line(True, f"{len(hubs)} hub(s)")
+    if not hubs:
+        return header
+    rows = [
+        [hub.get("label", hub.get("id")), hub.get("path", "-"), str(hub.get("edges", 0))]
+        for hub in hubs
+    ]
+    return "\n".join([header, "", console.table(["symbol", "path", "edges"], rows)])
+
+
+def _render_code_communities(value: dict[str, Any]) -> str:
+    communities = value.get("communities") or []
+    header = console.status_line(True, f"{value['count']} community cluster(s)")
+    if not communities:
+        return header
+    rows = [
+        [community["label"], str(community["size"]), f"{community['cohesion']:.3f}"]
+        for community in communities
+    ]
+    return "\n".join([header, "", console.table(["community", "size", "cohesion"], rows)])
+
+
+def _render_code_cycles(value: dict[str, Any]) -> str:
+    cycles = value.get("cycles") or []
+    header = console.status_line(not cycles, f"{value['count']} import cycle(s)")
+    if not cycles:
+        return header
+    rows = [
+        [f" {console.ARROW} ".join(cycle.get("cycle", [])), str(cycle.get("length", "")), cycle.get("why", "")]
+        for cycle in cycles
+    ]
+    return "\n".join([header, "", console.table(["cycle", "length", "why"], rows)])
+
+
+def _render_code_diff(value: dict[str, Any]) -> str:
+    parts = [console.status_line(True, value.get("summary", "diff computed"))]
+    for key, label in (
+        ("new_nodes", "new nodes"),
+        ("removed_nodes", "removed nodes"),
+        ("new_edges", "new edges"),
+        ("removed_edges", "removed edges"),
+    ):
+        items = value.get(key) or []
+        if not items:
+            continue
+        parts.append("")
+        parts.append(console.rule(label))
+        if key.endswith("_nodes"):
+            parts.append(console.table(["symbol"], [[item.get("label", item.get("id"))] for item in items]))
+        else:
+            parts.append(
+                console.table(
+                    ["source", "relation", "target"],
+                    [[item.get("source"), item.get("relation", ""), item.get("target")] for item in items],
+                )
+            )
+    return "\n".join(parts)
+
+
+_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "init": _render_init,
+    "status": _render_status,
+    "search": _render_search,
+    "context": _render_context,
+    "lint": _render_lint,
+    "proposals": _render_proposals,
+    "ingest": _render_ingest,
+    "approve": _render_approve,
+    "reject": _render_reject,
+    "forget": _render_forget,
+    "file": _render_file,
+    "ask": _render_ask,
+    "digest": _render_digest,
+    "resurface": _render_resurface,
+}
+
+_CODE_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "affected": _render_code_affected,
+    "path": _render_code_path,
+    "hubs": _render_code_hubs,
+    "communities": _render_code_communities,
+    "cycles": _render_code_cycles,
+    "diff": _render_code_diff,
+}
+
+
+def _render(value: Any, command: str, *, code_command: str | None = None) -> str:
+    if command == "code" and isinstance(value, dict):
+        renderer = _CODE_RENDERERS.get(code_command or "")
+        if renderer is not None:
+            return renderer(value)
+        return _render_auto(value)
+    renderer = _RENDERERS.get(command) if isinstance(value, dict) else None
+    if renderer is not None:
+        return renderer(value)
+    return _render_auto(value)
+
+
+def _emit(
+    value: Any, command: str, *, code_command: str | None = None, json_mode: bool
+) -> None:
     if json_mode:
         print(json.dumps({"ok": True, "result": value}, ensure_ascii=False))
         return
-    if isinstance(value, dict) and isinstance(value.get("answer"), str):
-        print(value["answer"])
-        if value.get("saved_to"):
-            print(f"\nSaved to {value['saved_to']}")
-        return
-    if isinstance(value, dict) and isinstance(value.get("digest"), str):
-        print(value["digest"])
-        print(f"\nSaved to {value['path']}")
-        return
-    print(json.dumps(value, indent=2, ensure_ascii=False))
+    print(_render(value, command, code_command=code_command))
 
 
 def _emit_gate(decision: Any, *, json_mode: bool) -> int:
@@ -1558,19 +2095,22 @@ def _emit_gate(decision: Any, *, json_mode: bool) -> int:
     if json_mode:
         print(json.dumps(decision, ensure_ascii=False))
     elif allowed:
-        print(f"allowed: {decision.get('path', '')}")
+        print(console.status_line(True, f"allowed: {decision.get('path', '')}"))
     else:
         reason = str(decision.get("reason") or "This write is not permitted")
         remediation = str(decision.get("remediation") or "")
         line = f"bk: {reason} {remediation}".rstrip()
-        print(line, file=sys.stderr)
+        print(console.style(line, console.ERR, stream=sys.stderr), file=sys.stderr)
     return 0 if allowed else 2
 
 
 def _internal_error(exc: BaseException) -> InternalError:
     """Summarize an unmodelled failure; the traceback stays on stderr."""
 
-    print("bk: unhandled internal error", file=sys.stderr)
+    print(
+        console.style("bk: unhandled internal error", console.ERR, stream=sys.stderr),
+        file=sys.stderr,
+    )
     traceback.print_exception(exc, file=sys.stderr)
     sys.stderr.flush()
     name = type(exc).__name__
@@ -1594,7 +2134,7 @@ def _emit_error(error: BrainkitError, *, json_mode: bool) -> None:
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False), file=stream)
     else:
-        print(f"bk: {error}", file=stream)
+        print(console.style(f"bk: {error}", console.ERR, stream=stream), file=stream)
         if error.details:
             print(json.dumps(error.details, indent=2, ensure_ascii=False), file=stream)
 

@@ -18,7 +18,7 @@ from brainkit.domain.model import ValidationError
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
 from brainkit.infrastructure.vault import FileVault
-from brainkit.interfaces import cli
+from brainkit.interfaces import cli, console
 from brainkit.interfaces.mcp import (
     MCP_MAX_REQUEST_BYTES,
     MCP_PROTOCOL_VERSION,
@@ -703,6 +703,469 @@ class WebViewerBoundaryTest(unittest.TestCase):
             build_server(
                 self.service, host="0.0.0.0", port=0, consumer="local"  # noqa: S104
             )
+
+
+class RendererUnitTests(unittest.TestCase):
+    """Each per-command renderer against the exact shape its service method
+    returns -- confirmed by reading health.py, retrieval.py, filing.py,
+    jobs.py and codegraph.py directly, not guessed. These pin content, not
+    exact strings, per this repo's own "assert the outcome" philosophy.
+
+    Every call runs under `redirect_stdout(io.StringIO())` even though a
+    renderer only returns a string: `console.style` reads
+    `sys.stdout.isatty()` at call time, and a StringIO is the same
+    "definitely not a terminal" signal the rest of the suite relies on --
+    it keeps these tests deterministic regardless of whether the run
+    happens to have a real TTY attached.
+    """
+
+    def render(self, fn: Any, value: dict[str, Any]) -> str:
+        with redirect_stdout(io.StringIO()):
+            return fn(value)
+
+    def test_status_reports_health_counts_and_branches(self) -> None:
+        text = self.render(
+            cli._render_status,
+            {
+                "vault": "/tmp/vault",
+                "sources": 3,
+                "pending": 1,
+                "wiki_pages": 5,
+                "by_branch": {"10-work": 2, "20-research": 1},
+                "index": {"documents": 5, "updated_at": "2026-01-01T00:00:00+00:00"},
+                "freshness": {"fresh": 3, "review": 1, "stale": 0, "unknown": 1},
+                "projections": {
+                    "views": {
+                        "state": "fresh",
+                        "stale": False,
+                        "generated_at": "2026-01-01T00:00:00+00:00",
+                    }
+                },
+                "enforcement": {
+                    "layers": [
+                        {
+                            "layer": "write_gate",
+                            "mechanism": "x",
+                            "active": True,
+                            "detail": "active",
+                        }
+                    ],
+                    "inactive": [],
+                    "gated": True,
+                },
+                "healthy": True,
+                "lint_errors": 0,
+            },
+        )
+        self.assertIn("/tmp/vault", text)
+        self.assertIn("10-work", text)
+        self.assertIn("write_gate", text)
+        self.assertIn("vault healthy", text)
+
+    def test_status_reports_unhealthy_with_a_lint_error_count(self) -> None:
+        text = self.render(
+            cli._render_status,
+            {
+                "vault": "/tmp/vault",
+                "sources": 0,
+                "pending": 0,
+                "wiki_pages": 0,
+                "by_branch": {},
+                "index": {"documents": 0, "updated_at": None},
+                "freshness": {},
+                "projections": {},
+                "enforcement": {"layers": [], "inactive": [], "gated": False},
+                "healthy": False,
+                "lint_errors": 2,
+            },
+        )
+        self.assertIn("2 lint error(s)", text)
+
+    def test_search_lists_hits_and_the_redacted_count(self) -> None:
+        text = self.render(
+            cli._render_search,
+            {
+                "query": "governed wiki",
+                "consumer": "human",
+                "redacted": 1,
+                "count": 1,
+                "hits": [
+                    {
+                        "path": "raw/10-work/note.md",
+                        "kind": "raw",
+                        "title": "note.md",
+                        "excerpt": "a governed wiki",
+                        "score": 1.246,
+                        "content_hash": None,
+                        "privacy": "local-only",
+                    }
+                ],
+            },
+        )
+        self.assertIn("note.md", text)
+        self.assertIn("1 redacted", text)
+
+    def test_context_shows_citation_and_content_per_evidence_item(self) -> None:
+        text = self.render(
+            cli._render_context,
+            {
+                "contract_version": 1,
+                "query": "q",
+                "consumer": "human",
+                "wiki_language": "English",
+                "evidence": [
+                    {
+                        "citation": "source:abc123",
+                        "path": "raw/10-work/note.md",
+                        "kind": "raw",
+                        "branches": ["10-work"],
+                        "privacy": "local-only",
+                        "content": "the actual evidence text",
+                    }
+                ],
+                "redacted": 0,
+                "apply_contract": {},
+            },
+        )
+        self.assertIn("source:abc123", text)
+        self.assertIn("the actual evidence text", text)
+
+    def test_lint_reports_no_findings(self) -> None:
+        text = self.render(cli._render_lint, {"ok": True, "findings": [], "semantic_report": None})
+        self.assertIn("no lint findings", text)
+
+    def test_lint_separates_errors_from_warnings(self) -> None:
+        text = self.render(
+            cli._render_lint,
+            {
+                "ok": False,
+                "findings": [
+                    {"code": "raw.content_modified", "severity": "error", "message": "boom", "path": "x"},
+                    {"code": "views.stale", "severity": "warning", "message": "stale", "path": None},
+                ],
+                "semantic_report": None,
+            },
+        )
+        self.assertIn("1 error(s)", text)
+        self.assertIn("1 warning(s)", text)
+        self.assertIn("raw.content_modified", text)
+
+    def test_proposals_lists_id_branch_and_status(self) -> None:
+        text = self.render(
+            cli._render_proposals,
+            {
+                "count": 1,
+                "proposals": [
+                    {
+                        "proposal_id": "p1",
+                        "source_hash": "abc",
+                        "destination_branch": "10-work",
+                        "filing_mode": "approve-each",
+                        "apply_proposal": {},
+                        "reason": "why",
+                        "status": "pending",
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "decided_at": None,
+                        "result": None,
+                    }
+                ],
+            },
+        )
+        self.assertIn("p1", text)
+        self.assertIn("10-work", text)
+        self.assertIn("pending", text)
+
+    def test_ingest_reports_queued_vs_applied(self) -> None:
+        text = self.render(
+            cli._render_ingest,
+            {
+                "ingested": 2,
+                "results": [
+                    {
+                        "source": "abcdef1234567890",
+                        "proposal": {"destination_branch": "10-work"},
+                        "queued": True,
+                    },
+                    {
+                        "source": "0987654321fedcba",
+                        "proposal": {"destination_branch": "20-research"},
+                        "apply": {},
+                        "queued": False,
+                    },
+                ],
+            },
+        )
+        self.assertIn("queued for approval", text)
+        self.assertIn("applied", text)
+
+    def test_approve_names_the_proposal(self) -> None:
+        text = self.render(
+            cli._render_approve,
+            {"proposal": {"proposal_id": "p1"}, "apply": {}, "idempotent": False},
+        )
+        self.assertIn("p1", text)
+        self.assertIn("applied", text)
+
+    def test_reject_names_the_proposal(self) -> None:
+        text = self.render(cli._render_reject, {"proposal": {"proposal_id": "p1"}})
+        self.assertIn("p1", text)
+        self.assertIn("rejected", text)
+
+    def test_forget_warns_about_pages_still_citing_it(self) -> None:
+        text = self.render(
+            cli._render_forget,
+            {
+                "forgotten": {"path": "raw/10-work/note.md", "content_hash": "abc"},
+                "still_cited_by": ["wiki/concepts/foo.md"],
+            },
+        )
+        self.assertIn("raw/10-work/note.md", text)
+        self.assertIn("still cited by 1 page(s)", text)
+        self.assertIn("wiki/concepts/foo.md", text)
+
+    def test_file_names_source_and_destination(self) -> None:
+        text = self.render(
+            cli._render_file,
+            {"source": {"original_name": "note.md", "path": "raw/20-research/note.md"}},
+        )
+        self.assertIn("note.md", text)
+        self.assertIn("raw/20-research/note.md", text)
+
+    def test_ask_shows_answer_citations_uncertainty_and_saved_path(self) -> None:
+        text = self.render(
+            cli._render_ask,
+            {
+                "question": "q",
+                "answer": "the answer",
+                "citations": ["source:abc"],
+                "uncertainty": "low confidence",
+                "saved_to": "output/answers/q.md",
+            },
+        )
+        self.assertIn("the answer", text)
+        self.assertIn("source:abc", text)
+        self.assertIn("low confidence", text)
+        self.assertIn("output/answers/q.md", text)
+
+    def test_digest_shows_markdown_actions_and_path(self) -> None:
+        text = self.render(
+            cli._render_digest,
+            {
+                "digest": "## Today",
+                "actions": ["review the inbox"],
+                "resurfaced": "concept:x",
+                "path": "output/digests/2026-01-01.md",
+            },
+        )
+        self.assertIn("## Today", text)
+        self.assertIn("review the inbox", text)
+        self.assertIn("output/digests/2026-01-01.md", text)
+
+    def test_resurface_shows_markdown_and_page(self) -> None:
+        text = self.render(
+            cli._render_resurface,
+            {
+                "markdown": "## Revisit this",
+                "page": "concept:durable-insight",
+                "question": "why now",
+                "path": "output/resurface/2026-01-01.md",
+            },
+        )
+        self.assertIn("## Revisit this", text)
+        self.assertIn("concept:durable-insight", text)
+        self.assertIn("output/resurface/2026-01-01.md", text)
+
+    def test_code_affected_lists_symbols_and_depth(self) -> None:
+        text = self.render(
+            cli._render_code_affected,
+            {
+                "symbol": "foo",
+                "id": "mod:foo",
+                "depth": 2,
+                "consumer": "local",
+                "count": 1,
+                "affected": [
+                    {"id": "mod:bar", "label": "bar", "path": "bar.py", "line": 10, "via": "calls", "depth": 1}
+                ],
+            },
+        )
+        self.assertIn("foo", text)
+        self.assertIn("bar", text)
+        self.assertIn("calls", text)
+
+    def test_code_path_reports_hops_when_found(self) -> None:
+        text = self.render(
+            cli._render_code_path,
+            {
+                "found": True,
+                "consumer": "local",
+                "hops": 1,
+                "path": [
+                    {"id": "mod:a", "label": "a", "path": "a.py", "line": 1},
+                    {"id": "mod:b", "label": "b", "path": "b.py", "line": 2, "via": "imports"},
+                ],
+            },
+        )
+        self.assertIn("1 hop(s)", text)
+        self.assertIn("a", text)
+        self.assertIn("imports", text)
+        self.assertIn("b", text)
+
+    def test_code_path_reports_not_found(self) -> None:
+        text = self.render(
+            cli._render_code_path,
+            {"found": False, "from": "mod:a", "to": "mod:z", "consumer": "local"},
+        )
+        self.assertIn("no path", text)
+        self.assertIn("mod:a", text)
+        self.assertIn("mod:z", text)
+
+    def test_code_hubs_lists_symbols_by_edge_count(self) -> None:
+        text = self.render(
+            cli._render_code_hubs,
+            {
+                "consumer": "local",
+                "hubs": [{"id": "mod:a", "label": "a", "path": "a.py", "line": 1, "edges": 12}],
+            },
+        )
+        self.assertIn("a", text)
+        self.assertIn("12", text)
+
+    def test_code_communities_lists_clusters(self) -> None:
+        text = self.render(
+            cli._render_code_communities,
+            {
+                "consumer": "local",
+                "count": 1,
+                "communities": [
+                    {"id": 0, "label": "Community 0", "size": 4, "cohesion": 0.8123, "members": []}
+                ],
+            },
+        )
+        self.assertIn("Community 0", text)
+        self.assertIn("0.812", text)
+
+    def test_code_cycles_reports_none_found(self) -> None:
+        text = self.render(cli._render_code_cycles, {"consumer": "local", "count": 0, "cycles": []})
+        self.assertIn("0 import cycle(s)", text)
+
+    def test_code_cycles_lists_the_cycle_chain(self) -> None:
+        text = self.render(
+            cli._render_code_cycles,
+            {
+                "consumer": "local",
+                "count": 1,
+                "cycles": [{"cycle": ["a.ts", "b.ts"], "length": 2, "why": "circular dependency"}],
+            },
+        )
+        self.assertIn("a.ts", text)
+        self.assertIn("b.ts", text)
+        self.assertIn("circular dependency", text)
+
+    def test_code_diff_reports_new_and_removed_nodes_and_edges(self) -> None:
+        text = self.render(
+            cli._render_code_diff,
+            {
+                "consumer": "local",
+                "new_nodes": [{"id": "mod:c", "label": "c"}],
+                "removed_nodes": [],
+                "new_edges": [{"source": "mod:a", "target": "mod:c", "relation": "calls", "confidence": 0.9}],
+                "removed_edges": [],
+                "summary": "1 new node, 1 new edge",
+            },
+        )
+        self.assertIn("1 new node, 1 new edge", text)
+        self.assertIn("c", text)
+        self.assertIn("calls", text)
+
+    def test_init_shows_the_confirmation_and_next_steps(self) -> None:
+        text = self.render(
+            cli._render_init,
+            {
+                "vault": "/tmp/vault",
+                "config": {"wiki_language": "English", "branches": {"10-work": {}}},
+                "indexed_documents": 2,
+                "views": ["views/home.md"],
+            },
+        )
+        self.assertIn("/tmp/vault", text)
+        self.assertIn("10-work", text)
+        self.assertIn("bk status", text)
+        self.assertIn("bk capture", text)
+
+    def test_auto_render_flat_dict_as_a_panel(self) -> None:
+        text = self.render(cli._render_auto, {"indexed_documents": 5})
+        self.assertIn("indexed_documents", text)
+        self.assertIn("5", text)
+
+    def test_auto_render_scalars_plus_one_list_of_dicts_as_a_table(self) -> None:
+        text = self.render(
+            cli._render_auto,
+            {
+                "created": 1,
+                "duplicates": 0,
+                "ignored": 0,
+                "failures": [{"path": "x.md", "error": "boom"}],
+            },
+        )
+        self.assertIn("created", text)
+        self.assertIn("x.md", text)
+        self.assertIn("boom", text)
+
+    def test_auto_render_scalars_plus_one_list_of_strings_as_bullets(self) -> None:
+        text = self.render(cli._render_auto, {"written": ["views/home.md", "views/map/_inbox.md"]})
+        self.assertIn(f"{console.BULLET} views/home.md", text)
+
+    def test_auto_render_falls_back_to_json_for_two_lists(self) -> None:
+        value = {"a": [1, 2], "b": [3, 4]}
+        text = self.render(cli._render_auto, value)
+        self.assertEqual(json.loads(text), value)
+
+    def test_auto_render_falls_back_to_json_for_a_nested_dict(self) -> None:
+        value = {"outer": {"inner": 1}}
+        text = self.render(cli._render_auto, value)
+        self.assertEqual(json.loads(text), value)
+
+
+class GroupedHelpTests(unittest.TestCase):
+    """Every command `build_parser()` registers has to land in exactly one
+    `HELP_CATEGORIES` section -- not zero (silently unlisted) and not two
+    (double-counted), so a future command can't go missing from `bk --help`
+    without a test noticing.
+    """
+
+    def test_every_command_is_grouped_exactly_once(self) -> None:
+        registered = set(cli._command_help_index(cli.build_parser()))
+        counts: dict[str, int] = {}
+        for _title, names in cli.HELP_CATEGORIES:
+            for name in names:
+                counts[name] = counts.get(name, 0) + 1
+        self.assertEqual(registered, set(counts), "registered vs. grouped commands differ")
+        self.assertEqual(
+            {name for name, count in counts.items() if count != 1},
+            set(),
+            "a command appears in more than one HELP_CATEGORIES section",
+        )
+
+    def test_top_level_help_is_branded_and_grouped(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["--help"])
+        self.assertEqual(0, code)
+        self.assertIn("brainkit", out.getvalue())
+        self.assertIn("HugLabs", out.getvalue())
+        self.assertIn("Vault & capture", out.getvalue())
+        self.assertIn("Code graph", out.getvalue())
+        self.assertEqual("", err.getvalue())
+
+    def test_subcommand_help_is_left_to_argparse(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as exit_code:
+                cli.main(["code", "--help"])
+        self.assertEqual(0, exit_code.exception.code)
+        self.assertIn("{build,import,status", out.getvalue())
+        self.assertNotIn("HugLabs", out.getvalue())
 
 
 if __name__ == "__main__":

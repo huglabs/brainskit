@@ -498,3 +498,56 @@ Two process lessons from the repair round itself:
   vendored networkx one. It needs no dependency and already answers under a
   `--consumer`. Take vendored analysis only for what Brainkit cannot do:
   community detection, import cycles, graph diff.
+
+## CLI terminal UI: colors, tables, grouped help, guided onboarding (2026-08-03)
+
+- The CLI had zero rendering of its own before this: every human-mode command
+  fell through one `_emit()` that printed `json.dumps(value, indent=2)`, and
+  no color/table library was imported anywhere in `src/`. Given "the core
+  stays at one dependency," `rich` was rejected in favor of a hand-rolled
+  ANSI module, `interfaces/console.py` — pure string builders (`style`,
+  `table`, `kv_panel`, `rule`, `status_line`, `banner`), no `print` calls of
+  its own, so every primitive is trivially unit-testable.
+- **Gate all color on `stream.isatty()`, never on an ambient flag.** Because
+  `io.StringIO().isatty()` and pytest's default capture both report `False`,
+  every existing test that asserted exact human-mode text kept passing
+  untouched the moment color was gated this way — structure could still
+  change freely (JSON dump → table), but escape codes only ever appear when
+  the actual target stream is a real terminal. This is what let a from-scratch
+  renderer rewrite of ~20 commands land with zero test breakage.
+- **A cell that already carries ANSI codes breaks naive width math — this
+  only shows up on a real TTY, never in a piped/test run.** `len()` on a
+  `status_line()`/`state_tag()` result counts the escape bytes as columns,
+  so raw-length width calculation both misaligns columns across rows (one
+  colored, one not) and — worse — lets truncation slice into the middle of
+  an escape sequence, cutting off the trailing reset and leaking that
+  cell's color into everything printed afterward in the terminal. Fixed by
+  measuring `_visible_len()` (ANSI-stripped) everywhere width/padding is
+  computed, and by truncating an overflowing colored cell on its
+  ANSI-stripped text rather than its raw string. **This bug was invisible to
+  the entire automated suite** (piped/StringIO output never carries color)
+  and only surfaced by actually driving the CLI over a `pty` with
+  `TERM=xterm-256color` and reading the raw bytes — confirm real-terminal
+  rendering this way before calling a terminal UI done, not just via tests.
+- **Driving an interactive prompt (`input()`) in a test harness needs a real
+  pty, not a piped stdin.** `sys.stdin.isatty()` gates the wizard
+  deliberately (`init` refuses non-interactively without `--config`), so
+  verifying the guided wizard end-to-end means `pty.openpty()` +
+  `subprocess.Popen(stdin=slave, stdout=slave, stderr=slave)`, sending `\r\n`
+  on the write end whenever `select()` reports the read end has gone idle
+  (i.e. the child is blocked on `input()`). A fixed-count "send N enters"
+  script is fragile against prompt count changes; idle-triggered sending
+  is not.
+- **Group a flat argparse subcommand list without touching argument
+  parsing.** Rather than subclassing `HelpFormatter` (fighting internals),
+  `bk --help`/`-h` is detected before `parse_args()` runs — scan argv left to
+  right, and if the help flag appears before any non-flag token, print a
+  custom grouped+branded help and return, otherwise fall through to
+  argparse untouched. `bk <command> --help` is never intercepted, so every
+  subcommand keeps argparse's default formatting exactly as before. The
+  one-line `help=` string each command was registered with has no public
+  accessor; it lives on the subparsers action's `_choices_actions`, read
+  once rather than duplicated into a second source of truth.
+- A mechanical test (every command name appears in exactly one
+  `HELP_CATEGORIES` bucket) is what makes "grouped help stays complete"
+  a fact instead of a hope the next added command quietly breaks.
