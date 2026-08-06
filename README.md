@@ -783,6 +783,17 @@ agents) covering how the graph is formed, where the privacy boundary applies and
 which commands may write, and installs a `pre-commit` hook running `bk lint`
 when the workspace is a git repository.
 
+It also runs the first `bk code build` itself, in-process, on the same run.
+Without that, `bk code status` would keep reporting `missing` until an agent
+happened to notice the `code build` row in the skill's own command table and
+ran it unprompted — nothing else on this path ever asks it to. The build is
+best-effort: a vault that never installed the `code` extra gets the same
+install hint `bk code build` would already give on its own, reported in
+`code_graph` and on stderr, not a failed onboarding. Pass `--skip-code-build`
+to leave the graph exactly as `bk code status` finds it — for a vault that
+documents something other than a code repository, or when a slow first
+extraction should not block onboarding.
+
 Everything it writes is safe to re-run. The instruction block is fenced by
 `<!-- brainkit:start -->` / `<!-- brainkit:end -->` and replaced in place, so
 your own instructions keep their content and their position. An existing skill

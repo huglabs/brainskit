@@ -25,8 +25,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from test_code_graph import _HAS_CODE_EXTRA
+
 from brainkit.application.services import BrainkitService
 from brainkit.domain.model import ValidationError
+from brainkit.infrastructure.extractor import GraphifyExtractor
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
 from brainkit.infrastructure.vault import FileVault
@@ -103,11 +106,19 @@ class VaultCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def install(self, agent: str = "claude", *, force: bool = False) -> dict[str, Any]:
+    def install(
+        self,
+        agent: str = "claude",
+        *,
+        force: bool = False,
+        skip_code_build: bool = False,
+    ) -> dict[str, Any]:
         # The installer writes an enforcement banner to stderr; the tests below
         # assert on the returned structure, so keep the test output readable.
         with redirect_stderr(StringIO()):
-            return cli._install_hooks(self.service, agent, force=force)
+            return cli._install_hooks(
+                self.service, agent, force=force, skip_code_build=skip_code_build
+            )
 
     def settings_path(self) -> Path:
         return self.root / ".claude" / "settings.json"
@@ -450,6 +461,121 @@ class EnforcementReportTest(VaultCase):
         self.assertFalse(self.settings_path().exists())
         layers = {item["layer"] for item in result["enforcement"]["layers"]}
         self.assertEqual(layers, {"commit_lint", "instructions"})
+
+
+class CodeGraphBootstrapTest(VaultCase):
+    """`hooks install` runs the first `bk code build` itself.
+
+    Without this, `bk code status` reports `missing` until an agent notices
+    the `code build` row in the skill's own command table and runs it
+    unprompted -- which nothing here ever asked it to do.
+    """
+
+    def test_no_extractor_configured_reports_skipped_not_raised(self) -> None:
+        # `self.service` (VaultCase) is built the same way every other test in
+        # this file uses it -- no extractor -- so this is also what every
+        # other `install()` call in this suite has been exercising all along.
+        result = self.install()
+        code_graph = result["code_graph"]
+        self.assertEqual(code_graph["state"], "skipped")
+        self.assertIn("No code extractor is configured", code_graph["reason"])
+        self.assertIn("bk code import", code_graph["hint"])
+
+    def test_the_skip_flag_is_reported_without_touching_the_extractor(self) -> None:
+        result = self.install(skip_code_build=True)
+        self.assertEqual(
+            result["code_graph"],
+            {"state": "skipped", "reason": "--skip-code-build was passed"},
+        )
+
+    def test_a_skip_warns_on_stderr_by_name(self) -> None:
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            cli._install_hooks(self.service, "claude", skip_code_build=True)
+        warning = buffer.getvalue()
+        self.assertIn("CODE GRAPH not built during onboarding", warning)
+        self.assertIn("--skip-code-build was passed", warning)
+        self.assertIn("bk code build", warning)
+
+    def test_an_unavailable_extractor_is_reported_not_raised(self) -> None:
+        service = BrainkitService(
+            self.vault,
+            SqliteFtsIndex(self.vault.index_path),
+            graph=MarkdownGraph(),
+            extractor=_UnavailableExtractor(),
+        )
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            result = cli._install_hooks(service, "claude")
+        self.assertEqual(result["code_graph"]["state"], "skipped")
+        self.assertIn("brainkit[code]", result["code_graph"]["hint"])
+        self.assertIn("brainkit[code]", buffer.getvalue())
+
+
+class _UnavailableExtractor:
+    """Stands in for `GraphifyExtractor` on a machine without the `code` extra.
+
+    Mirrors `test_code_graph._UnavailableExtractor`; kept local rather than
+    imported because that one asserts `extract()` is never called, which is
+    an assumption about `CodeGraph.build` this file has no reason to depend
+    on to make its own, narrower point about `_install_hooks`.
+    """
+
+    def available(self) -> bool:
+        return False
+
+    def extract(self, root: Path, paths: list[Path] | None = None, **_: Any) -> dict[str, Any]:
+        return {"nodes": [], "edges": []}
+
+
+@unittest.skipUnless(_HAS_CODE_EXTRA, "requires the `code` extra (tree-sitter + grammars)")
+class CodeGraphBootstrapBuildTest(unittest.TestCase):
+    """The one place `hooks install` meets a real extractor end to end."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary.name) / "repo"
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / ".git").mkdir()
+        (self.repo / "src" / "app.py").write_text(
+            "def main():\n    return 1\n", encoding="utf-8"
+        )
+        self.vault = FileVault.initialize(self.repo / "docs" / "brain", policy())
+        self.service = BrainkitService(
+            self.vault,
+            SqliteFtsIndex(self.vault.index_path),
+            graph=MarkdownGraph(),
+            extractor=GraphifyExtractor(),
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def graph_file(self) -> Path:
+        return self.vault.root / "graph" / "code.json"
+
+    def test_the_graph_is_built_and_the_run_stays_quiet_about_it(self) -> None:
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            result = cli._install_hooks(self.service, "claude", root=str(self.repo))
+        code_graph = result["code_graph"]
+        self.assertEqual(code_graph["state"], "built")
+        self.assertEqual(code_graph["written"], "graph/code.json")
+        self.assertGreater(code_graph["nodes"], 0)
+        self.assertTrue(self.graph_file().is_file())
+        self.assertNotIn("CODE GRAPH not built", buffer.getvalue())
+
+    def test_status_reports_fresh_immediately_after_install(self) -> None:
+        cli._install_hooks(self.service, "claude", root=str(self.repo))
+        self.assertEqual(self.service.code_status()["state"], "fresh")
+
+    def test_skip_code_build_leaves_no_graph_file_even_with_a_real_extractor(self) -> None:
+        result = cli._install_hooks(
+            self.service, "claude", root=str(self.repo), skip_code_build=True
+        )
+        self.assertEqual(result["code_graph"]["state"], "skipped")
+        self.assertFalse(self.graph_file().exists())
+        self.assertEqual(self.service.code_status()["state"], "missing")
 
 
 class GateCommandTest(VaultCase):

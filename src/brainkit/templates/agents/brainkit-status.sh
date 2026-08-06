@@ -69,11 +69,16 @@ fi
 
 # `lint` exits 1 when it finds errors, which is the interesting case, so its
 # exit code is deliberately not checked. A missing document becomes `null` so
-# the reader below keeps its positions.
+# the reader below keeps its positions. `code status` only ever reads the
+# stored graph -- no tree-sitter grammar required -- so it is safe to call
+# even on a vault that never installed the `code` extra; it just reports
+# `missing` the same way `bk code status` would from a terminal.
 PROPOSALS_JSON=$(bk --vault "$VAULT" proposals --status pending --json 2>/dev/null)
 LINT_JSON=$(bk --vault "$VAULT" lint --json 2>/dev/null)
+CODE_JSON=$(bk --vault "$VAULT" code status --json 2>/dev/null)
 [ -n "$PROPOSALS_JSON" ] || PROPOSALS_JSON=null
 [ -n "$LINT_JSON" ] || LINT_JSON=null
+[ -n "$CODE_JSON" ] || CODE_JSON=null
 
 HOOK_DIR=$(dirname "$0")
 if [ -x "$HOOK_DIR/brainkit-gate.sh" ]; then
@@ -90,7 +95,7 @@ else
     COMMIT_LINT=active
 fi
 
-printf '%s\n%s\n%s\n' "$STATUS_JSON" "$PROPOSALS_JSON" "$LINT_JSON" | python3 -c '
+printf '%s\n%s\n%s\n%s\n' "$STATUS_JSON" "$PROPOSALS_JSON" "$LINT_JSON" "$CODE_JSON" | python3 -c '
 import json
 import sys
 
@@ -122,8 +127,8 @@ def result(document):
 
 
 parsed = documents(sys.stdin.read())
-parsed += [None] * (3 - len(parsed))
-status, proposals, lint = (result(item) for item in parsed[:3])
+parsed += [None] * (4 - len(parsed))
+status, proposals, lint, code = (result(item) for item in parsed[:4])
 if not status:
     print("brainkit: status returned no readable result", file=sys.stderr)
     raise SystemExit(0)
@@ -174,6 +179,22 @@ for item in bypassed[:5]:
     lines.append("    outside apply: {}".format(item.get("path") or "?"))
 if len(bypassed) > 5:
     lines.append("    ... and {} more".format(len(bypassed) - 5))
+
+# `code` is {} rather than a real result whenever `bk code status` itself
+# could not be read (bk missing the subcommand, a vault old enough to
+# predate it) -- silence here, same tolerance as a missing lint/proposals
+# document above, not a claim that no code graph exists.
+code_state = code.get("state") if isinstance(code, dict) else None
+if code_state == "missing":
+    lines.append("  code graph missing - build it with: bk code build")
+elif code_state == "stale":
+    lines.append(
+        "  code graph stale ({} changed, {} removed) - refresh with: bk code build".format(
+            code.get("changed_total", 0), code.get("removed_total", 0)
+        )
+    )
+elif code_state == "fresh":
+    lines.append("  code graph fresh ({} files indexed)".format(code.get("files", 0)))
 
 lines.append("  enforcement write gate {} - commit lint {}".format(write_gate, commit_lint))
 lines.append("  evidence: bk context \"QUERY\" --consumer local --json - writes: bk apply")

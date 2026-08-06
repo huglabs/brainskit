@@ -299,6 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
             "scripts; settings.json is merged, never overwritten"
         ),
     )
+    hooks_install.add_argument(
+        "--skip-code-build",
+        action="store_true",
+        help=(
+            "Do not run bk code build as part of onboarding; leave the code "
+            "graph exactly as bk code status finds it"
+        ),
+    )
 
     commands.add_parser("schedule", help="Show configured habit job registrations")
 
@@ -703,7 +711,11 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return _watch(service, once=args.once, interval=args.interval, json_mode=args.json)
     if args.command == "hooks":
         return _install_hooks(
-            service, args.agent, root=args.root, force=args.force
+            service,
+            args.agent,
+            root=args.root,
+            force=args.force,
+            skip_code_build=args.skip_code_build,
         )
     if args.command == "schedule":
         return _schedule(service)
@@ -1487,6 +1499,7 @@ def _install_hooks(
     *,
     root: str | None = None,
     force: bool = False,
+    skip_code_build: bool = False,
 ) -> dict[str, Any]:
     vault = service.vault.root
     workspace = _resolve_workspace(vault, root)
@@ -1511,8 +1524,66 @@ def _install_hooks(
     if advisory is not None:
         result["workspace_advisory"] = advisory
     result["enforcement"] = _enforcement_summary(result)
+    result["code_graph"] = _bootstrap_code_graph(service, skip=skip_code_build)
     _warn_about_inactive_enforcement(result["enforcement"], advisory)
+    _note_code_graph_bootstrap(result["code_graph"])
     return result
+
+
+def _bootstrap_code_graph(service: BrainkitService, *, skip: bool) -> dict[str, Any]:
+    """Run the first `bk code build` on the same run that onboards the agent.
+
+    Without this, `bk code status` keeps reporting `missing` until an agent
+    happens to notice the `code build` row in the skill's command table and
+    runs it unprompted -- and the SessionStart hook never asks it to, because
+    it only ever reports vault/wiki health. Onboarding is the one moment a
+    human is already watching this command run, so it is also the moment a
+    slow first extraction is least surprising.
+
+    Best-effort, never fatal: the tree-sitter grammars are the `code` extra,
+    not a base dependency (see `pyproject.toml`), so a vault that never
+    installed it gets exactly the install hint `bk code build` would already
+    give on its own, not a failed onboarding. A caller that wants onboarding
+    to stay fast, or whose vault documents nothing that is a code repository,
+    opts out with `--skip-code-build`.
+    """
+    if skip:
+        return {"state": "skipped", "reason": "--skip-code-build was passed"}
+    try:
+        built = service.code_build(None)
+    except BrainkitError as exc:
+        return {
+            "state": "skipped",
+            "reason": str(exc),
+            "hint": exc.details.get("hint"),
+        }
+    except Exception as exc:
+        # Mirrors _sync_one_vault: an extractor's own failure belongs to this
+        # best-effort step, not to the onboarding it must not cancel.
+        return {
+            "state": "skipped",
+            "reason": f"{type(exc).__name__}: {exc}".strip(),
+        }
+    return {"state": "built", **built}
+
+
+def _note_code_graph_bootstrap(code_graph: dict[str, Any]) -> None:
+    """Say once, on stderr, whether the first `bk code build` actually ran.
+
+    Silence on a skip is the same failure `_warn_about_inactive_enforcement`
+    exists to prevent for the other layers: nothing else on this path ever
+    tells an agent the code graph is still missing.
+    """
+    if code_graph.get("state") == "built":
+        return
+    print("", file=sys.stderr)
+    print("bk: CODE GRAPH not built during onboarding:", file=sys.stderr)
+    if code_graph.get("reason"):
+        print(f"      {code_graph['reason']}", file=sys.stderr)
+    if code_graph.get("hint"):
+        print(f"      {code_graph['hint']}", file=sys.stderr)
+    print("      Build it yourself with: bk code build", file=sys.stderr)
+    print("", file=sys.stderr)
 
 
 def _vaults(args: argparse.Namespace) -> dict[str, Any]:

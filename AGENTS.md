@@ -551,3 +551,57 @@ Two process lessons from the repair round itself:
 - A mechanical test (every command name appears in exactly one
   `HELP_CATEGORIES` bucket) is what makes "grouped help stays complete"
   a fact instead of a hope the next added command quietly breaks.
+
+## Onboarding used to install the code graph's absence, not the graph (2026-08-05)
+
+- **The gap:** `bk hooks install` wrote the skill, the instruction block and
+  both Claude Code hooks, but never called `bk code build`. `bk init` didn't
+  either. So a fresh onboarding left `bk code status` reporting `missing`
+  forever, unless an agent happened to notice the `code build` row in the
+  skill's own command table and ran it unprompted — and the SessionStart hook
+  never asked it to, because it only ever read `bk status`/`proposals`/`lint`.
+  An agent talking to brainkit only over MCP could not reach the code graph
+  at all: none of the 16 registered tools wrap `code build`/`status`/
+  `affected`/`path`/`hubs`/`communities`/`cycles`/`diff` — that whole surface
+  was, and still is, CLI-only.
+- **The fix:** `_install_hooks` now calls `service.code_build(None)` itself,
+  best-effort, right after the enforcement summary. Caught as `BrainkitError`
+  first (the extractor's own clean failures — no extractor configured, the
+  `code` extra not installed — already carry the right hint) and `Exception`
+  second (mirrors `_sync_one_vault`: a producer's own failure belongs to the
+  one best-effort step it happened in, not to the onboarding it must not
+  cancel). `--skip-code-build` opts out for a vault that documents something
+  other than a code repository, or when a slow first extraction should not
+  block onboarding. Reported in `result["code_graph"]` and, on anything but
+  `state: "built"`, on stderr — the same "a skip has to say so" rule
+  `_warn_about_inactive_enforcement` already enforces for the other layers.
+- **The other half:** `brainkit-status.sh` (SessionStart) now also calls
+  `bk code status --json` alongside the three calls it already made, and
+  prints one more line: `missing`/`stale (N changed, N removed)`/`fresh (N
+  files)`. `code status` never needs the `code` extra — it only re-reads the
+  stored `graph/code.json` and re-hashes the files it names — so this is safe
+  to call unconditionally, including on a vault that skipped the build.
+  Placed after the existing `bk status` early-exit, alongside
+  `PROPOSALS_JSON`/`LINT_JSON`, with the same `2>/dev/null` + `null`-on-empty
+  tolerance: a `code status` failure degrades to no line, never a hook
+  failure.
+- **Verified live, not just unit-tested:** scaffolded a real git repo with
+  two Python files, ran `bk init` + `bk hooks install --agent claude --root
+  .` against it for real (no stubs). First run: `code_graph.state == "built"`,
+  15 nodes / 18 edges / 4 files, and the installed `brainkit-status.sh`
+  printed `code graph fresh (4 files indexed)`. Editing a source file after
+  install flipped it to `code graph stale (1 changed, 0 removed) - refresh
+  with: bk code build`. Re-running with `--skip-code-build` on a second vault
+  produced `code graph missing - build it with: bk code build` and the
+  matching stderr notice. All three states confirmed against the real CLI
+  before writing a single test.
+- **Test-suite consequence worth knowing:** every existing `_install_hooks`
+  call site in `tests/test_hooks_install.py` and `tests/test_fix_interfaces.py`
+  builds its `BrainkitService` without an `extractor` (the same fixture every
+  other test in those files already used), so `code_build`'s first check —
+  `if self.extractor is None: raise ValidationError(...)` — fires before any
+  filesystem walk. The new step is a no-op `state: "skipped"` in every one of
+  them; nothing about the existing 618 tests changed. A real `state: "built"`
+  path needed its own fixture (`CodeGraphBootstrapBuildTest`, gated on
+  `test_code_graph._HAS_CODE_EXTRA`, same real-repo shape as
+  `test_code_graph.CodeBuildFixture`) rather than retrofitting `VaultCase`.
