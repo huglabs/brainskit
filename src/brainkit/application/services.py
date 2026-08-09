@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from brainkit.application.codegraph import CodeGraph
 from brainkit.application.compilation import ApplyGate
+from brainkit.application.enrichment import Enrichment
 from brainkit.application.filing import Filing
 from brainkit.application.freshness import (
     _orphaned_freshness,
@@ -54,6 +55,7 @@ from brainkit.application.reader import Reader
 from brainkit.application.retrieval import Retrieval
 from brainkit.domain.model import (
     BrainkitError,
+    ScanSurvey,
     SourceRecord,
     ValidationError,
     is_ignored,
@@ -105,6 +107,7 @@ class BrainkitService:
         )
         self.projections = Projections(vault, self.health, graph, integrations)
         self.code_graph = CodeGraph(vault, extractor)
+        self.enrichment = Enrichment(vault, graph)
         self.reader = Reader(
             vault, index, self.health, self.filing, self.projections
         )
@@ -246,6 +249,23 @@ class BrainkitService:
         """Extract in-process and import the result. See `CodeGraph`."""
         scoped = [Path(path) for path in paths] if paths else None
         return self.code_graph.build(scoped)
+
+    def enrich_apply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Gate and store model-inferred edges. See `Enrichment`."""
+        return self.enrichment.apply(payload)
+
+    def enrich_list(self, *, consumer: str = "human") -> dict[str, Any]:
+        """Stored enrichment this consumer may see."""
+        edges = self.enrichment.edges(consumer=consumer)
+        return {"consumer": consumer, "count": len(edges), "edges": edges}
+
+    def enrich_forget(self, identifier: str) -> dict[str, Any]:
+        return self.enrichment.forget(identifier)
+
+    def code_survey(self, paths: list[str] | None = None) -> ScanSurvey | None:
+        """What a build would cover, without building. See `CodeGraph.survey`."""
+        scoped = [Path(path) for path in paths] if paths else None
+        return self.code_graph.survey(scoped)
 
     def code_status(self) -> dict[str, Any]:
         """Whether the code graph still describes the repository."""

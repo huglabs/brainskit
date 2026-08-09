@@ -391,6 +391,103 @@ class SettingsRegistrationTest(VaultCase):
                 )
 
 
+class StaleHookReplacementTest(VaultCase):
+    """A settings.json carried over from a different `--root` or vault must not
+    end up running alongside the correct install rather than being replaced by it.
+
+    Reproduces onboarding `eigent`: a settings.json copied in from another
+    project's `.claude/` (or written by an earlier install at a different
+    `--root`) registers `brainkit-gate.sh`/`brainkit-status.sh` at a path this
+    install will never write to. The old idempotency key (the literal command
+    string) never recognised that as the *same* hook, so both stayed
+    registered forever.
+    """
+
+    STALE_GATE = "/some/other/repo/.claude/hooks/brainkit-gate.sh"
+    STALE_STATUS = "/some/other/repo/.claude/hooks/brainkit-status.sh"
+
+    def seed_stale_hooks(self, *, alongside_unrelated: bool = False) -> None:
+        pre_tool_use = [
+            {
+                "matcher": "Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": self.STALE_GATE, "timeout": 10}],
+            }
+        ]
+        session_start = [
+            {"hooks": [{"type": "command", "command": self.STALE_STATUS, "timeout": 15}]}
+        ]
+        if alongside_unrelated:
+            pre_tool_use.append(
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/rtk.sh"}]}
+            )
+            session_start.append(
+                {"hooks": [{"type": "command", "command": "/other/session.sh"}]}
+            )
+        self.settings_path().parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path().write_text(
+            json.dumps(
+                {"hooks": {"PreToolUse": pre_tool_use, "SessionStart": session_start}},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_stale_path_is_replaced_not_duplicated(self) -> None:
+        self.seed_stale_hooks()
+        gate = str(self.script("brainkit-gate"))
+        status = str(self.script("brainkit-status"))
+        self.install()
+        self.assertEqual(self.commands("PreToolUse"), [gate])
+        self.assertEqual(self.commands("SessionStart"), [status])
+        self.assertNotIn(self.STALE_GATE, self.commands("PreToolUse"))
+        self.assertNotIn(self.STALE_STATUS, self.commands("SessionStart"))
+
+    def test_the_replacement_is_reported(self) -> None:
+        self.seed_stale_hooks()
+        outcome = self.install()["claude_hook"]["settings"]
+        self.assertEqual(
+            outcome["pruned"],
+            [
+                {"event": "PreToolUse", "command": self.STALE_GATE},
+                {"event": "SessionStart", "command": self.STALE_STATUS},
+            ],
+        )
+
+    def test_the_replacement_warns_on_stderr(self) -> None:
+        self.seed_stale_hooks()
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            cli._install_hooks(self.service, "claude")
+        warning = buffer.getvalue()
+        self.assertIn("STALE HOOKS replaced", warning)
+        self.assertIn(self.STALE_GATE, warning)
+        self.assertIn(self.STALE_STATUS, warning)
+
+    def test_unrelated_tooling_on_the_same_event_survives_the_prune(self) -> None:
+        self.seed_stale_hooks(alongside_unrelated=True)
+        self.install()
+        self.assertIn("/other/rtk.sh", self.commands("PreToolUse"))
+        self.assertIn("/other/session.sh", self.commands("SessionStart"))
+        self.assertNotIn(self.STALE_GATE, self.commands("PreToolUse"))
+        self.assertNotIn(self.STALE_STATUS, self.commands("SessionStart"))
+
+    def test_an_entry_left_empty_by_pruning_is_dropped_not_left_as_debris(self) -> None:
+        self.seed_stale_hooks()
+        self.install()
+        for event in ("PreToolUse", "SessionStart"):
+            for entry in self.settings()["hooks"][event]:
+                self.assertTrue(entry.get("hooks"), f"{event} kept an emptied entry")
+
+    def test_reinstalling_at_the_same_path_prunes_nothing_and_stays_idempotent(
+        self,
+    ) -> None:
+        self.install()
+        before = self.settings_path().read_bytes()
+        outcome = self.install()["claude_hook"]["settings"]
+        self.assertNotIn("pruned", outcome)
+        self.assertEqual(self.settings_path().read_bytes(), before)
+
+
 class EnforcementReportTest(VaultCase):
     """Every layer that is off has to say so; a quiet skip is how one disappears."""
 

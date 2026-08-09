@@ -37,13 +37,14 @@ import importlib.util
 import json
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from brainkit.application.ports import CodeExtractorPort, VaultPort
 from brainkit.application.privacy import _validate_consumer
 from brainkit.domain.model import (
     NotFoundError,
     PrivacyMode,
+    ScanSurvey,
     ValidationError,
     utc_now,
 )
@@ -113,8 +114,12 @@ class CodeGraph:
         if not self.extractor.available():
             raise ValidationError(
                 "Code extraction requires the optional tree-sitter grammars",
-                details={"hint": "Install them with: pip install brainkit[code]"},
+                details={"needs": ["brainkit[code]"]},
             )
+        self._refuse_missing_paths(paths)
+        survey = self.survey(paths)
+        self._refuse_oversized_scan(survey)
+        self._refuse_ignored_scan(survey)
         payload = self.extractor.extract(
             self.vault.code_root(), paths, cache_root=self.vault.code_cache_dir
         )
@@ -130,7 +135,119 @@ class CodeGraph:
                     "hint": "Extract with --code-only; prose belongs in the wiki",
                 },
             )
-        return self._write(nodes, edges, dropped)
+        return self._write(nodes, edges, dropped, survey=survey)
+
+    def survey(self, paths: list[Path] | None = None) -> ScanSurvey | None:
+        """What a build would cover, or None when the extractor cannot say.
+
+        Advisory by construction: an extractor that predates `survey`, or one
+        whose walk fails, costs the caller the ceiling check and the install
+        offer — never the build.
+        """
+
+        surveyor = getattr(self.extractor, "survey", None)
+        if surveyor is None:
+            return None
+        try:
+            return cast(ScanSurvey, surveyor(self.vault.code_root(), paths))
+        except Exception:
+            return None
+
+    def _refuse_missing_paths(self, paths: list[Path] | None) -> None:
+        """A scope that does not exist is a typo, not an empty scope.
+
+        `bk code build ./src/brainkti` (transposed) extracted nothing, merged
+        that nothing into the stored graph, and printed the *existing* node and
+        file counts under a success line — so a mistyped path reported as a
+        completed build of the whole repository. The scoped-merge behaviour is
+        right; accepting a path nobody could have meant is not.
+        """
+
+        if not paths:
+            return
+        root = self.vault.code_root()
+        missing = [
+            str(path)
+            for path in paths
+            if not (path if path.is_absolute() else root / path).exists()
+        ]
+        if missing:
+            raise NotFoundError(
+                "No such path under the code root",
+                details={
+                    "paths": missing,
+                    "code_root": str(root),
+                    "hint": "Scope a build to files or directories that exist",
+                },
+            )
+
+    def _refuse_ignored_scan(self, survey: ScanSurvey | None) -> None:
+        """Say when the scan root is being ignored, rather than being empty.
+
+        The extractor honours `.gitignore` and prunes conventionally noisy
+        directory names — `.cache`, `node_modules`, `dist`. That is correct
+        almost always, and useless in the one case where the *scan root itself*
+        sits under such a name: it collects nothing, and the only message that
+        ever reached the operator was "No code nodes in the imported graph",
+        which reads as a broken extractor.
+
+        Ten pinned repositories cached under `benchmarks/.cache/` all measured
+        zero exactly this way. The files were there, readable, and parseable;
+        the walk simply refused to enter. Naming that is the difference between
+        a two-minute fix and an afternoon.
+        """
+
+        if survey is None or not survey.ignored_entirely:
+            return
+        root, reason = self.vault.code_root_reason()
+        raise ValidationError(
+            "The code root exists and holds source, but the extractor skips all of it",
+            details={
+                "code_root": str(root),
+                "why_this_root": reason,
+                "files_on_disk": survey.present,
+                "files_collected": 0,
+                "likely_cause": (
+                    "a path component the extractor treats as noise (.cache, "
+                    "node_modules, dist, target, build) or a .gitignore rule "
+                    "that covers the whole root"
+                ),
+                "hint": "Move the source outside that directory, or point code_root at it",
+            },
+        )
+
+    def _refuse_oversized_scan(self, survey: ScanSurvey | None) -> None:
+        """Stop a scan that is far larger than any one project.
+
+        The check the incident needed. A vault sited in a directory that merely
+        held projects resolved its code root to that directory and indexed
+        55,295 files into a 683 MB graph, with no confirmation and nothing on
+        screen until it had finished. `code_root` is bounded now, so this is
+        the second lock rather than the first — but it is the one that holds
+        whatever a future layout does, because it measures the actual scan
+        instead of reasoning about where the vault sits.
+        """
+
+        if survey is None:
+            return
+        limit = self.vault.config().code_scan_limit
+        if survey.files <= limit:
+            return
+        root, reason = self.vault.code_root_reason()
+        raise ValidationError(
+            "Refusing to scan more files than a project should contain",
+            details={
+                "code_root": str(root),
+                "why_this_root": reason,
+                "files": survey.files,
+                "code_scan_limit": limit,
+                "hint": (
+                    "Point the vault at one project with code_root in "
+                    ".brain/config.json, or raise code_scan_limit if this "
+                    "really is one repository"
+                ),
+            },
+        )
 
     def _merge_scoped(
         self,
@@ -223,6 +340,8 @@ class CodeGraph:
         nodes: dict[str, dict[str, Any]],
         edges: list[dict[str, Any]],
         dropped: int,
+        *,
+        survey: ScanSurvey | None = None,
     ) -> dict[str, Any]:
         # Hashed at import, compared at status. This is the artefact's input
         # set, and the only reason the graph can ever be called stale.
@@ -241,16 +360,57 @@ class CodeGraph:
             "files": files,
             "fingerprint": _fingerprint(files),
         }
+        # Recorded *in the artefact*, not only in this call's return value, so
+        # that `bk code status` can tell a graph built with every grammar apart
+        # from one built without three of them. Without it, a partial graph and
+        # a complete one are indistinguishable the moment the build output
+        # scrolls away -- which is how a two-node graph of a four-file
+        # repository came to be reported as `fresh`.
+        if survey is not None:
+            graph["coverage"] = survey.to_dict()
         self.vault.write_generated(
             CODE_PROJECTION, json.dumps(graph, indent=2, ensure_ascii=False) + "\n"
         )
-        return {
+        result = {
             "written": CODE_PROJECTION,
             "nodes": len(nodes),
             "edges": len(edges),
             "files": len(files),
             "dropped_non_code_nodes": dropped,
             "unreadable_files": missing,
+        }
+        if survey is not None and survey.missing:
+            result["missing_grammars"] = [g.to_dict() for g in survey.missing]
+            result["unreachable_files"] = survey.unreachable_files
+        if survey is not None:
+            result.update(self._unexplained(survey, covered=len(files)))
+        return result
+
+    @staticmethod
+    def _unexplained(survey: ScanSurvey, *, covered: int) -> dict[str, Any]:
+        """Files that should have been indexed and were not, for no stated reason.
+
+        Every other outcome names itself: a missing grammar is reported, a
+        deliberate skip carries a marker, an unreadable file lands in
+        `unreadable_files`. What was left was a silent fourth category, and it
+        is the one both harness failures fell into -- spawned workers that died
+        without a word, and a scan root the extractor declined to walk. One
+        measured 7.7% coverage on files that all parse correctly; the other
+        reported ten repositories at zero. Neither raised, and neither had
+        anywhere to be reported.
+
+        Derived rather than detected, so it does not care *why*: the survey
+        says how many files have an installed grammar, the write says how many
+        landed in the graph, and any gap is by definition unaccounted for --
+        including gaps whose cause has not been invented yet.
+        """
+
+        gap = survey.parseable_files - covered
+        if gap <= 0:
+            return {}
+        return {
+            "unexplained_files": gap,
+            "unexplained_ratio": round(gap / survey.parseable_files, 4),
         }
 
     def _vault_prefix(self) -> str:
@@ -376,8 +536,23 @@ class CodeGraph:
                 changed.append(str(path))
 
         fresh = not changed and not removed
-        return {
-            "state": "fresh" if fresh else "stale",
+        # `fresh` answers "does the graph match the files it recorded" -- and a
+        # graph built without a grammar never recorded those files at all, so
+        # it passes that test while being blind to a whole language. A four-file
+        # repository reported two nodes and `fresh`, which is worse than an
+        # error: it is a wrong answer that looks like a right one. `partial`
+        # keeps the freshness verdict intact and adds the coverage one.
+        coverage = graph.get("coverage")
+        missing = (
+            coverage.get("grammars_missing") or []
+            if isinstance(coverage, dict)
+            else []
+        )
+        state = "fresh" if fresh else "stale"
+        if fresh and missing:
+            state = "partial"
+        result = {
+            "state": state,
             "stale": not fresh,
             "generated_at": generated_at if isinstance(generated_at, str) else None,
             "files": len(files),
@@ -389,6 +564,14 @@ class CodeGraph:
             "removed_total": len(removed),
             **({} if fresh else {"command": CODE_PROJECTION_COMMAND}),
         }
+        if missing:
+            result["missing_grammars"] = [
+                str(entry.get("distribution", "")) for entry in missing
+            ]
+            result["unreachable_files"] = (
+                coverage.get("unreachable_files") if isinstance(coverage, dict) else 0
+            )
+        return result
 
     # -------------------------------------------------------------- traversal
 
@@ -442,22 +625,29 @@ class CodeGraph:
 
         graph = self._read(consumer)
         start, goal = self._resolve(graph, source), self._resolve(graph, target)
-        neighbours: dict[str, list[tuple[str, str]]] = {}
+        # Undirected on purpose -- "how are these two related" is not the same
+        # question as "what does this call", and insisting on edge direction
+        # would report no path between two symbols that plainly are connected.
+        # But *which way* each hop actually points is information, and dropping
+        # it made every hop render as `--via-->` regardless: a chain read as a
+        # call sequence when half of it may be callers. The direction rides
+        # along so the renderer can tell the truth.
+        neighbours: dict[str, list[tuple[str, str, bool]]] = {}
         for edge in graph["edges"]:
             a, b = str(edge["source"]), str(edge["target"])
-            neighbours.setdefault(a, []).append((b, str(edge["type"])))
-            neighbours.setdefault(b, []).append((a, str(edge["type"])))
+            neighbours.setdefault(a, []).append((b, str(edge["type"]), True))
+            neighbours.setdefault(b, []).append((a, str(edge["type"]), False))
 
-        previous: dict[str, tuple[str, str]] = {}
+        previous: dict[str, tuple[str, str, bool]] = {}
         seen = {start}
         frontier = deque([start])
         while frontier and goal not in seen:
             current = frontier.popleft()
-            for neighbour, relation in neighbours.get(current, []):
+            for neighbour, relation, forward in neighbours.get(current, []):
                 if neighbour in seen:
                     continue
                 seen.add(neighbour)
-                previous[neighbour] = (current, relation)
+                previous[neighbour] = (current, relation, forward)
                 frontier.append(neighbour)
 
         nodes = {str(node["id"]): node for node in graph["nodes"]}
@@ -467,8 +657,16 @@ class CodeGraph:
         chain: list[dict[str, Any]] = []
         cursor = goal
         while cursor != start:
-            parent, relation = previous[cursor]
-            chain.append({**nodes.get(cursor, {"id": cursor}), "via": relation})
+            parent, relation, forward = previous[cursor]
+            chain.append(
+                {
+                    **nodes.get(cursor, {"id": cursor}),
+                    "via": relation,
+                    # True: the previous symbol points at this one. False: this
+                    # one points back at the previous.
+                    "forward": forward,
+                }
+            )
             cursor = parent
         chain.append(nodes.get(start, {"id": start}))
         chain.reverse()
@@ -586,7 +784,7 @@ class CodeGraph:
             if not self.extractor.available():
                 raise ValidationError(
                     "Code extraction requires the optional tree-sitter grammars",
-                    details={"hint": "Install them with: pip install brainkit[code]"},
+                    details={"needs": ["brainkit[code]"]},
                 )
             payload = self.extractor.extract(
                 self.vault.code_root(), cache_root=self.vault.code_cache_dir
@@ -710,7 +908,7 @@ def _load_analysis() -> tuple[Any, Any]:
         if importlib.util.find_spec("networkx") is None:
             raise ValidationError(
                 "This command requires the optional `networkx` dependency",
-                details={"hint": "Install it with: pip install brainkit[code]"},
+                details={"needs": ["brainkit[code]"]},
             )
         # Side effect only: installs the `graphify` alias in `sys.modules`,
         # same as `infrastructure/extractor.py`'s own `_load`. A function

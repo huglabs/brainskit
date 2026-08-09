@@ -308,7 +308,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_communities()
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["hint"])
+        self.assertIn("brainkit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
     def test_cycles_without_networkx_is_a_clear_error(self) -> None:
@@ -317,7 +317,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_cycles()
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["hint"])
+        self.assertIn("brainkit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
     def test_diff_without_networkx_is_a_clear_error(self) -> None:
@@ -326,7 +326,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_diff(clustered_payload())
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["hint"])
+        self.assertIn("brainkit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
     def test_the_refusal_is_checked_before_the_privacy_boundary(self) -> None:
@@ -338,7 +338,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_communities(consumer="cloud")
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["hint"])
+        self.assertIn("brainkit[code]", caught.exception.details["needs"])
 
 
 class VendoredAnalysisImportTest(unittest.TestCase):

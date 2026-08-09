@@ -44,6 +44,36 @@ code = [
   # Community detection, hub ranking, import cycles and graph diff.
   "networkx>=3.4",
 ]
+# The rest of the grammars the vendored extractors can drive. They are a
+# separate extra rather than part of `code` for the reason `code` is itself an
+# extra: grammars are compiled wheels, and this roughly triples an already
+# large download for languages most repositories do not contain.
+#
+# What makes it worth naming at all is that `codeanalysis/extractors/` ships a
+# working extractor for every one of these. Without the grammar the extractor
+# is unreachable code -- `bk code build` reports the file "contributed nothing"
+# and the graph builds successfully around the hole. `tests/test_code_grammars.py`
+# asserts that every grammar the extractors import appears in one of the two
+# lists, so a new extractor cannot quietly land without one.
+code-all = [
+  "brainkit[code]",
+  "tree-sitter-sql>=0.3,<1",
+  "tree-sitter-swift>=0.7,<1",
+  "tree-sitter-hcl>=1.2,<2",
+  "tree-sitter-kotlin>=1.1,<2",
+  "tree-sitter-objc>=3,<4",
+  "tree-sitter-groovy>=0.1,<1",
+  "tree-sitter-powershell>=0.26,<1",
+  "tree-sitter-fortran>=0.6,<1",
+  "tree-sitter-lua>=0.5,<1",
+  "tree-sitter-elixir>=0.3,<1",
+  "tree-sitter-julia>=0.23,<1",
+  "tree-sitter-scala>=0.26,<1",
+  "tree-sitter-zig>=1.1,<2",
+  "tree-sitter-verilog>=1,<2",
+  "tree-sitter-pascal>=0.11,<1",
+  "tree-sitter-dm>=0.25,<1",
+]
 
 [project.scripts]
 bk = "brainkit.interfaces.cli:main"

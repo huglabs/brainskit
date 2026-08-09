@@ -4222,14 +4222,6 @@ _DISPATCH: dict[str, Any] = {
 # (pyproject [project.optional-dependencies]) and hard-fails without it,
 # rather than falling back like Pascal does. Used by the #1745 warning in
 # extract() to tell the user which extra restores the language.
-_EXTRA_FOR_EXTENSION = {
-    ".sql": "sql",
-    ".tf": "terraform",
-    ".tfvars": "terraform",
-    ".hcl": "terraform",
-    ".dm": "dm",
-    ".dme": "dm",
-}
 
 
 # Extensionless executables (CLI entry points like `devctl` or `manage`) carry
@@ -4427,7 +4419,15 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
     # byte-stable across runs and silently blinds affected/explain to and
     # through the file (#1666); skipping the write lets a rerun self-heal.
-    if not bypass_cache and "error" not in result and result.get("nodes"):
+    # A `skipped` result is cacheable where an anomalous empty is not: the
+    # extractor reached a deliberate, deterministic decision about this file.
+    # Re-deriving it every build re-parses every data-shaped JSON in the tree
+    # forever. Safe because the key is the content hash, so editing the file
+    # re-extracts, and the cache directory is namespaced by extractor version,
+    # so changing the recognition rule invalidates it.
+    if not bypass_cache and "error" not in result and (
+        result.get("nodes") or result.get("skipped")
+    ):
         save_cached(path, result, root, cache_root=cache_location)
     return idx, result
 
@@ -4572,7 +4572,10 @@ def _extract_sequential(
         # XAML boundary anchors on `root` (the corpus), not the cache location.
         result = _safe_extract_with_xaml_root(extractor, path, root)
         # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
-        if not bypass_cache and "error" not in result and result.get("nodes"):
+        # Deliberate skips are cacheable; see _extract_single_file.
+        if not bypass_cache and "error" not in result and (
+            result.get("nodes") or result.get("skipped")
+        ):
             save_cached(path, result, root, cache_root=cache_location)
         per_file[idx] = result
     if total_files >= _PROGRESS_INTERVAL:
@@ -4692,10 +4695,17 @@ def extract(
     # #1666: surface any source file an extractor accepted but that produced zero
     # nodes (not even a file node). Such a file is silently absent from the graph,
     # so affected/explain are blind to and through it with no other signal.
+    #
+    # `skipped` is a third outcome, distinct from both: the extractor ran, chose
+    # not to index this file, and said so. `extract_json` sets it for data-shaped
+    # JSON, which #1224 deliberately excluded after AST-walking datasets and API
+    # dumps swamped real structure with orphan key-nodes. Without honouring it
+    # here, #1666 warns about precisely what #1224 decided to skip -- and tells
+    # the operator to re-run, which re-derives the same deliberate skip forever.
     _empty_sources: list[str] = []
     for i, _p in enumerate(paths):
         _res = per_file[i] or {}
-        if _res.get("nodes") or _res.get("error"):
+        if _res.get("nodes") or _res.get("error") or _res.get("skipped"):
             continue
         if _get_extractor(_p) is not None:
             _empty_sources.append(str(_p))
@@ -4749,10 +4759,22 @@ def extract(
             _missing_dep_count[_ext] = _missing_dep_count.get(_ext, 0) + 1
             _missing_dep_error.setdefault(_ext, _err)
     for _ext, _n in sorted(_missing_dep_count.items(), key=lambda kv: (-kv[1], kv[0])):
-        _extra = _EXTRA_FOR_EXTENSION.get(_ext)
-        if _extra:
-            _reason = _missing_dep_error[_ext].split(". ")[0]
-            _hint = f' Install it with: pip install "graphifyy[{_extra}]"'
+        # The hint is derived from the module the error already names, not from
+        # an extension->extra table. Upstream's table pointed at `graphifyy`
+        # extras, which is a dead end here: brainkit vendors this code and does
+        # not depend on graphifyy, so following that instruction installed an
+        # unrelated distribution and the file still contributed nothing. The
+        # module name is right there in the message and maps to its distribution
+        # by the usual underscore-to-hyphen rule, so every grammar gets a
+        # correct hint without a mapping to keep in step.
+        _reason = _missing_dep_error[_ext].split(". ")[0]
+        _module = re.search(r"(tree_sitter_[a-z0-9_]+)", _reason)
+        if _module:
+            _package = _module.group(1).replace("_", "-")
+            _hint = (
+                f" Install it with: pip install {_package}"
+                ' — or pip install "brainkit[code-all]" for every language.'
+            )
         else:
             _reason = _missing_dep_error[_ext]
             _hint = ""

@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "Real repositories, pinned by commit so a run is reproducible and a",
+    "regression is attributable to brainkit rather than to upstream moving.",
+    "Chosen to span the languages the shipped extractors claim, at two",
+    "sizes, and to stay small enough that a full run is minutes rather than",
+    "hours -- the question is coverage and cost per language, not throughput.",
+    "Commits are the repositories' HEAD as of 2026-08-08, resolved with",
+    "git ls-remote. Re-pin deliberately; do not track HEAD, or a coverage",
+    "change will be indistinguishable from an upstream change.",
+    "Fetched shallow into benchmarks/.cache (gitignored). A repository that",
+    "cannot be fetched is skipped rather than fatal: this tier is opt-in and",
+    "a network problem must not read as a brainkit regression."
+  ],
+  "pinned_at": "2026-08-08",
+  "repositories": [
+    {
+      "name": "flask",
+      "languages": "python",
+      "size": "S",
+      "url": "https://github.com/pallets/flask",
+      "commit": "6a2f545bfd8ed31e19066a299296917e034aca58"
+    },
+    {
+      "name": "requests",
+      "languages": "python",
+      "size": "S",
+      "url": "https://github.com/psf/requests",
+      "commit": "1f6589ec3a1ee910f9a65cc3ceac60b26677bc0e"
+    },
+    {
+      "name": "chi",
+      "languages": "go",
+      "size": "S",
+      "url": "https://github.com/go-chi/chi",
+      "commit": "8b258c7bb28f97a5f2a856ff7ef962578fec9215"
+    },
+    {
+      "name": "ripgrep",
+      "languages": "rust",
+      "size": "M",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7"
+    },
+    {
+      "name": "zod",
+      "languages": "typescript",
+      "size": "M",
+      "url": "https://github.com/colinhacks/zod",
+      "commit": "912f0f51b0ced654d0069741e7160834dca742ee"
+    },
+    {
+      "name": "sinatra",
+      "languages": "ruby",
+      "size": "S",
+      "url": "https://github.com/sinatra/sinatra",
+      "commit": "cb22afd7902b566b6eaba6c4ea89739494a65d12"
+    },
+    {
+      "name": "terraform-provider-random",
+      "languages": "go, hcl",
+      "size": "S",
+      "url": "https://github.com/hashicorp/terraform-provider-random",
+      "commit": "0edb70b39eea1633f643252b81f98dbf70aef24a"
+    },
+    {
+      "name": "alamofire",
+      "languages": "swift",
+      "size": "M",
+      "url": "https://github.com/Alamofire/Alamofire",
+      "commit": "0455bfb650893e86ad07ace16e5f2d36dadf46f4"
+    },
+    {
+      "name": "commons-lang",
+      "languages": "java",
+      "size": "M",
+      "url": "https://github.com/apache/commons-lang",
+      "commit": "9d1f110190081801754a8a0b447693ad2407a502"
+    },
+    {
+      "name": "sqlite-utils",
+      "languages": "python, sql",
+      "size": "S",
+      "url": "https://github.com/simonw/sqlite-utils",
+      "commit": "6a456830ca33eb5edaa634a9b0febe5d71bea2be"
+    }
+  ]
+}

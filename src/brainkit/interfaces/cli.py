@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 import traceback
@@ -16,21 +19,23 @@ from typing import Any, NamedTuple
 from brainkit import __version__
 from brainkit.application.services import BrainkitService
 from brainkit.domain.model import (
-    DEFAULT_IGNORE_PATTERNS,
     BrainkitError,
-    FilingMode,
     PolicyError,
-    PrivacyMode,
     ValidationError,
 )
-from brainkit.infrastructure.extractor import GraphifyExtractor
+from brainkit.infrastructure import pyenv
+from brainkit.infrastructure.extractor import (
+    GraphifyExtractor,
+    _extension_grammars,
+    grammar_inventory,
+)
 from brainkit.infrastructure.graph import MarkdownGraph
 from brainkit.infrastructure.index import SqliteFtsIndex
 from brainkit.infrastructure.integrations import NativeIntegrations, vault_id
 from brainkit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainkit.infrastructure.vault import FileVault
 from brainkit.infrastructure.vaults import RegisteredVault, VaultRegistry
-from brainkit.interfaces import console
+from brainkit.interfaces import console, onboarding, prompt
 
 
 class InternalError(BrainkitError):
@@ -53,6 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--config", help="Complete policy JSON path, or - for standard input"
     )
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="Create the vault even in a directory that holds other projects",
+    )
+    # `hooks install` has had this since the code-graph bootstrap landed; `init`
+    # runs the same bootstrap and had no way to decline it.
+    init.add_argument(
+        "--skip-code-build",
+        action="store_true",
+        help="Do not build the code graph while onboarding the agent",
+    )
 
     capture = commands.add_parser("capture", help="Capture a file, URL, or text")
     capture.add_argument("source", nargs="?")
@@ -60,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--title")
 
     commands.add_parser("status", help="Show vault health and counts")
+    commands.add_parser(
+        "doctor", help="Check the installation itself: deps, grammars, code root"
+    )
     commands.add_parser("reconcile", help="Heal registry paths after manual moves")
     commands.add_parser("reindex", help="Rebuild the disposable FTS5 index")
 
@@ -114,6 +134,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent", default="claude", help="Policy adapter to consult"
     )
 
+    # Model-inferred edges are stored apart from `graph/graph.json` and joined
+    # at read time: that file is a projection and would destroy them on the
+    # next `bk graph`. See `application/enrichment.py`.
+    enrich = commands.add_parser(
+        "enrich", help="Model-inferred graph edges, gated and kept apart"
+    )
+    enrich_sub = enrich.add_subparsers(dest="enrich_command", required=True)
+    enrich_apply = enrich_sub.add_parser(
+        "apply", help="Validate and store proposed edges"
+    )
+    enrich_apply.add_argument("proposal", help="Proposal JSON path, or - for stdin")
+    enrich_list = enrich_sub.add_parser("list", help="Stored edges, privacy-filtered")
+    enrich_list.add_argument("--consumer", choices=["human", "local", "cloud"])
+    enrich_forget = enrich_sub.add_parser("forget", help="Drop one stored edge")
+    enrich_forget.add_argument("id", metavar="ID", help="Full or prefix edge id")
+
     commands.add_parser("views", help="Regenerate Obsidian views")
     graph = commands.add_parser("graph", help="Regenerate the knowledge graph")
     graph.add_argument("--html", action="store_true")
@@ -139,6 +175,24 @@ def build_parser() -> argparse.ArgumentParser:
             "Scope the scan to these files/directories (default: the whole "
             "code root). Merged into the stored graph rather than replacing it"
         ),
+    )
+    # A grammar that is not installed does not fail the build -- it removes a
+    # language from it, silently, and the graph then reports itself complete.
+    # The scan is surveyed first so the shortfall is offered before the time is
+    # spent, and the offer is a question rather than an action because
+    # installing into someone's environment is not a build step's decision.
+    code_build.add_argument(
+        "--install-missing",
+        dest="install_missing",
+        action="store_true",
+        default=None,
+        help="Install any missing tree-sitter grammars without asking",
+    )
+    code_build.add_argument(
+        "--no-install-missing",
+        dest="install_missing",
+        action="store_false",
+        help="Never install; report the shortfall and build without them",
     )
 
     code_import = code_commands.add_parser(
@@ -448,12 +502,12 @@ def build_parser() -> argparse.ArgumentParser:
 HELP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Vault & capture",
-        ("init", "capture", "status", "reconcile", "reindex", "file", "forget", "watch", "lint"),
+        ("init", "capture", "status", "doctor", "reconcile", "reindex", "file", "forget", "watch", "lint"),
     ),
     ("Search & context", ("search", "context", "ask")),
     ("Code graph", ("code",)),
     ("Filing & review", ("ingest", "proposals", "approve", "reject", "apply")),
-    ("Automation", ("digest", "resurface", "views", "graph", "schedule")),
+    ("Automation", ("digest", "resurface", "views", "graph", "enrich", "schedule")),
     ("Governance", ("gate", "hooks")),
     ("Integrations & registry", ("export", "integration", "vaults")),
     ("Serve", ("serve", "web")),
@@ -467,8 +521,17 @@ def _wants_top_level_help(argv: Sequence[str]) -> bool:
     command: if that token is the help flag, this is top-level help; if it
     is anything else (the command name), argparse's own per-subcommand help
     already handles it correctly and is left untouched.
+
+    Naming no command at all counts. A bare `bk` is someone asking what this
+    thing does, and argparse's answer -- a usage block listing thirty commands
+    on one line, then `error: the following arguments are required: command`
+    -- is the least useful reply available to a first-time reader. Note this
+    is deliberately "the token list is empty", not "it held no command":
+    `bk --version` exhausts the loop without one and must still reach argparse.
     """
 
+    if not argv:
+        return True
     for token in argv:
         if token in ("-h", "--help"):
             return True
@@ -494,8 +557,19 @@ def _command_help_index(parser: argparse.ArgumentParser) -> dict[str, str]:
 
 
 def _grouped_help(parser: argparse.ArgumentParser) -> str:
+    # Argparse's own usage line spells out all thirty command names in one
+    # brace-delimited blob, which wraps to several lines and is unreadable at
+    # exactly the moment someone is trying to find their bearings. The grouped
+    # listing below *is* the enumeration; the usage line only has to show the
+    # shape of an invocation.
     help_index = _command_help_index(parser)
-    lines = [console.banner(), "", parser.format_usage().strip(), ""]
+    usage = (
+        console.style("usage:", console.MUTED)
+        + " bk [--vault PATH] [--json] "
+        + console.style("<command>", console.BOLD)
+        + " [args]"
+    )
+    lines = [console.banner(), "", usage, ""]
     grouped = {name for _, names in HELP_CATEGORIES for name in names}
     for title, names in HELP_CATEGORIES:
         lines.append(console.style(title, console.BOLD, console.ACCENT))
@@ -512,13 +586,479 @@ def _grouped_help(parser: argparse.ArgumentParser) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _browse_commands(parser: argparse.ArgumentParser) -> int:
+    """Walk the command set two levels deep instead of printing all thirty.
+
+    Progressive disclosure, on the reasoning that the first question a reader
+    actually has is not "which of thirty commands" but "which *kind* of thing
+    am I doing" -- and there are eight of those. Picking a group narrows to a
+    handful; picking a command prints that command's own `--help`, which is
+    where the flags live and which this function deliberately does not try to
+    reproduce.
+
+    Esc goes back one level and Esc at the top exits cleanly, so the browser
+    is `prompt.Cancelled` handling and nothing more -- no new primitive, and
+    no state to get out of step with the parser.
+
+    Nothing here runs a command. A browser that executed what it highlighted
+    would make `bk` -- typed by someone who does not yet know what these do --
+    the most dangerous keystroke in the tool.
+    """
+
+    index = _command_help_index(parser)
+    groups: list[prompt.Choice[tuple[str, tuple[str, ...]] | None]] = [
+        prompt.Choice(
+            (title, names),
+            title,
+            f"{len(names)} command{'s' if len(names) != 1 else ''}",
+        )
+        for title, names in HELP_CATEGORIES
+    ]
+    groups.append(prompt.Choice(None, "Show every command", "the full flat list"))
+
+    print(console.banner())
+    while True:
+        try:
+            group = prompt.select(
+                "What are you trying to do?",
+                groups,
+                hint="↑↓ · Enter · Esc quits",
+                quiet=True,
+            )
+        except prompt.Cancelled:
+            return 0
+        if group is None:
+            print(_grouped_help(parser))
+            return 0
+        title, names = group
+        commands: list[prompt.Choice[str]] = [
+            prompt.Choice(name, name, index.get(name, "")) for name in names
+        ]
+        try:
+            chosen = prompt.select(
+                title, commands, hint="↑↓ · Enter · Esc goes back", quiet=True
+            )
+        except prompt.Cancelled:
+            continue
+        # Delegating to argparse rather than rendering the flags here keeps one
+        # source of truth: `bk <cmd> --help` is what the operator will type next
+        # time, and it must not differ from what the browser just showed them.
+        print(_subcommand_help(parser, chosen))
+        outcome = _offer_to_run(parser, chosen)
+        if outcome is _BACK:
+            continue
+        return outcome
+
+
+#: `_offer_to_run` returning "the operator wants the previous screen", which is
+#: not an exit code and must not be confused with one.
+_BACK = object()
+
+
+def _offer_to_run(parser: argparse.ArgumentParser, command: str) -> Any:
+    """Let the browser finish the job it just helped someone find.
+
+    The browser used to end at `--help` and exit. That is a dead end in the
+    literal sense: you have navigated to the command you wanted, and the tool's
+    last act is to make you retype it from scratch — with its arguments, which
+    are exactly what you came here not knowing. Twenty of the forty-six
+    commands cannot run without one, so this was the common case rather than
+    the edge.
+
+    It still never runs what it merely highlighted — the browser is typed by
+    people who do not yet know what these do. Running is a separate, explicit
+    choice, defaulted to no, taken after the composed command line is on screen
+    in full. Commands that destroy something are not offered at all: they are
+    printed to be run deliberately, which is the same standard `--force`
+    already holds them to.
+    """
+
+    needed = requirements(parser, command.split())
+    wants_input = bool(needed) or command in _ALTERNATIVES
+    destructive = command.split()[0] in _DESTRUCTIVE
+
+    choices: list[prompt.Choice[str]] = []
+    if not destructive:
+        choices.append(
+            prompt.Choice(
+                "run",
+                "Run it now",
+                "asks for what it needs first"
+                if wants_input
+                else "no arguments needed",
+            )
+        )
+    choices.append(prompt.Choice("compose", "Show me the command", "to copy and edit"))
+    choices.append(prompt.Choice("back", "Back", "pick something else"))
+
+    try:
+        decision = prompt.select("What next?", choices, hint="↑↓ · Enter · Esc goes back")
+    except prompt.Cancelled:
+        return _BACK
+
+    if decision == "back":
+        return _BACK
+
+    extra: list[str] = []
+    if wants_input:
+        collected = _ask_for(needed, command)
+        if collected is None:
+            return _BACK
+        extra = collected
+
+    line = shlex.join(["bk", *command.split(), *extra])
+    print()
+    print("  " + console.style(line, console.ACCENT))
+    print()
+    if decision == "compose":
+        return 0
+    return main([*command.split(), *extra])
+
+
+#: Commands that remove or overwrite something. The browser shows their
+#: composed command line and stops there -- a keystroke reached by wandering
+#: through a menu is not the right way to delete a source or take an
+#: integration down.
+_DESTRUCTIVE = frozenset({"forget", "reject", "apply"})
+
+
+def _fill_missing_arguments(
+    parser: argparse.ArgumentParser,
+    argv: list[str],
+    global_values: dict[str, Any],
+) -> list[str]:
+    """Ask for a required argument instead of printing usage and quitting.
+
+    `bk search` at a terminal used to answer with a usage block and exit 2,
+    which tells someone who already knows what they want that they typed too
+    little. Now it asks for the query. The same applies to the other nineteen
+    commands that cannot run without an argument.
+
+    Deliberately narrow, because a prompt in the wrong place is worse than a
+    usage message:
+
+    - **only at a terminal**, and never under `--json`: a script that is
+      missing an argument must fail, not block forever on a question nobody
+      will answer;
+    - **only when nothing was supplied** — a partially-typed command is a
+      mistake to report, not a form to fill in, and guessing which of two
+      arguments was meant is how you get the wrong one;
+    - **never for flags the operator may legitimately be replacing** with an
+      alternative, which is why `requirements` ignores optional positionals.
+    """
+
+    if global_values["json"] or not prompt.supports_interactive():
+        return argv
+    command = [token for token in argv if not token.startswith("-")]
+    if not command:
+        return argv
+    needed = requirements(parser, command)
+    joined = " ".join(command)
+    # Anything already typed beyond the command name means the operator is
+    # mid-thought; argparse's own message is the right answer then.
+    if len(command) < len(argv):
+        return argv
+    if not needed and joined not in _ALTERNATIVES:
+        return argv
+    collected = _ask_for(needed, joined)
+    if collected is None:
+        raise SystemExit(130)
+    return [*argv, *collected]
+
+
+class _Needed(NamedTuple):
+    """One argument a command cannot run without."""
+
+    dest: str
+    flag: str | None
+    help: str
+    choices: tuple[str, ...]
+
+
+
+def _typed_value(raw: str) -> str:
+    """What the operator *meant*, after the shell conventions they pasted.
+
+    A path reaches this prompt the way the operator obtained it, and the two
+    common ways both carry shell syntax: dragging a file into a terminal
+    escapes its spaces (`/a/b\\ c.pdf`), and tab-completion or a copied
+    command wraps it in quotes (`'/a/b c.pdf'`). Passing either through
+    verbatim produces a path that cannot exist -- brainkit answered a real
+    drag-and-drop with "Capture source is not a file" and echoed a filename
+    with the quotes still in it, which reads as brainkit failing rather than
+    as one layer of quoting nobody removed.
+
+    `shlex` already knows both conventions, so the rule is: if the value parses
+    to exactly **one** token, that token is what was meant. Anything that
+    parses to several is ordinary prose -- a search query, a title -- and is
+    returned untouched. Unbalanced quotes raise, and are likewise left alone
+    rather than guessed at.
+    """
+
+    value = raw.strip()
+    if not value:
+        return value
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    if len(tokens) == 1:
+        value = tokens[0]
+    return os.path.expanduser(value) if value.startswith("~") else value
+
+
+def _looks_like_source(value: str) -> str | None:
+    """Reject a capture target that is neither a URL nor a file that exists.
+
+    Caught at the prompt, where the operator can fix it in place, instead of
+    after the command has been assembled and dispatched -- the difference
+    between one re-ask and starting the whole flow again.
+    """
+
+    if "://" in value:
+        return None
+    if Path(value).expanduser().is_file():
+        return None
+    return f"No file at {value!r}. Paste a path that exists, or a URL."
+
+
+class _Alternative(NamedTuple):
+    """One of several ways to satisfy a command that needs *something*."""
+
+    label: str
+    note: str
+    flag: str | None
+    #: False for a switch like `--all`, which is complete on its own.
+    takes_value: bool = True
+    #: Checked at the prompt, so a bad value is re-asked rather than dispatched.
+    validate: Callable[[str], str | None] | None = None
+
+
+#: Commands whose argument is optional to argparse and mandatory in practice,
+#: because the requirement is a choice between forms rather than a single slot.
+#: `bk capture` is the case that prompted this: argparse sees an optional
+#: positional and a `--text` flag, reports nothing as required, and the command
+#: then refuses at runtime with "capture requires a source path, URL, or
+#: --text" -- a requirement that existed only in that error string, so neither
+#: the browser nor the bare invocation could ask for it.
+#:
+#: Declared rather than inferred: "one of these" is not something an argparse
+#: parser records, and guessing it from a mutually-exclusive group would still
+#: miss this one, which is not in a group.
+_ALTERNATIVES: dict[str, tuple[str, tuple[_Alternative, ...]]] = {
+    "capture": (
+        "What do you want to capture?",
+        (
+            _Alternative(
+                "A file or URL",
+                "path on disk, or a link",
+                None,
+                validate=_looks_like_source,
+            ),
+            _Alternative("Type the text", "captured as a note", "--text"),
+        ),
+    ),
+    "ingest": (
+        "What should be ingested?",
+        (
+            _Alternative("One source", "full or prefix hash, or a raw path", None),
+            _Alternative(
+                "Everything pending", "every unfiled source", "--all", takes_value=False
+            ),
+        ),
+    ),
+}
+
+
+def requirements(parser: argparse.ArgumentParser, path: Sequence[str]) -> list[_Needed]:
+    """What `bk <path...>` must be given before it can run.
+
+    Read off the parser rather than restated, because the answer has to stay
+    true as commands change: 20 of the 46 invocable commands cannot run without
+    an argument, and every one of them was a place the operator could arrive
+    and be stuck.
+
+    Optional positionals are excluded even when the command errors without one
+    (`capture`, `ingest`): those carry their own alternatives (`--text`,
+    `--all`), and prompting for a path would hide them.
+    """
+
+    current: argparse.ArgumentParser | None = parser
+    for token in path:
+        action = _subparsers_of(current) if current else None
+        if action is None or token not in action.choices:
+            return []
+        current = action.choices[token]
+    if current is None or _subparsers_of(current) is not None:
+        return []
+
+    needed = []
+    for action in current._actions:
+        if action.dest in ("help", "command"):
+            continue
+        required = action.required if action.option_strings else action.nargs not in (
+            "?",
+            "*",
+        )
+        if not required:
+            continue
+        needed.append(
+            _Needed(
+                dest=action.dest,
+                flag=action.option_strings[-1] if action.option_strings else None,
+                help=action.help or "",
+                choices=tuple(str(c) for c in (action.choices or ())),
+            )
+        )
+    return needed
+
+
+def _subparsers_of(
+    parser: argparse.ArgumentParser,
+) -> argparse._SubParsersAction | None:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    return None
+
+
+
+def _ask_for(needed: Sequence[_Needed], command: str) -> list[str] | None:
+    """Collect the missing arguments at the prompt, or None if cancelled."""
+
+    print()
+    print(console.style(f"bk {command}", console.BOLD, console.ACCENT))
+    collected: list[str] = []
+    alternatives = _ALTERNATIVES.get(command)
+    if alternatives is not None:
+        question, options = alternatives
+        try:
+            picked = prompt.select(
+                question,
+                [prompt.Choice(o, o.label, o.note) for o in options],
+            )
+            if not picked.takes_value:
+                return [picked.flag] if picked.flag else []
+            value = _typed_value(
+                prompt.text(
+                    picked.flag or "value", "", validate=picked.validate or _non_empty
+                )
+            )
+        except prompt.Cancelled:
+            return None
+        return [picked.flag, value] if picked.flag else [value]
+    for item in needed:
+        label = item.flag or item.dest
+        try:
+            if item.choices:
+                value = str(
+                    prompt.select(
+                        f"{label}{console.DASH and ''}",
+                        [prompt.Choice(c, c) for c in item.choices],
+                        hint=item.help or None,
+                    )
+                )
+            else:
+                value = _typed_value(prompt.text(label, "", validate=_non_empty))
+        except prompt.Cancelled:
+            return None
+        if item.flag:
+            collected += [item.flag, value]
+        else:
+            collected.append(value)
+    return collected
+
+
+def _non_empty(value: str) -> str | None:
+    return None if value.strip() else "This one is required."
+
+
+def _subcommand_help(parser: argparse.ArgumentParser, name: str) -> str:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction) and name in action.choices:
+            return action.choices[name].format_help().rstrip()
+    return ""
+
+
+def _mistyped_command(
+    argv: Sequence[str], parser: argparse.ArgumentParser
+) -> str | None:
+    """The first token that should have been a command but names none.
+
+    Returns `None` when the command is valid, so argparse keeps ownership of
+    every *other* argument error -- a bad flag or a missing operand belongs to
+    the subparser that declared it, and second-guessing those here would
+    duplicate messages argparse already writes well.
+    """
+
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        return None if token in _command_help_index(parser) else token
+    return None
+
+
+def _did_you_mean(unknown: str, parser: argparse.ArgumentParser) -> str:
+    """Argparse's answer to a typo is to reprint all thirty command names.
+
+    That is the same wall the usage line was trimmed of, at the moment it helps
+    least: the reader already knows roughly what they wanted and mistyped it.
+    A close match is almost always the whole answer, so lead with it and leave
+    the full list one keystroke away.
+    """
+
+    import difflib
+
+    commands = sorted(_command_help_index(parser))
+    lines = [
+        console.style(f"bk: '{unknown}' is not a bk command.", console.ERR),
+    ]
+    close = difflib.get_close_matches(unknown, commands, n=3, cutoff=0.6)
+    # Prefix matches are what a truncated or half-typed command produces, and
+    # `get_close_matches` scores those poorly when the prefix is short: `bk co`
+    # is far more likely to be `context`/`code` than anything a ratio picks.
+    prefixed = [name for name in commands if name.startswith(unknown)]
+    suggestions = list(dict.fromkeys(prefixed + close))[:3]
+    if suggestions:
+        lines.append("")
+        lines.append("Did you mean?")
+        index = _command_help_index(parser)
+        width = max(len(name) for name in suggestions)
+        for name in suggestions:
+            lines.append(
+                f"  {console.style(name, console.ACCENT):<{width}}  "
+                f"{console.style(index.get(name, ''), console.MUTED)}"
+            )
+    lines.append("")
+    lines.append(f"Run `bk` to see all {len(commands)} commands.")
+    return "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     effective_argv = list(argv if argv is not None else sys.argv[1:])
     effective_argv, global_values = _extract_global_options(effective_argv)
     parser = build_parser()
     if _wants_top_level_help(effective_argv):
+        # A bare `bk` at a terminal is someone looking around, and gets the
+        # browser. An explicit `-h` is someone asking for the help *text* --
+        # usually to read, pipe or grep it -- so it stays the flat listing, as
+        # does any non-tty invocation. Diverging on the flag rather than on the
+        # terminal alone is what keeps `bk -h | grep` meaning what it always did.
+        if not effective_argv and prompt.supports_interactive():
+            try:
+                return _browse_commands(parser)
+            except KeyboardInterrupt:
+                # Between prompts the tty is briefly back in cooked mode, so an
+                # interrupt arrives as a signal rather than as a key the raw
+                # reader would have turned into `Cancelled`.
+                return 130
         print(_grouped_help(parser))
         return 0
+    mistyped = _mistyped_command(effective_argv, parser)
+    if mistyped is not None:
+        print(_did_you_mean(mistyped, parser), file=sys.stderr)
+        return 2
+    effective_argv = _fill_missing_arguments(parser, effective_argv, global_values)
     args = parser.parse_args(effective_argv)
     if global_values["vault"] is not None:
         args.vault = global_values["vault"]
@@ -560,6 +1100,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         wrapped = BrainkitError(str(exc))
         _emit_error(wrapped, json_mode=args.json)
         return 2
+    except prompt.Cancelled:
+        # Dismissing a prompt is the operator declining, not the tool failing:
+        # same exit status as the interrupt it stands in for, and no error
+        # envelope claiming something went wrong.
+        _emit_error(BrainkitError("Cancelled — nothing was written"), json_mode=args.json)
+        return 130
     except KeyboardInterrupt:
         _emit_error(BrainkitError("Interrupted"), json_mode=args.json)
         return 130
@@ -589,19 +1135,49 @@ def create_service(vault_path: str | None) -> BrainkitService:
 
 def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "init":
-        raw_config = (
-            _read_json(args.config) if args.config else _interactive_policy_wizard()
+        target = Path(args.vault or args.path)
+        outcome = (
+            onboarding.Outcome(policy=_read_json(args.config))
+            if args.config
+            else _guided_init(target)
         )
-        vault = FileVault.initialize(Path(args.vault or args.path), raw_config)
+        # The wizard now asks where the vault goes, so its answer wins over the
+        # `.` this command defaults to. `--config` never runs the wizard and
+        # keeps naming its path on the command line.
+        target = outcome.vault or target
+        vault = FileVault.initialize(target, outcome.policy, force=args.force)
         service = create_service(str(vault.root))
         indexed = service.reindex()
         views = service.views()
-        return {
+        result = {
             "vault": str(vault.root),
             "config": vault.config().to_dict(),
             **indexed,
             "views": views["written"],
+            # Registered here rather than left for a second command nobody was
+            # told to run: `bk init` was the only way to create a vault and the
+            # only path that never registered one, so `bk vaults list` silently
+            # omitted every vault the wizard made.
+            "registered": _register_new_vault(vault.root),
         }
+        # Wiring the agent is deliberately the *last* step: it writes outside
+        # the vault, into the operator's project, and doing it before the vault
+        # exists would leave a `.claude/` pointing at something that was never
+        # created if initialization failed.
+        if outcome.wire_agent:
+            # The workspace is the *project*, not the vault. With the vault at
+            # `<repo>/.brainkit` these are different directories, and installing
+            # into the vault is the failure `_workspace_advisory` exists to
+            # report: every file lands, the installer says success, and an agent
+            # opened on the repository loads none of it. Under the old
+            # `bk init .` layout they coincided, so nothing had to choose.
+            result["hooks"] = _install_hooks(
+                service,
+                "claude",
+                root=_project_root_for(vault),
+                skip_code_build=args.skip_code_build,
+            )
+        return result
 
     # Registry commands span vaults, so they must not be gated on the current
     # directory being one: `bk vaults list` has to work from anywhere, and
@@ -614,6 +1190,8 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.capture(args.source, text=args.text, title=args.title)
     if args.command == "status":
         return service.status()
+    if args.command == "doctor":
+        return _doctor(service)
     if args.command == "reconcile":
         return service.reconcile()
     if args.command == "reindex":
@@ -641,13 +1219,24 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.apply(_read_json(args.proposal))
     if args.command == "gate":
         return service.gate_check_write(args.path, agent=args.agent)
+    if args.command == "enrich":
+        if args.enrich_command == "apply":
+            return service.enrich_apply(_read_json(args.proposal))
+        if args.enrich_command == "list":
+            return service.enrich_list(consumer=_consumer_for_args(args))
+        if args.enrich_command == "forget":
+            return service.enrich_forget(args.id)
     if args.command == "views":
         return service.views()
     if args.command == "graph":
         return service.graph(html=args.html)
     if args.command == "code":
         if args.code_command == "build":
-            return service.code_build(args.paths or None)
+            paths = args.paths or None
+            _offer_missing_grammars(
+                service, paths, choice=args.install_missing, json_mode=args.json
+            )
+            return service.code_build(paths)
         if args.code_command == "import":
             return service.code_import(_read_json(args.graph))
         if args.code_command == "status":
@@ -798,183 +1387,49 @@ def _read_json(path: str) -> dict[str, Any]:
     return value
 
 
-def _interactive_policy_wizard() -> dict[str, Any]:
+
+
+def _project_root_for(vault: FileVault) -> str | None:
+    """The repository a nested vault belongs to, or None for a standalone one.
+
+    `None` keeps `_resolve_workspace`'s existing default (the vault itself),
+    which is right when the vault is not inside a project.
+    """
+
+    root, _ = vault.code_root_reason()
+    if root != vault.root and (root / ".git").exists():
+        return str(root)
+    return None
+
+
+def _register_new_vault(root: Path) -> dict[str, Any] | None:
+    """Add a freshly created vault to this machine's registry, best-effort.
+
+    Never fatal: the vault exists and works whether or not the registry on this
+    machine could be written, and failing an otherwise successful `bk init`
+    over a bookkeeping file would be the wrong trade.
+    """
+
+    try:
+        return VaultRegistry().register(root, label=root.parent.name or root.name)
+    except (BrainkitError, OSError):
+        return None
+
+
+def _guided_init(target: Path) -> onboarding.Outcome:
+    """Run the guided onboarding, refusing rather than guessing without a tty.
+
+    `--config` remains the complete-policy path for scripts and CI. This one is
+    for a human, and it needs a terminal: silently answering its own questions
+    from defaults nobody saw is how the previous wizard shipped a vault
+    configured for a model that was not installed.
+    """
+
     if not sys.stdin.isatty():
         raise ValidationError(
             "Interactive init needs a terminal; use --config with a complete policy"
         )
-    print(console.banner())
-    print(
-        "The compilation gate between raw evidence and knowledge an agent "
-        "may act on. Every question has a sensible default -- press Enter "
-        "to accept it."
-    )
-
-    print()
-    print(console.step_header(1, 4, "Language & branches"))
-    wiki_language = _ask("Wiki language", "Portuguese (Brazil)")
-    branch_names = [
-        item.strip()
-        for item in _ask(
-            "Raw branches (comma-separated)",
-            "10-work,20-research,30-learning,90-personal",
-        ).split(",")
-        if item.strip()
-    ]
-    inbox_policy = _ask_policy("_inbox")
-    branches = {branch: _ask_policy(branch) for branch in branch_names}
-
-    print()
-    print(console.step_header(2, 4, "Providers & models"))
-    providers = _ask_json(
-        "Provider configuration JSON",
-        {
-            "ollama": {"base_url": "http://127.0.0.1:11434"},
-        },
-    )
-    job_models = _ask_json(
-        "Model-per-job JSON",
-        {
-            "ingest": {"provider": "ollama", "model": "qwen3:8b"},
-            "query": {"provider": "ollama", "model": "qwen3:8b"},
-            "digest": {"provider": "ollama", "model": "qwen3:8b"},
-            "lint-semantic": {"provider": "ollama", "model": "qwen3:8b"},
-            "file-proposal": {"provider": "ollama", "model": "qwen3:8b"},
-            "resurface": {"provider": "ollama", "model": "qwen3:8b"},
-        },
-    )
-
-    print()
-    print(console.step_header(3, 4, "Sources & schedule"))
-    sources = _comma_values(_ask("Source folders/files (comma-separated)", ""))
-    # Offered with the defaults filled in rather than as "anything to add?":
-    # the operator has to see what is already excluded to judge it, and a
-    # capture cannot be taken back once a watch has made it.
-    ignore = _comma_values(
-        _ask(
-            "Ignore patterns for watched folders (comma-separated)",
-            ",".join(DEFAULT_IGNORE_PATTERNS),
-        )
-    )
-    digest_schedule = _ask("Morning digest cron schedule", "0 8 * * *")
-    taxonomy = _comma_values(
-        _ask("Taxonomy seed (comma-separated)", ",".join(branch_names))
-    )
-
-    print()
-    print(console.step_header(4, 4, "Novelty & integrations"))
-    novelty = _ask_json(
-        "Novelty and freshness policy JSON",
-        {
-            "duplicate_similarity_threshold": 0.9,
-            "min_new_token_ratio": 0.15,
-            "stale_after_days": 30,
-        },
-    )
-    integrations = _ask_json(
-        "Persistent integrations JSON",
-        {
-            "obsidian": {"enabled": False, "managed": False, "options": {}},
-            "neo4j": {"enabled": False, "managed": False, "options": {}},
-            "postgres": {"enabled": False, "managed": False, "options": {}},
-            "web": {
-                "enabled": False,
-                "managed": True,
-                "options": {
-                    "host": "127.0.0.1",
-                    "port": 8765,
-                    "consumer": "human",
-                },
-            },
-        },
-    )
-
-    print()
-    print(console.rule("Creating vault with"))
-    print(
-        console.kv_panel(
-            [
-                ("language", wiki_language),
-                ("branches", ", ".join(branch_names) or "-"),
-                ("providers", ", ".join(providers) or "-"),
-                ("digest schedule", digest_schedule),
-            ]
-        )
-    )
-    print()
-
-    return {
-        "version": 3,
-        "wiki_language": wiki_language,
-        "inbox_policy": inbox_policy,
-        "branches": branches,
-        "providers": providers,
-        "job_models": job_models,
-        "sources": sources,
-        "ignore": ignore,
-        "schedule": {"digest": digest_schedule},
-        "taxonomy_seed": taxonomy,
-        "novelty": novelty,
-        "integrations": integrations,
-    }
-
-
-def _ask_policy(branch: str) -> dict[str, str]:
-    privacy = _ask_choice(
-        f"{branch} privacy",
-        [mode.value for mode in PrivacyMode],
-        PrivacyMode.LOCAL_ONLY.value,
-    )
-    filing = _ask_choice(
-        f"{branch} filing",
-        [mode.value for mode in FilingMode],
-        FilingMode.APPROVE_EACH.value,
-    )
-    return {"privacy": privacy, "filing": filing}
-
-
-def _ask(prompt: str, suggestion: str) -> str:
-    label = console.style(prompt, console.BOLD)
-    suffix = console.style(f" [{suggestion}]", console.MUTED) if suggestion else ""
-    value = input(f"{label}{suffix}: ").strip()
-    return value or suggestion
-
-
-def _ask_choice(prompt: str, values: list[str], suggestion: str) -> str:
-    while True:
-        value = _ask(f"{prompt} ({'/'.join(values)})", suggestion)
-        if value in values:
-            return value
-        print(console.style(f"Choose one of: {', '.join(values)}", console.WARN))
-
-
-def _ask_json(prompt: str, suggestion: dict[str, Any]) -> dict[str, Any]:
-    """Ask for a JSON object, showing the suggestion pretty-printed above.
-
-    Inlining the suggestion into the prompt's `[...]` bracket -- what this
-    used to do -- meant reading a wall of compact JSON on one line before
-    deciding whether to accept it. Printing it expanded first is the same
-    accept-on-Enter contract, just legible.
-    """
-
-    print(console.style(f"{prompt}:", console.MUTED))
-    print(console.indent(json.dumps(suggestion, indent=2, ensure_ascii=False)))
-    while True:
-        raw = _ask("Press Enter to accept, or paste replacement JSON", "")
-        if not raw:
-            return suggestion
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            print(console.style("Enter a valid JSON object.", console.WARN))
-            continue
-        if isinstance(value, dict):
-            return value
-        print(console.style("Enter a JSON object.", console.WARN))
-
-
-def _comma_values(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+    return onboarding.run(target)
 
 
 def _consumer_for_args(args: argparse.Namespace) -> str:
@@ -982,7 +1437,7 @@ def _consumer_for_args(args: argparse.Namespace) -> str:
         return str(args.consumer)
     if args.json:
         raise ValidationError(
-            "Machine-readable search/context requires --consumer",
+            "Machine-readable output requires --consumer",
             details={"choices": ["human", "local", "cloud"]},
         )
     return "human"
@@ -1249,6 +1704,52 @@ def _hook_command_registered(group: Sequence[Any], command: str) -> bool:
     return False
 
 
+def _is_stale_hook_command(command: Any, template: str, current: str) -> bool:
+    """Whether `command` is a brainkit `template` hook at some path other than `current`.
+
+    Every install writes to `<root>/.claude/hooks/<template>.sh`, so the command
+    this workspace should be running for a given template never has more than
+    one live value at a time. A registered command matching that name but not
+    equal to the one being installed now is not "unrelated tooling on the same
+    event" — the case this file otherwise takes care never to touch — it is a
+    previous install this one supersedes: a settings.json carried over from a
+    different `--root`, or copied wholesale from another project's `.claude/`.
+    Left alone, it keeps firing every session against a vault or workspace this
+    one no longer is.
+    """
+    if not isinstance(command, str) or command == current:
+        return False
+    return Path(command).name == f"{template}.sh"
+
+
+def _prune_stale_hook_entries(
+    group: list[Any], template: str, current: str
+) -> tuple[list[Any], list[str]]:
+    """Drop any `template` hook command other than `current`; report what left.
+
+    An entry that loses every command this way is dropped whole rather than
+    kept as `{"hooks": []}` — an empty hooks list is not a shape Claude Code
+    itself ever writes, and leaving one behind would be a second kind of debris
+    in a file this module otherwise treats as the operator's.
+    """
+    removed: list[str] = []
+    pruned: list[Any] = []
+    for entry in group:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            pruned.append(entry)
+            continue
+        kept = []
+        for item in entry["hooks"]:
+            command = item.get("command") if isinstance(item, dict) else None
+            if _is_stale_hook_command(command, template, current):
+                removed.append(command)
+                continue
+            kept.append(item)
+        if kept:
+            pruned.append({**entry, "hooks": kept})
+    return pruned, removed
+
+
 def _register_claude_hooks(
     root: Path, entries: Sequence[tuple[ClaudeHook, str]]
 ) -> dict[str, Any]:
@@ -1258,8 +1759,11 @@ def _register_claude_hooks(
     the same events, so this reads, mutates and writes: unknown top-level keys
     survive, existing arrays are appended to rather than replaced, and a file
     that does not parse is left exactly as it is instead of being rebuilt. The
-    idempotency key is the hook's command path, so a second install appends
-    nothing and the file stays byte-identical.
+    idempotency key is the hook's command path, so a second install at the same
+    path appends nothing and the file stays byte-identical — but a *different*
+    path registered under the same template name is recognised as stale and
+    pruned first, so reinstalling against a new `--root` or vault replaces the
+    old entry instead of running alongside it.
     """
     target = root / ".claude" / "settings.json"
     settings: dict[str, Any] = {}
@@ -1301,9 +1805,17 @@ def _register_claude_hooks(
             }
 
     registered: list[dict[str, Any]] = []
+    pruned_stale: list[dict[str, Any]] = []
     changed = False
     for hook, command in entries:
         group = list(hooks.get(hook.event, []))
+        group, removed = _prune_stale_hook_entries(group, hook.template, command)
+        if removed:
+            hooks[hook.event] = group
+            changed = True
+            pruned_stale.extend(
+                {"event": hook.event, "command": stale} for stale in removed
+            )
         if _hook_command_registered(group, command):
             registered.append(
                 {"event": hook.event, "command": command, "state": "current"}
@@ -1329,11 +1841,14 @@ def _register_claude_hooks(
     target.write_text(
         json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    return {
+    result: dict[str, Any] = {
         "path": str(target),
         "state": "updated" if existed else "created",
         "registered": registered,
     }
+    if pruned_stale:
+        result["pruned"] = pruned_stale
+    return result
 
 
 def _install_claude_hook(
@@ -1446,6 +1961,28 @@ def _warn_about_inactive_enforcement(
     print("", file=sys.stderr)
 
 
+def _note_pruned_stale_hooks(claude_hook: dict[str, Any] | None) -> None:
+    """Say, on stderr, which stale hook commands this install just replaced.
+
+    `_register_claude_hooks` prunes silently because `settings.json` is the
+    operator's file and this module otherwise never announces an edit to it —
+    but a removed entry is exactly the kind of change `_warn_about_inactive_
+    enforcement` exists to never leave quiet: the operator may have expected
+    that command to still be the one guarding a different vault or workspace.
+    """
+    if not isinstance(claude_hook, dict):
+        return
+    pruned = claude_hook.get("settings", {}).get("pruned")
+    if not pruned:
+        return
+    print("", file=sys.stderr)
+    print("bk: STALE HOOKS replaced in settings.json:", file=sys.stderr)
+    for item in pruned:
+        print(f"  - {item['event']}: {item['command']}", file=sys.stderr)
+    print("      Each was a brainkit hook this install superseded.", file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def _resolve_workspace(vault: Path, root: str | None) -> Path:
     """Where the agent's configuration belongs, which is not always the vault.
 
@@ -1526,8 +2063,153 @@ def _install_hooks(
     result["enforcement"] = _enforcement_summary(result)
     result["code_graph"] = _bootstrap_code_graph(service, skip=skip_code_build)
     _warn_about_inactive_enforcement(result["enforcement"], advisory)
+    _note_pruned_stale_hooks(result.get("claude_hook"))
     _note_code_graph_bootstrap(result["code_graph"])
     return result
+
+
+def _doctor(service: BrainkitService) -> dict[str, Any]:
+    """Whether this installation can do what it advertises.
+
+    `bk status` answers "is the vault healthy". This answers the question that
+    went unasked until three separate failures traced back to it: is the machine
+    underneath it wired up. Each section is here because its absence was silent —
+
+    - **environment**: every "install the optional X" message named `pip`, which
+      a `uv tool` install does not have, so the advice could not be followed.
+    - **grammars**: 13 of 29 shipped and the rest unreachable, discoverable only
+      by building a graph and noticing a language missing from it.
+    - **code root**: the directory a build would scan, *and why that one*. A
+      vault resolved this to a parent holding every repository on the machine,
+      and nothing said so until the graph reached 683 MB.
+    - **enforcement**: reused from `Health`, because "is the write gate live" is
+      part of any health question.
+
+    Assembled in the interface layer rather than in `Health`: every fact here is
+    about the interpreter and the installation, which `application` may not
+    import (`tests/test_layering.py`) and should not have to know.
+    """
+
+    vault = service.vault
+    environment = pyenv.describe_environment()
+    root, reason = vault.code_root_reason()
+    grammars = grammar_inventory()
+    missing = [name for name, installed in grammars.items() if not installed]
+    return {
+        "vault": str(vault.root),
+        "environment": {
+            "kind": environment.kind,
+            "label": environment.label,
+            "executable": environment.executable,
+            "installable": environment.installable,
+        },
+        "code": {
+            "root": str(root),
+            "why_this_root": reason,
+            "scan_limit": vault.config().code_scan_limit,
+            "grammars_installed": sum(grammars.values()),
+            "grammars_known": len(grammars),
+            "grammars_missing": missing,
+            **(
+                {"install": environment.install_hint(missing)}
+                if missing and environment.installable
+                else {}
+            ),
+        },
+        "enforcement": service.health.enforcement(),
+        "healthy": not missing,
+    }
+
+
+def _offer_missing_grammars(
+    service: BrainkitService,
+    paths: list[Path] | None,
+    *,
+    choice: bool | None,
+    json_mode: bool,
+) -> None:
+    """Say which grammars this scan needs, and offer to install them.
+
+    Before the scan, because afterwards is too late to be useful: the build
+    succeeds either way, and the only difference a missing grammar makes is
+    that a language is absent from a graph that then calls itself complete.
+
+    `choice` is the operator's standing answer -- `--install-missing`,
+    `--no-install-missing`, or `None` for "ask". Asking requires a terminal;
+    `--json` and a pipe never prompt, because a command whose output is being
+    parsed must not block on a question nobody will see. In that case the
+    shortfall is still printed, with the command that fixes it.
+    """
+
+    survey = service.code_survey(paths)
+    if survey is None or not survey.missing:
+        return
+    distributions = [need.distribution for need in survey.missing]
+    environment = pyenv.describe_environment()
+    command = environment.install_command(distributions)
+
+    print("", file=sys.stderr)
+    print(
+        f"bk: {len(distributions)} tree-sitter grammar(s) missing for this scan:",
+        file=sys.stderr,
+    )
+    for need in survey.missing:
+        extensions = " ".join(need.extensions)
+        print(
+            f"  - {need.distribution:<24} {need.files} file(s)  {extensions}",
+            file=sys.stderr,
+        )
+    print(
+        f"      Without them those {survey.unreachable_files} file(s) contribute "
+        "nothing to the graph.",
+        file=sys.stderr,
+    )
+    print(f"      {environment.install_hint(distributions)}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    if choice is False or not environment.installable:
+        return
+    if choice is None:
+        if json_mode or not prompt.supports_interactive():
+            return
+        try:
+            if not prompt.confirm("Install them now?", default=False):
+                return
+        except prompt.Cancelled:
+            return
+    _run_install(command)
+
+
+def _run_install(command: list[str]) -> None:
+    """Run an install command, reporting rather than raising on failure.
+
+    A failed install must not fail the build: the build was always going to
+    work, just over fewer languages. The output is left on stderr so the
+    operator sees the package manager's own reason rather than a summary of it.
+    """
+
+    print(f"bk: {shlex.join(command)}", file=sys.stderr)
+    try:
+        # No shell, and nothing here comes from the operator: the executable is
+        # `sys.executable` or a `shutil.which` hit, and every package name is a
+        # `tree_sitter_*` module the vendored dispatch table already names,
+        # hyphenated. The whole point of this function is to run a command the
+        # operator did not have to compose.
+        completed = subprocess.run(command, check=False)  # noqa: S603
+    except OSError as exc:
+        print(f"bk: could not run the installer: {exc}", file=sys.stderr)
+        return
+    if completed.returncode != 0:
+        print(
+            f"bk: install exited {completed.returncode}; building without them",
+            file=sys.stderr,
+        )
+        return
+    # The grammars were absent when this process started, so `find_spec` has
+    # already cached their absence. A fresh scan of the import machinery is
+    # what makes them visible to the build that follows.
+    importlib.invalidate_caches()
+    _extension_grammars.cache_clear()
 
 
 def _bootstrap_code_graph(service: BrainkitService, *, skip: bool) -> dict[str, Any]:
@@ -1555,7 +2237,7 @@ def _bootstrap_code_graph(service: BrainkitService, *, skip: bool) -> dict[str, 
         return {
             "state": "skipped",
             "reason": str(exc),
-            "hint": exc.details.get("hint"),
+            "hint": _install_hint_for(exc.details or {}).get("hint"),
         }
     except Exception as exc:
         # Mirrors _sync_one_vault: an extractor's own failure belongs to this
@@ -1964,23 +2646,36 @@ _INIT_NEXT_STEPS: tuple[tuple[str, str], ...] = (
 
 def _render_init(value: dict[str, Any]) -> str:
     config = value.get("config") or {}
+    hooks = value.get("hooks")
+    rows = [
+        ("wiki language", str(config.get("wiki_language", "-"))),
+        ("branches", ", ".join(config.get("branches", {})) or "-"),
+        ("indexed", str(value.get("indexed_documents", 0))),
+        ("views written", str(len(value.get("views", [])))),
+    ]
+    if hooks:
+        rows.append(("agent", f"claude {console.DASH} {hooks['workspace']}"))
     parts = [
         console.banner(),
         "",
         console.status_line(True, f"vault initialized at {value['vault']}"),
-        console.kv_panel(
-            [
-                ("wiki language", str(config.get("wiki_language", "-"))),
-                ("branches", ", ".join(config.get("branches", {})) or "-"),
-                ("indexed", str(value.get("indexed_documents", 0))),
-                ("views written", str(len(value.get("views", [])))),
-            ]
-        ),
+        console.kv_panel(rows),
         "",
         console.style("Next", console.BOLD, console.ACCENT),
     ]
-    for command, description in _INIT_NEXT_STEPS:
-        parts.append(f"  {console.ARROW} {command:<20} {console.style(description, console.MUTED)}")
+    # Onboarding used to end without ever naming `bk hooks install`, so the one
+    # step that turns a vault into something an agent can use was left for the
+    # operator to discover in the README. It leads the list when it is still
+    # pending, and is dropped only once it has actually run.
+    steps = list(_INIT_NEXT_STEPS)
+    if not hooks:
+        steps.insert(0, ("bk hooks install --agent claude", "wire up your agent"))
+    width = max(len(command) for command, _ in steps)
+    for command, description in steps:
+        parts.append(
+            f"  {console.ARROW} {command:<{width}}  "
+            f"{console.style(description, console.MUTED)}"
+        )
     return "\n".join(parts)
 
 
@@ -2030,18 +2725,75 @@ def _render_code_affected(value: dict[str, Any]) -> str:
 
 
 def _render_code_path(value: dict[str, Any]) -> str:
+    """The chain as a descending tree, with each hop's real direction and site.
+
+    Three things the previous one-line version got wrong or left out, in order
+    of how much they cost a reader:
+
+    - **The arrow could be backwards.** Every hop printed `--via-->` while the
+      traversal is undirected, so a chain of callers rendered exactly like a
+      chain of calls. `forward` now decides which way the arrow points, and
+      half the hops in a typical path turn out to be reverse edges.
+    - **`path` and `line` were discarded.** The graph knows where each symbol
+      is, and the whole promise of the command is not having to go and look.
+    - **A flat line hides the shape.** Indentation makes hop count legible
+      without counting arrows.
+
+    Locations are right-aligned into whatever width the terminal gives, and
+    dropped entirely when it is too narrow -- the chain is the answer, the
+    file is the follow-up.
+    """
+
     if not value.get("found"):
-        return console.status_line(False, f"no path from {value['from']} to {value['to']}")
+        return console.status_line(
+            False, f"no path from {value['from']} to {value['to']}"
+        )
     chain = value.get("path") or []
-    tokens = []
-    for node in chain:
+    width = console.terminal_width()
+
+    rows: list[tuple[str, str]] = []
+    for depth, node in enumerate(chain):
+        label = str(node.get("label", node.get("id", "?")))
         via = node.get("via")
+        indent = "  " + "   " * depth
         if via:
-            tokens.append(console.style(f"--{via}-->", console.MUTED))
-        tokens.append(str(node.get("label", node.get("id", "?"))))
-    return "\n".join(
-        [console.status_line(True, f"{value['hops']} hop(s)"), "  " + " ".join(tokens)]
+            # `◂──` reads as "this one points back at the previous", which is
+            # what a reverse edge means, without needing a legend.
+            arrow = "──▸ " if node.get("forward", True) else "◂── "
+            left = f"{indent}└─ {console.style(str(via), console.ACCENT)} {arrow}{label}"
+        else:
+            left = f"{indent}{console.style(label, console.BOLD)}"
+        location = ""
+        if node.get("path"):
+            line = node.get("line")
+            location = f"{node['path']}:{line}" if line else str(node["path"])
+        rows.append((left, location))
+
+    longest = max((len(_plain(left)) for left, _ in rows), default=0)
+    body = []
+    for left, location in rows:
+        if not location or longest + len(location) + 4 > width:
+            body.append(left)
+            continue
+        pad = " " * (longest - len(_plain(left)) + 2)
+        body.append(left + pad + console.style(location, console.MUTED))
+
+    symbols = len(chain)
+    footer = console.style(
+        f"  {value['hops']} hop(s) {console.BULLET} {symbols} symbols "
+        f"{console.BULLET} no files opened",
+        console.MUTED,
     )
+    header = console.status_line(
+        True, f"shortest path {console.DASH} {value['hops']} hops"
+    )
+    return "\n".join([header, "", *body, "", footer])
+
+
+def _plain(text: str) -> str:
+    """Visible length helper: the console owns the escape-stripping rule."""
+
+    return console.strip_ansi(text)
 
 
 def _render_code_hubs(value: dict[str, Any]) -> str:
@@ -2105,9 +2857,101 @@ def _render_code_diff(value: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _render_doctor(value: dict[str, Any]) -> str:
+    environment = value.get("environment") or {}
+    code = value.get("code") or {}
+    known = code.get("grammars_known", 0)
+    installed = code.get("grammars_installed", 0)
+    missing = code.get("grammars_missing") or []
+    parts = [
+        console.status_line(
+            bool(value.get("healthy")),
+            "installation complete"
+            if value.get("healthy")
+            else f"{len(missing)} language(s) cannot be parsed",
+        ),
+        "",
+        console.kv_panel(
+            [
+                ("install method", str(environment.get("label", "?"))),
+                ("interpreter", str(environment.get("executable", "?"))),
+                ("grammars", f"{installed}/{known}"),
+                # The two facts the incident turned on: which directory a build
+                # scans, and why it is that one.
+                ("code root", str(code.get("root", "?"))),
+                ("", console.style(str(code.get("why_this_root", "")), console.MUTED)),
+                ("scan limit", f"{code.get('scan_limit', '?')} files"),
+            ]
+        ),
+    ]
+    if missing:
+        parts += ["", console.rule("missing grammars")]
+        parts.append(console.style("  " + ", ".join(missing), console.WARN))
+        if code.get("install"):
+            parts += ["", console.style("  " + str(code["install"]), console.MUTED)]
+    layers = (value.get("enforcement") or {}).get("layers") or []
+    if layers:
+        parts += ["", console.rule("enforcement")]
+        parts.append(
+            console.table(
+                ["layer", "state"],
+                [
+                    [layer["layer"], console.status_line(layer["active"], layer.get("detail", ""))]
+                    for layer in layers
+                ],
+            )
+        )
+    return "\n".join(parts)
+
+
+def _render_code_build(value: dict[str, Any]) -> str:
+    rows = [
+        ("written", str(value.get("written", "-"))),
+        ("nodes", str(value.get("nodes", 0))),
+        ("edges", str(value.get("edges", 0))),
+        ("files", str(value.get("files", 0))),
+    ]
+    parts = [console.kv_panel(rows)]
+    # A build that dropped a language is the one result worth interrupting for:
+    # it succeeded, and the number above is wrong in a way nothing else says.
+    missing = value.get("missing_grammars") or []
+    if missing:
+        names = ", ".join(str(entry.get("distribution", "")) for entry in missing)
+        parts += [
+            "",
+            console.style(
+                f"  {value.get('unreachable_files', 0)} file(s) contributed nothing — "
+                f"missing: {names}",
+                console.WARN,
+            ),
+        ]
+    # Louder than a missing grammar, because a missing grammar at least says
+    # what it needs. This is the category with no explanation attached, and it
+    # is what a broken worker pool or an unwalkable scan root looks like from
+    # here — the two failures that previously showed up as a plausible number.
+    unexplained = int(value.get("unexplained_files") or 0)
+    if unexplained:
+        ratio = float(value.get("unexplained_ratio") or 0)
+        parts += [
+            "",
+            console.style(
+                f"  {console.CROSS} {unexplained} file(s) ({ratio:.0%}) have an "
+                "installed grammar but produced nothing, and no reason was given.",
+                console.ERR,
+            ),
+            console.style(
+                "     Something stopped extraction rather than a language being "
+                "absent. Re-run with BK_NO_PARALLEL=1 to rule out the worker pool.",
+                console.MUTED,
+            ),
+        ]
+    return "\n".join(parts)
+
+
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "init": _render_init,
     "status": _render_status,
+    "doctor": _render_doctor,
     "search": _render_search,
     "context": _render_context,
     "lint": _render_lint,
@@ -2123,6 +2967,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
 }
 
 _CODE_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "build": _render_code_build,
     "affected": _render_code_affected,
     "path": _render_code_path,
     "hubs": _render_code_hubs,
@@ -2192,13 +3037,35 @@ def _internal_error(exc: BaseException) -> InternalError:
     )
 
 
+def _install_hint_for(details: dict[str, Any]) -> dict[str, Any]:
+    """Turn a `needs` list into the command that works on *this* machine.
+
+    The application layer names what is missing (`{"needs": ["brainkit[code]"]}`)
+    and stops there, because which command installs it is a fact about the
+    running interpreter — not something a layer that must not import
+    infrastructure can know, and not something to hardcode. Every hint that did
+    hardcode it said `pip install …`, which is unrunnable under `uv tool`: that
+    environment ships no `pip`, so the operator either saw a failure or silently
+    installed the package into an unrelated interpreter and hit the identical
+    message on the retry.
+
+    Enriching here, at the one place errors are rendered, means every raiser
+    gets a correct hint without any of them knowing how `bk` was installed.
+    """
+
+    needs = details.get("needs")
+    if not isinstance(needs, list) or not needs or "hint" in details:
+        return details
+    return {**details, "hint": pyenv.install_hint([str(item) for item in needs])}
+
+
 def _emit_error(error: BrainkitError, *, json_mode: bool) -> None:
     payload = {
         "ok": False,
         "error": {
             "code": error.code,
             "message": str(error),
-            "details": error.details,
+            "details": _install_hint_for(error.details or {}),
         },
     }
     stream = sys.stdout if json_mode else sys.stderr
@@ -2206,8 +3073,9 @@ def _emit_error(error: BrainkitError, *, json_mode: bool) -> None:
         print(json.dumps(payload, ensure_ascii=False), file=stream)
     else:
         print(console.style(f"bk: {error}", console.ERR, stream=stream), file=stream)
-        if error.details:
-            print(json.dumps(error.details, indent=2, ensure_ascii=False), file=stream)
+        details = _install_hint_for(error.details or {})
+        if details:
+            print(json.dumps(details, indent=2, ensure_ascii=False), file=stream)
 
 
 if __name__ == "__main__":

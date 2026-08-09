@@ -42,3 +42,15 @@ outputs/
 
 # macOS
 .DS_Store
+
+# Benchmark corpora: real repositories cloned at pinned commits, plus the
+# LOCOMO release. Declared at the *root* rather than only in benchmarks/,
+# because the extractor reads the ignore file at its scan root and never
+# descends into nested ones -- so a nested rule left ~1,400 files of ripgrep
+# and commons-lang in this project's own code graph, where they took every
+# top hub slot.
+benchmarks/corpus-repos/
+benchmarks/memory/locomo10.json
+# Derived from locomo10.json by run_locomo_graphify.py -- ~7,000 markdown turns
+# regenerated on every run, and the same scan-root reasoning applies.
+benchmarks/memory/graphify-corpora/

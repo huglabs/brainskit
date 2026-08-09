@@ -605,3 +605,574 @@ Two process lessons from the repair round itself:
   path needed its own fixture (`CodeGraphBootstrapBuildTest`, gated on
   `test_code_graph._HAS_CODE_EXTRA`, same real-repo shape as
   `test_code_graph.CodeBuildFixture`) rather than retrofitting `VaultCase`.
+
+## The settings.json merge's idempotency key was the wrong thing (2026-08-06)
+
+- **The bug, confirmed by reproduction before fixing:** `_register_claude_hooks`
+  deduped purely on the literal command *string*. Onboarding `eigent` the day
+  before had left a `.claude/settings.json` carrying a `brainkit-gate.sh`/
+  `brainkit-status.sh` pair pointing at a completely different project's vault
+  (copied in, or written by an earlier install at a different `--root`) —
+  since that path differs from the one this install writes, the old idempotency
+  check saw two distinct commands to keep, not one to replace. Reproduced with
+  a minimal repro (seed `settings.json` with a hook at `/some/other/repo/...`,
+  install fresh) before writing a single line of the fix — both entries
+  survived, exactly as onboarding found it.
+- **The fix:** the idempotency key is now the hook's *identity* — template name
+  (`brainkit-gate`, `brainkit-status`) plus event — not its command string.
+  `_is_stale_hook_command` recognises any registered command whose basename is
+  `<template>.sh` but isn't the one being installed now; `_prune_stale_hook_
+  entries` removes those before the existing "already registered?" check runs,
+  and drops an entry that loses every command this way rather than leaving
+  `{"hooks": []}` debris. Reported in `settings.pruned` and warned on stderr
+  by `_note_pruned_stale_hooks`, the same "a silent change is the expensive
+  part" rule `_warn_about_inactive_enforcement` already follows.
+- **What had to keep working:** unrelated tooling on the *same* event
+  (`Bash`/other hooks) is untouched by the prune — only a command whose
+  basename literally matches brainkit's own naming is ever a candidate. A
+  second install at the *same* path prunes nothing and stays byte-identical
+  (verified both as a manual repro and as a test:
+  `test_reinstalling_at_the_same_path_prunes_nothing_and_stays_idempotent`).
+- **6 new tests** in `StaleHookReplacementTest`
+  (`tests/test_hooks_install.py`): stale replaced not duplicated, replacement
+  reported in the return value, replacement warned on stderr, unrelated
+  tooling survives, an emptied entry is dropped whole, same-path reinstall
+  stays idempotent. Full suite 631 passed, ruff clean. Not yet applied to
+  `eigent` itself — that vault's `settings.json` was already hand-fixed during
+  onboarding; this closes the bug for the *next* multi-vault onboarding.
+
+## `bk init` asked twenty questions to reach its own defaults (2026-08-07)
+
+- **Measured before changing anything**, by driving the real wizard through a
+  pty and pressing Enter for every default: **20 prompts**, under a header that
+  said "Step 1/4". Ten were per-branch `privacy`/`filing` pairs, so naming a
+  fourth branch bought two more questions. Four asked the operator to hand-author
+  JSON at a terminal prompt, one of them a thirty-line integrations object. Zero
+  arrow-key selections: choosing a privacy mode meant *typing* `local-only` and
+  being re-asked on a typo.
+- **Two failures were not cosmetic.** (1) The happy path built a vault that
+  could not run: `qwen3:8b` was hardcoded for all six jobs and nothing ever
+  asked ollama what was installed, so accepting every default on a machine
+  without that model configured six jobs to fail silently. (2) Answers were
+  validated only when `VaultConfig.from_dict` assembled them, *after* the last
+  prompt — pasting a partial integrations object (the natural way to enable one
+  integration) hit the completeness check and discarded all twenty answers,
+  leaving no vault and no way to resume. Both reproduced before fixing.
+- **The root cause was structural**: `console.py` had grown rich *output*
+  primitives and the CLI had no *input* ones, so every question degraded to
+  `input()` with the suggestion spelled into the prompt string. New
+  `interfaces/prompt.py` (stdlib `termios`/`tty`/`select`, no new dependency)
+  supplies `select`/`multiselect`/`text`/`confirm`; `interfaces/onboarding.py`
+  probes first and asks three questions.
+- **`sys.stdin.read(1)` cannot be used to read escape sequences.** It pulls the
+  rest of `\x1b[B` into `TextIOWrapper`'s buffer, so `select()` — which only
+  sees the OS buffer — reports nothing pending and every arrow key resolves as a
+  bare Esc, i.e. "cancel". Only a live pty run caught it; the unit tests took
+  the non-tty fallback path and passed throughout. Read the **fd** (`os.read`)
+  so the only buffer in play is the one `select` measures.
+- **Do not assert `tcgetattr(fd)` equality to prove the terminal was restored.**
+  `PENDIN` is a transient kernel status bit meaning "input is pending" — true
+  precisely because a key was just sent — so an exact comparison reports a leak
+  that is not there. Mask it and compare the settable flags; `ECHO`, `ICANON`
+  and `ISIG` are what actually matter.
+- **The completeness crash is now unreachable, not just unlikely**: `_assemble`
+  generates the integration set from `INTEGRATION_NAMES` rather than from
+  whatever the operator named, and `job_models` is keyed off `jobs/*.md` rather
+  than a restated list. A test asserts all 8 extras combinations pass
+  `VaultConfig.from_dict`, and another asserts the job list matches what ships.
+- **Onboarding used to end before the product started**: the "Next" panel named
+  `bk status`/`capture`/`ask` and never `bk hooks install`, the one step that
+  writes the skill and CLAUDE.md. `init` now offers it as a checked extra
+  (writing outside the vault only after the vault exists) and, when declined,
+  leads the "Next" list with it.
+- **20 new tests** in `tests/test_onboarding.py`, three of them pty-driven.
+  Negative control run for the escape-sequence bug: reverting `_read_key` fails
+  exactly the two arrow/space cases and leaves the Ctrl-C case passing, which is
+  correct — a single byte is unaffected by the buffering. Full suite 651 passed,
+  ruff clean. Result: 20 keystrokes → 5, and the model comes from the machine.
+
+- **`bk` with no command, and `bk <typo>`, are the two first impressions** —
+  and argparse answered both by reprinting all thirty command names: once as a
+  brace-delimited usage blob, again as `invalid choice: (choose from ...)`. Bare
+  `bk` now prints the grouped help and exits 0. The guard is `if not argv`, not
+  "the scan found no command": `bk --version` also exhausts the loop without
+  naming one and must still reach argparse. The usage line no longer enumerates
+  the commands, because the grouped listing below it already is that
+  enumeration. A typo gets a git-style suggestion, ranked **prefix matches
+  first** — `bk co` is a truncation, which `difflib.get_close_matches` scores
+  poorly on its own but which obviously means `code` or `context`. Argparse
+  keeps ownership of every other argument error; `_mistyped_command` returns
+  `None` for a valid command so a bad flag stays the subparser's message to
+  write. 7 tests, negative-controlled.
+
+- **Bare `bk` at a terminal browses; every other path stays flat text.** Eight
+  group rows is a better first screen than thirty command rows, so a tty gets a
+  two-level `prompt.select` browser (group -> command -> that command's own
+  `--help`, delegated to argparse so the browser cannot drift from what the
+  operator will type next time). `-h`, a pipe and a redirect all still get the
+  flat grouped listing, because that is what gets read, grepped and scripted
+  against. Back-navigation is `Cancelled` handling and nothing else: Esc pops a
+  level, Esc at the top returns 0. `select(quiet=True)` exists for this --
+  a browser you can back out of must not leave a checkmark beside an abandoned
+  path, while a linear wizard *wants* that transcript. The browser never runs
+  what it highlights: `bk` is typed by people who do not yet know what these do.
+- **Driving a pty test by marker or by fixed sleep is a race; drive it by
+  quiescence.** A prompt writes its question line *before* entering raw mode, so
+  a key sent when the question appears can land on a still-canonical tty, where
+  Esc is buffered awaiting a newline that never arrives and the child hangs to
+  the timeout. Waiting for output to go idle is the only signal that the child
+  is genuinely blocked on a read, and it re-synchronises per screen, which a
+  multi-level browser needs. It must also require that *some* output has
+  arrived -- a slow import is silent too. This cut the pty suite from 82s of
+  timeouts to 7s green. Negative-controlled: stubbing the browser out fails all
+  four cases.
+
+## A 140-character help string corrupted the interactive prompts (2026-08-08)
+
+- **Symptom:** picking `Vault & capture` in the `bk` browser painted the same
+  rows over and over down the screen. Only that group, and only that group,
+  because `bk forget`'s one-line help is **140 characters** -- the rendered row
+  came to **162**, which wraps onto a second physical line on any terminal
+  narrower than that.
+- **Cause:** `_redraw` moves the cursor up by the number of lines it *wrote*,
+  while the terminal counts the rows it *occupied*. One wrapped row makes the
+  two disagree forever after, so every subsequent redraw paints over the wrong
+  lines. `console.table()` had always fitted its cells to the terminal;
+  `_render_rows` never did. The invariant is now stated where it is relied on:
+  `_redraw` is sound only while every line is one physical row and the whole
+  block fits on screen, which `_render_rows` (truncation, shared
+  `console.truncate`) and `_viewport` (windowing) are what guarantee.
+- **`_viewport` closes the same bug from the other side.** A list taller than
+  the screen cannot be redrawn by cursor arithmetic at all: once its top
+  scrolls past row zero `\x1b[A` stops moving -- the cursor *clamps* -- and the
+  up-count silently under-shoots. Latent here (9 rows max) but a general
+  primitive should not corrupt on a short terminal.
+- **A byte-stream assertion cannot catch this class, and mine did not.** The
+  emitted bytes were perfectly balanced -- every label appearing an equal
+  number of times -- while the painted screen was garbage. Tests now run the
+  output through a ~50-line ANSI `Screen` emulator modelling the only two
+  things that matter: the cursor clamping at row 0, and text wrapping. Assert
+  on **row count** (9 commands must paint 9 rows), not on alignment: with the
+  bug present, alignment happened to stay at column 4 and only duplication
+  showed, so an alignment-only check passed while the screen was broken.
+- **Test-harness lesson that cost real time twice over.** Reading a captured
+  pty stream back with `open(path)` applies universal-newline translation and
+  turns every `\r` into `\n`, so the emulator never sees a carriage return and
+  reports a staircase that does not exist. Read captures with `newline=""`.
+  The pytest cases were right the whole time because `_drive` hands the decoded
+  bytes straight to `Screen`; only the ad-hoc inspection round-tripped a file.
+- **Negative-controlled:** removing the truncation makes `capture` paint 4
+  times where it should paint once, reproducing the reported symptom exactly.
+  672 tests pass, ruff clean.
+
+## The vendored extractors could name grammars nothing installed (2026-08-08)
+
+- **The gap:** `codeanalysis/` imports **29** tree-sitter grammars and ships an
+  extractor for each; `[code]` pinned **13**. The other 16 were unreachable
+  code, and the failure is silent by construction -- `bk code build` prints
+  "contributed nothing" per file (#1745) and then reports success, so a
+  repository of SQL, Swift and Terraform produced a two-node graph. Reproduced
+  with a four-file project: only `app.py` was extracted.
+- **The hint was a dead end, not just terse.** Upstream pointed every such
+  message at `pip install "graphifyy[<extra>]"`, and brainkit does **not depend
+  on graphifyy at all** -- it vendors this code. Following the instruction
+  installed an unrelated distribution while the grammar brainkit actually
+  imports stayed missing. Installing `tree-sitter-sql` directly took the same
+  build from 2 nodes/1 edge/1 file to 5/4/2.
+- **Derive the hint from the error, do not tabulate it.** Upstream's
+  `_EXTRA_FOR_EXTENSION` covered six extensions, so Swift -- the second largest
+  gap -- got no hint at all. The message already names the module, and
+  `tree_sitter_x` -> `tree-sitter-x` is the packaging rule, so deriving it gives
+  all 29 a correct hint and leaves no table to fall out of step. The old table
+  is now dead and removed.
+- **Split rather than fold in:** `code` keeps the common 13, `code-all` adds the
+  rest via `brainkit[code]` + 16 pins. Grammars are compiled wheels and `code`
+  is already ~70 MB; tripling it by default would trade one silent problem for a
+  loud one. All 16 exist on PyPI, so this is purely mechanical.
+- **`tests/test_code_grammars.py` (8 tests)** asserts both directions -- every
+  imported grammar is pinned by some extra, and no extra pins one nothing
+  imports -- plus that no user-facing string advertises graphifyy and that
+  graphifyy is absent from every dependency list. Negative-controlled: dropping
+  one pin names the exact grammar. Beware the regex trap: `tree_sitter_version`
+  matches inside `_check_tree_sitter_version`, so it is excluded explicitly.
+- **Side effect to know about:** editing `pyproject.toml` made the local uv
+  rewrite `uv.lock` from `revision = 1` to `revision = 3`. No package was
+  dropped (71 -> 87, exactly the 16 grammars added), but it is a format
+  migration and most of the 734-line deletion count is reformatting, not change.
+
+## #1666's empties warning fired on what #1224 deliberately skipped (2026-08-08)
+
+- **Not transient, and the advice looped.** The warning says "A re-run will
+  retry them (empties are no longer cached)". Built the same 111-file tree three
+  times: the same six files every time, identical counts. The #1666 fix (don't
+  cache zero-node results, so a hiccup self-heals) is real, but it only helps an
+  *anomalous* empty -- a deterministic one re-derives itself and warns forever.
+- **Cause: three outcomes, two of them checked.** `extract_json` skips
+  data-shaped JSON on purpose (#1224 removed it after datasets swamped the graph
+  with orphan key-nodes) and *already said so* by returning a `skipped` marker.
+  The empties loop tested only `nodes` and `error`, so a deliberate skip read as
+  an anomaly. Honouring `skipped` silenced all six and left the graph
+  byte-identical (1330 nodes / 3783 edges / 85 files) -- it was pure noise, not
+  lost coverage.
+- **Proof the skip is recognition, not failure:** the identical document with
+  one extra `$schema` key goes from **0 nodes to 59**. Recognition is by
+  filename (package.json, tsconfig.json…) or a top-level probe
+  (dependencies/extends/$ref/$schema/compilerOptions); a JSON Schema document
+  has none of them.
+- **Second-order: a skip was never cached either**, since the cache write also
+  keyed on `result.get("nodes")`. Every data-shaped JSON was re-parsed on every
+  build forever. Caching it is safe *because* of how the cache is keyed --
+  content hash (so editing the file re-extracts) inside a directory namespaced
+  by extractor version (so changing the recognition rule invalidates it).
+- **A passing negative control means the control is broken.** Reverting the
+  cache fix left the test green: there are **two** cache-write sites, and
+  `parallel=False` exercises the one in `_extract_sequential`, not the one in
+  `_extract_single_file` that I had reverted. Each site now has its own test and
+  its own control; the parallel one needs `_PARALLEL_THRESHOLD` (20) files
+  before the parallel path is taken at all. Always confirm which branch the test
+  actually runs before trusting a control.
+
+## A vault sited one directory too high indexed 55,295 files (2026-08-08)
+
+- **The incident, measured before anything was changed:** `bk init` run in
+  `~/Projetos/tools` — a directory that *holds* three checkouts rather than
+  being one — produced `graph/code.json` at **683 MB** (614,944 nodes,
+  1,317,441 edges) over **55,295 files** from every unrelated repository on the
+  machine, plus **1.6 GB** of AST cache. Nothing refused, nothing asked, and
+  nothing on screen named the scanned directory until it was done.
+- **Three defects had to line up, so there are three independent locks.**
+  (1) `FileVault.code_root()` fell back to `self.root.parent` when no `.git`
+  was found — the origin; and because that parent is not a VCS root, the
+  extractor's own `.gitignore` ceiling collapses to the scan root, so nothing
+  was excluded either. It now falls back to the *vault itself* and stops the
+  upward walk before `~`. (2) `initialize` refuses `$HOME`, a nested vault, and
+  (without `--force`) a directory holding ≥2 child repositories. (3)
+  `code_scan_limit` (default 20,000) refuses the scan itself — the backstop
+  that holds whatever a future layout does, because it measures the real scan
+  instead of reasoning about where the vault sits.
+- **`bk init` never asked where the vault goes.** It defaulted `path` to `.`
+  and had no location prompt at all. It now asks, defaulting to
+  `<repo>/.brainkit` — hidden and tool-owned, beside `.git` and `.claude`.
+  Not `docs/`, which is the repository's own published documentation.
+- **Changing the layout exposed the next bug immediately**, and the existing
+  `_workspace_advisory` caught it: with the vault at `<repo>/.brainkit`, the
+  agent hooks installed *into the vault* instead of the repository, so every
+  file landed and nothing would ever load. Under the old `bk init .` layout the
+  two directories coincided, so nothing had to choose. Only a real end-to-end
+  run surfaced this — the unit tests were green throughout.
+- **`graph/`, `views/` and `output/` were generated from day one and never
+  gitignored.** `vault.py` already classified them as generated
+  (`write_generated`'s allow-list) — the ignore file simply never agreed, so an
+  in-repo vault committed its own derived output. The list is now derived from
+  that allow-list, and a test asserts the two account for each other.
+  Separately, `initialize` wrote `.gitignore` unconditionally: `bk init .` at a
+  repository root **destroyed that repository's `.gitignore`**. It now splices a
+  marked block.
+
+## A build that dropped three of four languages reported success (2026-08-08)
+
+- **The lie, reproduced:** a four-file repo (`.py/.sql/.swift/.tf`) built a
+  two-node graph, exited **0**, and `bk code status` then answered
+  `"state": "fresh"` — because every check asked "does the graph match the files
+  it *recorded*" and none asked "did everything parseable get parsed".
+  `staleness` now returns **`partial`**, and the coverage is written into the
+  artefact so the answer survives the build output scrolling away.
+- **Every install hint was unrunnable on this machine.** `bk` is a `uv tool`,
+  and a uv tool environment ships **no `pip`** (`find_spec("pip") is None`), so
+  `pip install "brainkit[code]"` either failed or installed into an unrelated
+  interpreter and produced the identical message on the retry. New
+  `infrastructure/pyenv.py` classifies the interpreter (uv tool / pipx / venv /
+  system) and emits the command that works — `uv pip install --python
+  <sys.executable> …`, verified end to end.
+- **Layering told me twice where the code belonged, and it was right both
+  times.** `application` may not import `infrastructure`, so the application
+  layer now raises `details={"needs": [...]}` and the CLI resolves it to a
+  command at the single point errors are rendered; and `bk doctor` — which is
+  entirely about the interpreter and the installation — is assembled in
+  `interfaces`, not in `Health`. Adding a `DOCUMENTED_EXCEPTIONS` entry would
+  have been the easy answer and the wrong one.
+- **Read grammars off the *function*, not its module.** `graphify.extract` is
+  one 260 KB file holding many extractors, so module-level attribution reported
+  that `.swift` needed `tree_sitter_python`. `co_names` plus the live
+  `LanguageConfig.ts_module` is exact, covers both the direct-import and
+  engine-driven shapes, and needs no edit inside the vendored tree. 83
+  extensions map; the ~21 that resolve to nothing are the non-tree-sitter
+  extractors (`.md`, `.sln`, `.csproj`), which is the correct answer for them.
+
+## The vendored tree was not byte-identical, and the cache did not notice (2026-08-08)
+
+- `NOTICE` claimed "nothing inside this directory" while three files had been
+  edited. The operational half is the one that matters: `_cache_format_marker`
+  namespaced the AST cache by **hashing `NOTICE` alone**, so an edit to
+  `extract.py` that changed *which results are cached* left the namespace
+  unchanged and entries written by the old extractor stayed live under the new
+  one — the exact "stale cache, wrong graph" failure the marker exists to
+  prevent. The marker now hashes the vendored source tree; `tests/
+  test_vendoring.py` pins the declared-modification list and both controls fire.
+
+## Benchmarks: coverage, not node count (2026-08-08)
+
+- **The metric has to be coverage** (files yielding ≥1 node ÷ files with an
+  extractor). A node count can rise while a whole language falls out, which is
+  precisely what happened. Two tiers: a hermetic 26-language fixture that runs
+  in pytest, and 10 real repositories pinned by commit.
+- **Two harness traps, both of which read as a catastrophic regression in the
+  tool rather than a bug in the harness.** (1) The vendored extractor's process
+  pool *spawns* on macOS: children re-import `__main__` and inherit no
+  `sys.modules`, so the synthetic `graphify` alias is unresolvable and every
+  worker dies quietly — first fixture run measured **7.7%** coverage on files
+  that all parse correctly in isolation. `bk` is unaffected because its console
+  script imports the CLI. (2) Clones were cached in `benchmarks/.cache/`, and
+  the extractor prunes `.cache` as a noise directory: **all ten repositories
+  measured zero nodes**. A benchmark whose fixtures live somewhere the tool
+  refuses to look measures nothing.
+- **The metric counted correct behaviour as failure, and that pointed the
+  investigation at the wrong place.** The first baseline read Alamofire at
+  **82.4%** and I wrote it up as a Swift extraction problem worth chasing. All
+  98 Swift files were covered; the entire shortfall was 23 fixture `.json`
+  files that `extract_json` declines on purpose (#1224). `skipped` is a third
+  outcome and coverage must exclude it -- the same three-way distinction the
+  empties warning had to learn. Corrected, every repository is **100%**, and
+  the skip count is reported separately so "not indexed" stays distinguishable
+  from "failed to index".
+- **`ruff --fix` reordered an import and silently broke `bk doctor`.**
+  `_extension_grammars` registered the synthetic `graphify` alias and then
+  imported through it; the sorter hoisted the `from graphify.extract import`
+  above the registration, so in a *fresh* process the lookup raised, the
+  `except` returned `{}`, and doctor reported **0 of 0 grammars known** while
+  looking healthy. It only appeared correct earlier because the CLI had already
+  imported the vendored package for another reason. `importlib.import_module`
+  is a call, not an import statement, so nothing can reorder it.
+- **Baseline (all 29 grammars installed):** every repository 100% coverage --
+  1,766 files, 26,706 nodes, 54,745 edges, 21.7 MB of graph in 30.2 s
+  (~58 files/s, ~811 bytes per node). Largest is commons-lang at 625 files /
+  13.6 s. `peak_rss_mb` was dropped rather than reported: `ru_maxrss` is a
+  process high-water mark, so every repository after the first measured 0.0.
+
+## Both harness bugs, fixed at the root this time (2026-08-08)
+
+- **Spawned workers now resolve the extractor.** The first pass raised
+  `_PARALLEL_THRESHOLD` inside the test — a workaround that left every
+  non-`bk` embedder silently losing files. The fix is a real, importable
+  `graphify` package (three lines: `__path__` pointing at the vendored tree)
+  written to a temp dir keyed by the vendored-source hash and **appended** to
+  `sys.path`, which `spawn` hands to the child. `BK_NO_PARALLEL=1` forces the
+  sequential path, and `extract(parallel=…)` — always in the vendored
+  signature, never declared in our Protocol — is the seam it uses. Tests now
+  assert the parallel and sequential paths cover identically, and a subprocess
+  probe proves a fresh interpreter resolves `graphify.extract`.
+- **An ignored scan root now says so.** `.cache` pruning produced "No code
+  nodes in the imported graph", which reads as a broken extractor. `ScanSurvey`
+  gained `present` (a plain walk honouring no ignore rules); collected == 0
+  while present > 0 raises a refusal naming the mechanism and the likely
+  directory. The corpus clones also had to leave `benchmarks/.cache/`, and the
+  root `.gitignore` had to name them — **the extractor reads the ignore file at
+  its scan root and never descends into nested ones**, so `benchmarks/.gitignore`
+  did nothing and ~1,400 files of ripgrep and commons-lang took every top hub
+  slot in brainkit's own graph.
+- **The general fix, and its own false positive.** `unexplained_files` reports
+  any file with an installed grammar that produced nothing for no stated
+  reason — the silent fourth category both bugs fell into. It immediately
+  accused six JSON Schema documents that `extract_json` declines on purpose:
+  the same skipped-is-not-failed confusion already fixed in the benchmark's
+  coverage metric, repeated one layer down. `ScanSurvey.skipped` now probes
+  only extensions whose extractor *has* a skip path, detected by looking for
+  the marker in its source rather than by keeping a list.
+
+## LOCOMO, and what it does and does not say (2026-08-08)
+
+- **recall@10 = 0.537** over n=300 (seed 7, adversarial category 5 excluded),
+  5,882 turns indexed in 34 s, 4.65 ms median query, **0 LLM calls**. Per
+  category: single-hop 0.67, temporal 0.58, multi-hop 0.25, open-domain 0.20.
+- **It is not a re-run of Graphify's table.** Those figures are for
+  conversational *memory* systems; brainkit vendors Graphify's code-extraction
+  closure only, never its memory or retrieval stack. This measures brainkit's
+  own `capture → FTS5 → search` on the same task. The protocol also differs in
+  a way that flatters it: one turn per document makes retrieval units align
+  exactly with `evidence` ids. Report the protocol with the number, always.
+- **recall@k is the metric to publish here** because LOCOMO ships gold evidence
+  ids, so it needs no judge — no confound from which model answered. QA
+  accuracy was deliberately not run: the local models available (qwen2.5:3b,
+  a 14B) would measure the model far more than the retrieval.
+
+## `bk code path` printed the arrow backwards (2026-08-08)
+
+- The traversal is undirected on purpose — "how are these related" is not "what
+  calls what", and insisting on direction reports no path between symbols that
+  plainly connect. But the *renderer* printed `--via-->` for every hop
+  regardless, so a chain of callers read exactly like a chain of calls. In the
+  first path tested, hop 1 was a reverse edge. Direction now rides along in the
+  payload (`forward`) and renders as `◂──`.
+- The payload always carried `path` and `line`; the old one-line renderer threw
+  both away, which defeats the command's whole promise of not having to go
+  looking. Now a descending tree with right-aligned `file:line`, dropped when
+  the terminal is too narrow.
+
+## CLI dead ends: 20 of 46 commands could be reached and not run (2026-08-08)
+
+- **Measured, not guessed.** Walking the parser: 46 invocable commands, **20**
+  cannot run without an argument (`search`, `ask`, `code path`, `export`,
+  `file`, `hooks install`, …), 7 have an optional positional, 19 run bare.
+  Every one of the 20 was a place to arrive and be stuck.
+- **The browser was the worst of them.** `bk` → group → command printed
+  `--help` and exited, so having navigated to what you wanted, the tool's last
+  act was to make you retype it — including the argument you came here not
+  knowing. It now offers **Run it now / Show me the command / Back**, prompting
+  for what is missing and printing the composed line before running anything.
+  The old safety property is kept and narrowed rather than dropped: selecting a
+  command still never runs it, running is a separate defaulted-to-no choice,
+  and `forget`/`reject`/`apply` are printed only.
+- **argparse cannot see every requirement.** `bk capture` has an *optional*
+  positional plus `--text`, so the parser reports nothing required and the
+  command refuses at runtime with "capture requires a source path, URL, or
+  --text" — a requirement that existed only inside an error string, which is
+  why neither entry point could ask for it. `_ALTERNATIVES` declares the
+  "one of these" cases (`capture`, `ingest`); everything else is read off the
+  parser so it cannot drift.
+- **Bare commands now ask instead of printing usage** — but only at a tty,
+  never under `--json`, and never when anything beyond the command name was
+  already typed. A half-typed command is a mistake to report, not a form to
+  fill in, and a script missing an argument must fail rather than block on a
+  question nobody will answer.
+- **Found while auditing:** `bk code build ./typo` extracted nothing, merged
+  that nothing into the stored graph, and printed the *existing* counts under a
+  success line — a mistyped path reported as a completed build. Scoping to a
+  path that does not exist is now `NotFoundError`.
+- **Correction to an earlier note in this file:** the "exits 0 on error" claim
+  was wrong — it came from reading `$?` through a pipe. Every error path exits
+  2. Check the exit code of the command, not of `head`.
+
+## Both systems through one harness: what a single recall column hides (2026-08-08)
+
+- **Result** (full LOCOMO population, n=1,536, k=10, same questions, same
+  retrieval unit, same scorer):
+
+      system     recall@10   ceiling   ranking eff.   index    query
+      brainkit       0.519     1.000          0.519   0.6 min    4 ms
+      graphify       0.302     0.575          0.525  58.4 min  132 ms
+
+- **The n=383 result did not survive.** At three conversations graphify's
+  ranking efficiency led 0.594 to 0.542 and I reported "graphify ranks better".
+  Over the full population the margin is **+0.006** (0.525 vs 0.519) -- nothing.
+  It was flagged as at-risk when reported, because 0.05 sat inside the band a
+  383-question sample produces; the flag was right and the finding was noise.
+  A margin smaller than the sampling band is not a result no matter how
+  mechanistically satisfying its story is.
+
+- **The metric that mattered was not recall.** graphify condenses 1,207 turns
+  into entities and keeps 15–21% of them, so **132 of 383 questions have no
+  evidence turn in its graph at all** — decided before ranking begins. Adding
+  `ceiling` (best recall a perfect ranker could reach over what a system
+  retained) and `ranking efficiency` (recall ÷ ceiling) turns "graphify
+  retrieves worse" into "graphify retains less and ranks better", which are
+  different claims warranting different responses.
+- **The condensation is selective, not lossy-at-random.** 15–21% of turns
+  survive, yet the ceiling is 0.59–0.64 — extraction preferentially keeps
+  answer-bearing turns. Reporting raw coverage alone would have understated it
+  by 3×.
+- **A weak model does not measure the system.** Piloted with `qwen2.5:3b`,
+  graphify extracted **two distinct entities from thirty turns** (both speaker
+  names), returned invalid JSON, and needed adaptive bisection. With
+  `claude-cli`: 23 meaningful entities and the gold turn at rank 2. Any
+  published number for an LLM-backed system is a number about that LLM; name it
+  or the figure means nothing.
+- **My cost estimate was 6× wrong, and I quoted it to the operator.**
+  Extrapolating linearly from a 30-turn pilot predicted ~30 min per
+  conversation; the real figure is ~4.5 min, because per-chunk prompt overhead
+  amortises at real conversation size. I had flagged the *token* figure as an
+  upper bound and should have flagged the *time* the same way. Scope decisions
+  get made on these estimates — a pilot that is 1/14th of the real size is a
+  bad basis for one.
+- **Cached indexing reported zero cost.** `index()` returned `(0.0, 0)` when a
+  graph already existed, so a re-run showed graphify's 15 minutes as `0.0m` in
+  the very table built to compare cost. The cost is now written to disk beside
+  the graph. A number that is only true the first time you run it is not a
+  measurement.
+- **Fairness checks worth keeping:** both systems returned ~9.8/10 candidates,
+  so neither was starved at k=10, and quadrupling graphify's `--budget` changed
+  nothing. Without that check, a low score could have been my truncation rather
+  than its retrieval.
+- **What this does NOT establish.** graphify scores 0.497 in its own published
+  harness and 0.352 here, so this is not reproducing their setup. The per-turn
+  document unit was chosen to make scoring exact against LOCOMO's turn-level
+  evidence, and it suits a system that retrieves turns while handicapping one
+  that retrieves entities. Same-harness is necessary for comparability, not
+  sufficient for a verdict.
+
+## The prompt took a pasted path literally, quotes and all (2026-08-08)
+
+- **Reported from a real session.** Dragging a PDF into the terminal and
+  pasting at `bk capture`'s new prompt produced
+  `'/Users/…/Vant · … negócio.pdf'` — quotes included — which went straight
+  through as a filename. The result was `Capture source is not a file`, a path
+  resolved under the *cwd* because a leading `'` is not absolute, and an echoed
+  command line reading `bk capture ''"'"'/Users/…'"'"''`. Every one of those
+  reads as brainkit being broken; all three are one layer of shell quoting
+  nobody removed.
+- **A prompt is not `argv`.** Everything typed at a shell is unquoted by the
+  shell before a program sees it; a value typed at a *prompt* has had nothing
+  done to it. Adding interactive prompts silently moved that responsibility
+  into the application, and none of the new code did it.
+- **`shlex` already knows both conventions** — quoting *and* drag-and-drop's
+  backslash escaping — so the rule is: if the value parses to exactly one
+  token, that token is what was meant; several tokens is ordinary prose (a
+  search query, a `--text` note) and is returned untouched; unbalanced quotes
+  raise and are likewise left alone rather than guessed at. That single rule
+  covers every shape without a special case per argument.
+- **Validate at the prompt, not after dispatch.** `_Alternative` now carries an
+  optional validator, and capture's file option checks the path exists (or is a
+  URL) before the command is assembled — one re-ask instead of restarting the
+  whole flow.
+- **8 tests, negative-controlled** (removing the one-token rule fails exactly
+  the quoted-paste and backslash cases). One asserts the *wiring*, not the
+  logic: a validator defined and never attached is precisely this bug's shape.
+
+## Enrichment: a model's own edge, admitted through a gate (2026-08-08)
+
+- **The question was "can models enrich the graphs", and the answer had to
+  distinguish two things.** Enriching *through* `bk apply` already works and
+  needs nothing new: an agent proposes a cited page, the gate writes it, and
+  `bk graph` derives the edges — the edge is a consequence of a cited claim.
+  What did not exist is the relationship that *is* the claim ("these are the
+  same entity", "this supersedes that"), which has no page to live on.
+- **Three refusals, each inherited from an invariant rather than invented.**
+  (1) Enrichment never enters `graph/graph.json`, because that file is a
+  projection and `bk graph` would destroy it on the next build — it lives in
+  `.brain/enrichment.json`, joined at read time. (2) An edge must name the
+  sources it was derived from: the privacy filter decides by the branch a
+  *source record* lives in, so an edge with nothing behind it is
+  unclassifiable, and the filter runs after expansion precisely so an edge
+  cannot pull a restricted node back into view. (3) Everything is marked
+  `provenance: model`, with derived edges labelled `derived`.
+- **Privacy inheritance reused an existing rule instead of writing a second
+  one.** `_evidence_privacy` already computed "strictest across contributing
+  branches" inline; extracting it as `strictest_privacy` and calling it from
+  both is what keeps a privacy rule from drifting between two copies.
+  Unresolvable provenance fails **closed** (`never-ingest`), and `bk lint`
+  reports it as `enrichment.unresolved_source` so a restriction nobody chose is
+  visible rather than silent.
+- **Identity is the `(source, relation, target)` triple**, not a random id, so
+  an agent that re-runs proposes one edge rather than inflating the graph.
+- **20 tests, four negative controls**, one per load-bearing rule: accept
+  edges with no provenance (1 fails), take the first source instead of the
+  strictest (1 fails), skip the endpoint re-check on merge (1 fails), merge
+  enrichment into the written projection (1 fails).
+
+## `git checkout --` destroyed an hour of uncommitted work (2026-08-08)
+
+- Reverting one experimental edit with `git checkout -- src/brainkit/domain/
+  model.py` reset the file to **HEAD**, not to its pre-experiment state — and
+  every change made to it this session was uncommitted. `EnrichmentEdge`,
+  `ScanSurvey`, `GrammarNeed`, `DEFAULT_CODE_SCAN_LIMIT`, `_code_scan_limit`
+  and the `code_scan_limit` field all vanished in one command.
+- **Never use `git checkout --` to undo a scratch edit in a dirty tree.** The
+  only safe undo is the one used for every other control in this session:
+  `cp file /tmp/file.bak` before, `cp` back after. It restores the *working*
+  state, which is what an experiment perturbs; git restores the *committed*
+  state, which is a different thing entirely.
+- Recovery was possible only because the test suite covers every lost symbol:
+  rewriting them and watching 764 tests go green is what proved the file whole
+  again. Coverage is a restore receipt, not only a regression net.
+- Related, same session: a "negative control" that only added a comment passed
+  and proved nothing. **A control that does not fail has not run** — re-do it
+  until it fails, or drop the claim.

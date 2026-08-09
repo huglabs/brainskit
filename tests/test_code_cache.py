@@ -279,7 +279,11 @@ class StdoutIsolationTest(unittest.TestCase):
 
     def test_a_noisy_vendored_call_never_reaches_real_stdout(self) -> None:
         def noisy_extract(
-            files: list[Path], cache_root: Path | None = None, *, root: Path | None = None
+            files: list[Path],
+            cache_root: Path | None = None,
+            *,
+            root: Path | None = None,
+            parallel: bool = True,
         ) -> dict[str, Any]:
             print("  AST extraction: 100/580 uncached files (17%) [12 workers]")
             return {"nodes": [], "edges": []}

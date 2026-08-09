@@ -58,6 +58,42 @@ def _visible_len(text: str) -> int:
     return len(_ANSI_RE.sub("", text))
 
 
+def truncate(text: str, width: int) -> str:
+    """Cut `text` to `width` visible columns, never mid-escape-sequence.
+
+    Slicing a string that carries ANSI codes could land inside one and drop its
+    trailing reset, leaking that colour into everything printed afterwards, so
+    anything that actually needs cutting is flattened to plain text first.
+
+    Shared rather than private because two callers need the same guarantee for
+    different reasons: `table()` wants columns that line up, and the interactive
+    prompts need it for correctness -- a row wider than the terminal wraps onto
+    a second physical line, and every redraw there counts logical lines while
+    the terminal counts physical ones.
+    """
+
+    if width <= 0:
+        return ""
+    if _visible_len(text) <= width:
+        return text
+    plain = _ANSI_RE.sub("", text)
+    if width <= 1:
+        return plain[:width]
+    return plain[: width - 1].rstrip() + "…"
+
+
+
+def strip_ansi(text: str) -> str:
+    """`text` without colour codes, for callers measuring their own layout."""
+
+    return _ANSI_RE.sub("", text)
+
+
+def terminal_width() -> int:
+    """The usable width, shared so callers do not each guess their own."""
+
+    return _terminal_width()
+
 def supports_color(*, stream: IO[str] | None = None) -> bool:
     """Whether `stream` (default stdout) is a real terminal worth coloring.
 
@@ -179,18 +215,6 @@ def table(
             give = min(overflow, max(widths[i] - _MIN_COLUMN_WIDTH, 0))
             widths[i] -= give
             overflow -= give
-
-    def truncate(cell: str, col_width: int) -> str:
-        if _visible_len(cell) <= col_width:
-            return cell
-        # A cell that still overflows once it is stripped of color is cut on
-        # the plain text -- slicing the raw (possibly ANSI-bearing) string
-        # instead could land mid-escape-sequence and drop the trailing
-        # reset, leaking that cell's color into everything printed after it.
-        plain = _ANSI_RE.sub("", cell)
-        if col_width <= 1:
-            return plain[:col_width]
-        return plain[: col_width - 1].rstrip() + "…"
 
     def fit(cell: str, col_width: int, *, pad: bool) -> str:
         cell = truncate(cell, col_width)

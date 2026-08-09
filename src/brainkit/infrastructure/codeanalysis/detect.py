@@ -1441,7 +1441,10 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                     total_words += _wc(md_path)
                 else:
                     # Conversion failed (library not installed) - skip with note
-                    skipped_sensitive.append(str(p) + " [office conversion failed - pip install graphifyy[office]]")
+                    skipped_sensitive.append(
+                        str(p)
+                        + ' [office conversion failed - pip install "brainkit[convert]"]'
+                    )
                 continue
             files[ftype].append(str(p))
             if ftype != FileType.VIDEO:

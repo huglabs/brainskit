@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from brainkit.domain.model import SearchHit, SourceRecord, VaultConfig
+from brainkit.domain.model import ScanSurvey, SearchHit, SourceRecord, VaultConfig
 
 
 class VaultPort(Protocol):
@@ -37,6 +37,8 @@ class VaultPort(Protocol):
     def content_hash(self, relative_path: str) -> str: ...
 
     def code_root(self) -> Path: ...
+
+    def code_root_reason(self) -> tuple[Path, str]: ...
 
     #: A property rather than a method, matching the adapter. Declared here
     #: because the application layer is what hands it to the extractor, and a
@@ -136,6 +138,15 @@ class CodeExtractorPort(Protocol):
     ) -> dict[str, Any]: ...
 
     def available(self) -> bool: ...
+
+    #: What a scan would cover, measured without performing it. Declared on the
+    #: port because `CodeGraph` refuses an oversized scan and offers to install
+    #: missing grammars *before* extracting, and both need this answer. Callers
+    #: reach it defensively (`getattr`) so an extractor that predates it still
+    #: satisfies the protocol at runtime.
+    def survey(
+        self, root: Path, paths: list[Path] | None = None
+    ) -> ScanSurvey: ...
 
 
 class IntegrationPort(Protocol):

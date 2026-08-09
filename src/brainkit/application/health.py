@@ -114,8 +114,40 @@ class Health:
             ),
         }
 
+    def enforcement(self) -> dict[str, Any]:
+        """Which enforcement layers are live, read from disk.
+
+        Public because `bk doctor` reports the same four layers and must not
+        pay for a full lint (`status` runs one) to ask a question about the
+        installation rather than about the vault's contents.
+        """
+
+        return self._enforcement_state()
+
+    def _lint_enrichment(self, findings: list[LintFinding]) -> None:
+        """Report inferred edges whose evidence is gone.
+
+        Enrichment inherits its privacy from the sources it was derived from,
+        so a source that has been forgotten leaves an edge nothing can classify.
+        `Enrichment.privacy_of` already fails closed and treats it as
+        `never-ingest`; this is what turns that silent restriction into
+        something an operator can repair.
+        """
+
+        from brainkit.application.enrichment import Enrichment
+
+        for edge in Enrichment(self.vault).orphaned():
+            findings.append(
+                LintFinding(
+                    "enrichment.unresolved_source",
+                    "Enrichment edge cites evidence this vault no longer holds",
+                    path=f"{edge.get('source')} --{edge.get('relation')}--> {edge.get('target')}",
+                )
+            )
+
     def _mechanical_lint(self) -> list[LintFinding]:
         findings: list[LintFinding] = []
+        self._lint_enrichment(findings)
         freshness = self._refresh_staleness()
         records = self.vault.registry()
         raw_files = set(self.vault.raw_files())
@@ -642,3 +674,4 @@ class Health:
         if isinstance(workspace, str) and workspace:
             return Path(workspace)
         return self.vault.root
+

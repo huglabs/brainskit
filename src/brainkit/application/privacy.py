@@ -11,6 +11,7 @@ the consumer that asked, never on how the caller reached it.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
@@ -90,14 +91,32 @@ def _evidence_privacy(
     source_hashes = metadata.get("sources", [])
     if not isinstance(source_hashes, list):
         return PrivacyMode.CLOUD
-    modes = [
+    return strictest_privacy(
         _privacy_for_record(config, records[content_hash])
         for content_hash in source_hashes
         if content_hash in records
-    ]
-    if PrivacyMode.NEVER_INGEST in modes:
+    )
+
+
+def strictest_privacy(modes: Iterable[PrivacyMode]) -> PrivacyMode:
+    """The most restrictive policy in `modes`, defaulting to the most open.
+
+    Named and shared rather than repeated: derived evidence and model-inferred
+    enrichment both answer "what may this be shown to" by taking the strictest
+    policy across everything that contributed, which is the same rule the
+    judgment router applies when evidence spans branches. Two copies of a
+    privacy rule is one copy too many -- the second is where they drift.
+
+    An empty `modes` means nothing classifiable contributed. `CLOUD` is the
+    honest answer there only because every caller checks provenance resolves
+    *first*: `Enrichment.apply` refuses an edge whose sources are unknown, so
+    "no contributing source" never reaches this function from that path.
+    """
+
+    collected = set(modes)
+    if PrivacyMode.NEVER_INGEST in collected:
         return PrivacyMode.NEVER_INGEST
-    if PrivacyMode.LOCAL_ONLY in modes:
+    if PrivacyMode.LOCAL_ONLY in collected:
         return PrivacyMode.LOCAL_ONLY
     return PrivacyMode.CLOUD
 

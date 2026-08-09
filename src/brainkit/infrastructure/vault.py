@@ -29,6 +29,70 @@ from brainkit.domain.model import (
 )
 from brainkit.infrastructure.converters import extract_document, guess_media_type
 
+#: The only directories `write_generated` may write into. Everything here is
+#: derived from `raw/` and `wiki/`, which are the source of truth.
+GENERATED_DIRECTORIES: tuple[str, ...] = ("views", "graph", "output", ".brain")
+
+#: Of those, the ones whose *entire* contents are reproducible, and so belong
+#: in `.gitignore`. `.brain/` is excluded because it is mixed: `config.json`,
+#: `registry.json` and `freshness.json` are the vault's own state and are meant
+#: to be committed, while the index, the locks and the AST cache are not --
+#: hence `_GITIGNORE_STATE_ENTRIES` naming those individually.
+#:
+#: Kept beside `GENERATED_DIRECTORIES` rather than spelled into the ignore file
+#: because the two drifted: `graph/`, `views/` and `output/` were generated from
+#: the beginning and never ignored, so every vault sited inside a repository was
+#: committing its own derived output -- here, a 683 MB `graph/code.json`. A test
+#: asserts the two lists still account for each other, so a fourth generated
+#: directory cannot be added without deciding whether it is committable.
+DERIVED_DIRECTORIES: tuple[str, ...] = ("graph", "output", "views")
+
+_GITIGNORE_STATE_ENTRIES: tuple[str, ...] = (
+    ".brain/index.db",
+    ".brain/index.db-shm",
+    ".brain/index.db-wal",
+    ".brain/*.lock",
+    ".brain/services/",
+    ".brain/code-cache/",
+    ".brain/extracted/",
+)
+
+_GITIGNORE_BEGIN = "# >>> brainkit >>>"
+_GITIGNORE_END = "# <<< brainkit <<<"
+
+
+def gitignore_block() -> str:
+    """The lines brainkit owns in a vault's `.gitignore`, fenced by markers.
+
+    Fenced so the block can be rewritten in place on a later run without
+    touching anything around it -- the same idempotency key the agent-hook
+    installer uses, and for the same reason.
+    """
+
+    entries = [f"{name}/" for name in DERIVED_DIRECTORIES]
+    entries.extend(_GITIGNORE_STATE_ENTRIES)
+    body = "\n".join(entries)
+    return f"{_GITIGNORE_BEGIN}\n{body}\n{_GITIGNORE_END}\n"
+
+
+def merge_gitignore(existing: str, block: str) -> str:
+    """Splice brainkit's block into `existing`, replacing a previous one.
+
+    `initialize` used to write this file unconditionally, so running `bk init`
+    at the root of a repository that already had a `.gitignore` destroyed it --
+    silently, and with no way back short of git. Appending instead means the
+    only file brainkit writes outside its own directories can no longer lose
+    anyone's work.
+    """
+
+    if _GITIGNORE_BEGIN in existing and _GITIGNORE_END in existing:
+        head, _, rest = existing.partition(_GITIGNORE_BEGIN)
+        _, _, tail = rest.partition(_GITIGNORE_END)
+        return head + block + tail.lstrip("\n")
+    if not existing.strip():
+        return block
+    return existing.rstrip("\n") + "\n\n" + block
+
 
 class FileVault:
     """Filesystem adapter for the Markdown source of truth."""
@@ -38,6 +102,7 @@ class FileVault:
         "freshness",
         "proposals",
         "integration-state",
+        "enrichment",
     }
 
     def __init__(self, root: Path):
@@ -53,7 +118,9 @@ class FileVault:
             self._migrate_wiki_directories_unlocked()
 
     @classmethod
-    def initialize(cls, root: Path, raw_config: dict[str, Any]) -> FileVault:
+    def initialize(
+        cls, root: Path, raw_config: dict[str, Any], *, force: bool = False
+    ) -> FileVault:
         root = root.expanduser().resolve()
         config = VaultConfig.from_dict(raw_config)
         config_path = root / ".brain" / "config.json"
@@ -61,6 +128,7 @@ class FileVault:
             raise ValidationError(
                 "Vault is already initialized", details={"vault": str(root)}
             )
+        cls._refuse_bad_site(root, force=force)
         directories = [
             "raw/_inbox",
             "raw/_assets",
@@ -81,6 +149,7 @@ class FileVault:
         _atomic_json(root / ".brain" / "freshness.json", {"version": 2, "pages": {}})
         _atomic_json(root / ".brain" / "proposals.json", {"version": 1, "proposals": {}})
         _atomic_json(root / ".brain" / "applied.json", {"version": 1, "proposals": {}})
+        _atomic_json(root / ".brain" / "enrichment.json", {"version": 1, "edges": {}})
         _atomic_json(
             root / ".brain" / "integration-state.json",
             {"version": 1, "integrations": {}},
@@ -91,20 +160,86 @@ class FileVault:
             .read_text(encoding="utf-8")
         )
         _atomic_text(root / ".brain" / "schema.json", schema_text.rstrip() + "\n")
-        _atomic_text(
-            root / ".gitignore",
-            ".brain/index.db\n"
-            ".brain/index.db-shm\n"
-            ".brain/index.db-wal\n"
-            ".brain/*.lock\n"
-            ".brain/services/\n"
-            ".brain/code-cache/\n",
-        )
+        gitignore_path = root / ".gitignore"
+        try:
+            existing = gitignore_path.read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+        _atomic_text(gitignore_path, merge_gitignore(existing, gitignore_block()))
         index_page = _system_page("index", "Brainkit index")
         log_page = _system_page("log", "Brainkit log")
         _atomic_text(root / "wiki" / "index.md", index_page)
         _atomic_text(root / "wiki" / "log.md", log_page)
         return cls(root)
+
+    @staticmethod
+    def _refuse_bad_site(root: Path, *, force: bool) -> None:
+        """Refuse the three sitings that cannot be what anyone meant.
+
+        A vault's location decides what its code graph scans, and by the time
+        that is visible the scan has already happened. All three of these
+        produced real damage rather than a tidiness complaint:
+
+        - **Home, or anything above it.** Everything on the machine becomes one
+          project.
+        - **Inside another vault.** `discover()` walks up and stops at the first
+          marker, so which vault a command addresses would depend on the
+          directory it was run from.
+        - **A workspace holding projects.** This is the one that actually
+          happened: `~/Projetos/tools` holds three checkouts, so the vault's
+          code root resolved to `~/Projetos` and indexed 55,295 files.
+
+        Only the third is overridable, because only the third is ever a
+        deliberate choice -- a monorepo whose sub-projects each carry a `.git`
+        is a legitimate single project.
+        """
+
+        if _is_above_projects(root):
+            raise ValidationError(
+                "Refusing to create a vault here",
+                details={
+                    "vault": str(root),
+                    "reason": (
+                        "this is your home directory or above it, so the code "
+                        "graph would treat the whole machine as one project"
+                    ),
+                    "hint": "Create it inside a project, e.g. <repo>/.brainkit",
+                },
+            )
+        for parent in root.parents:
+            if (parent / ".brain" / "config.json").is_file():
+                raise ValidationError(
+                    "Refusing to nest a vault inside another vault",
+                    details={
+                        "vault": str(root),
+                        "enclosing_vault": str(parent),
+                        "hint": (
+                            "Commands discover the nearest vault above the "
+                            "working directory, so nesting makes which one "
+                            "they address depend on where they are run"
+                        ),
+                    },
+                )
+        if force or (root / ".git").exists():
+            return
+        repos = workspace_repos(root)
+        if len(repos) >= 2:
+            raise ValidationError(
+                "Refusing to create a vault in a directory that holds projects",
+                details={
+                    "vault": str(root),
+                    "repositories": [repo.name for repo in repos],
+                    "reason": (
+                        f"{len(repos)} git repositories sit directly inside it, "
+                        "so this is a workspace rather than a project and the "
+                        "code graph would scan all of them"
+                    ),
+                    "hint": (
+                        f"Create it inside one of them, e.g. "
+                        f"{repos[0].name}/.brainkit — or pass --force"
+                    ),
+                },
+            )
 
     @classmethod
     def discover(cls, start: Path | None = None) -> FileVault:
@@ -346,22 +481,50 @@ class FileVault:
         return content_hash
 
     def code_root(self) -> Path:
-        """Directory that `code_sources` paths are relative to.
+        """Directory that `code_sources` paths are relative to."""
+
+        return self.code_root_reason()[0]
+
+    def code_root_reason(self) -> tuple[Path, str]:
+        """The code root and, in one phrase, why it is that directory.
 
         Configured, or discovered by walking up for a `.git` directory. The
         common layout puts a vault inside the repository it documents
-        (`repo/docs/brain`), and nothing else about that layout says where the
+        (`repo/.brainkit`), and nothing else about that layout says where the
         repository starts — so the marker git already maintains is a better
         answer than counting `..` segments and hoping.
+
+        **The walk is bounded in both directions, which it once was not.** The
+        old fallback, when no `.git` was found anywhere, was `self.root.parent`
+        — so a vault created in a directory that merely *holds* projects handed
+        the extractor that whole directory. That is not hypothetical: a vault at
+        `~/Projetos/tools` scanned `~/Projetos`, 55,295 files across every
+        unrelated repository on the machine, because a non-VCS root also
+        collapses the extractor's own `.gitignore` ceiling to the scan root and
+        nothing is excluded. The fallback is now the vault itself: a vault with
+        no discoverable project indexes only what it owns, which is empty and
+        obviously wrong, rather than enormous and quietly wrong.
+
+        The upward walk stops before `~` and the filesystem root for the same
+        reason. Neither is a project, and returning one is always a mistake,
+        however the vault came to be sited there.
+
+        The reason string is returned alongside because "which directory does
+        this vault consider its code" is exactly the question nobody thought to
+        ask before running a build, and `bk status`/`bk doctor` now put the
+        answer on screen.
         """
 
         configured = self.config().code_root
         if configured is not None:
-            return (self.root / configured).resolve()
+            resolved = (self.root / configured).resolve()
+            return resolved, f"configured code_root {configured!r}"
         for candidate in (self.root, *self.root.parents):
+            if _is_above_projects(candidate):
+                break
             if (candidate / ".git").exists():
-                return candidate
-        return self.root.parent
+                return candidate, f"git repository at {candidate}"
+        return self.root, "no repository found — the vault indexes only itself"
 
     def code_hash(self, relative_path: str) -> str | None:
         """SHA-256 of a file under the code root, or None when it is not there.
@@ -676,7 +839,7 @@ class FileVault:
 
     def write_generated(self, relative_path: str, content: str) -> None:
         pure = PurePosixPath(relative_path)
-        if not pure.parts or pure.parts[0] not in {"views", "graph", "output", ".brain"}:
+        if not pure.parts or pure.parts[0] not in GENERATED_DIRECTORIES:
             raise ValidationError(
                 "Generated output is outside an allowed directory",
                 details={"path": relative_path},
@@ -1014,6 +1177,52 @@ def _resolve_record(
             "Source identifier is ambiguous", details={"identifier": identifier}
         )
     return matches[0]
+
+
+def _is_above_projects(candidate: Path) -> bool:
+    """Whether `candidate` is too high up to ever be one project's root.
+
+    True for the filesystem root, for the home directory, and for anything
+    between them (`/Users`, `/home`). Those directories hold *many* unrelated
+    trees, so returning one as a code root means scanning all of them — and an
+    upward walk that is allowed to reach `/` will always find something up
+    there eventually, since `.git` is not the only marker a walk might use.
+
+    Deliberately not extended to "any directory containing several
+    repositories": `~/Projetos` is such a directory, but so is a legitimate
+    monorepo with vendored submodules, and refusing that at *read* time would
+    break vaults that are working. The shape is caught where it is actually
+    decidable — `bk init` refuses to site a vault in one (`workspace_repos`),
+    and `CodeGraph.build` refuses to scan more files than a project has.
+    """
+
+    home = Path.home().resolve()
+    return candidate == candidate.parent or candidate == home or home.is_relative_to(candidate)
+
+
+def workspace_repos(directory: Path, limit: int = 8) -> list[Path]:
+    """Git repositories one level below `directory`, up to `limit`.
+
+    Two or more of these mean `directory` is a workspace holding projects
+    rather than a project itself — the shape that produced a vault at
+    `~/Projetos/tools` sitting beside `brainkit/`, `gitlab-mcp/` and `lp-hp/`.
+    Capped because the answer is only ever compared against two, and a home
+    directory full of checkouts should not cost a full listing.
+    """
+
+    found: list[Path] = []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if (entry / ".git").exists():
+            found.append(entry)
+            if len(found) >= limit:
+                break
+    return found
 
 
 def _hash_file(path: Path, chunk_size: int = 1024 * 1024) -> tuple[str, int]:

@@ -480,7 +480,7 @@ class MissingDependencyTest(CodeGraphFixture):
         )
         with self.assertRaises(ValidationError) as caught:
             service.code_build()
-        self.assertIn("brainkit[code]", caught.exception.details["hint"])
+        self.assertIn("brainkit[code]", caught.exception.details["needs"])
 
     def test_extract_translates_a_missing_grammar_into_a_brainkit_error(self) -> None:
         # `graphify.extract` re-checks tree-sitter on every call (not just at
@@ -498,6 +498,9 @@ class MissingDependencyTest(CodeGraphFixture):
                 del sys.modules["tree_sitter"]
             else:
                 sys.modules["tree_sitter"] = previous
+        # The extractor is infrastructure, so it may resolve the install
+        # command itself and ships a ready `hint`. The application layer
+        # cannot -- it names `needs` and the CLI resolves it (`_install_hint_for`).
         self.assertIn("brainkit[code]", caught.exception.details["hint"])
         self.assertNotIsInstance(caught.exception, ImportError)
 

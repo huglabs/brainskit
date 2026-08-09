@@ -38,6 +38,8 @@ editorial changes, but only the deterministic `bk apply` gate can write the
 - [Command reference](#command-reference)
 - [The privacy boundary](#the-privacy-boundary)
 - [The code graph](#the-code-graph)
+- [Enrichment](#enrichment)
+- [Benchmarks](#benchmarks)
 - [Persistent integrations](#persistent-integrations)
 - [Web viewer](#web-viewer)
 - [MCP over the network](#mcp-over-the-network)
@@ -300,8 +302,30 @@ apply gate, the privacy filter or an integration lifecycle.
 
 ## Fast start
 
-Run `bk init ./my-vault` and answer every policy question. For automation, pass
-a complete config file:
+Run `bk init ./my-vault`. It probes the machine before it asks anything —
+whether this is a git repository, what language `$LANG` implies, whether ollama
+is running and which models are actually pulled — and then asks the three
+things it cannot work out for itself:
+
+1. **What the vault is for.** A preset (Work / Personal / Research) names the
+   branches and their privacy, or `Custom` lets you name your own. Every preset
+   keeps a `never-ingest` branch, because that is the one policy choice you
+   cannot walk back: what has been sent to a provider has been sent.
+2. **Which model runs the six jobs.** Chosen from the models ollama reports,
+   never from a hardcoded name — a vault configured for a model you do not have
+   is a vault whose every judgment fails at first use.
+3. **Anything else** — Obsidian sync, the local web UI, and wiring up Claude
+   Code, which is on by default and writes `.claude/` plus a managed
+   `CLAUDE.md` block for you.
+
+Answers are validated at the prompt that produced them and shown as a summary
+you can walk back into before anything is written. If ollama is down or has no
+models, `init` says so and still produces a valid vault — the jobs simply stay
+idle until a provider is up.
+
+Arrow keys drive the selections; off a terminal every prompt degrades to
+numbered input, so a here-doc can answer it. For automation, skip the questions
+entirely and pass a complete config file:
 
 ```bash
 bk init ./my-vault --config policy.json --json
@@ -405,6 +429,7 @@ switches to machine-readable output.
 | `apply PROPOSAL\|-` | Validate and atomically commit wiki writes |
 | `gate check-write PATH [--agent A]` | Whether a direct write to `PATH` is permitted |
 | `views` · `graph [--html]` | Regenerate views and the knowledge graph |
+| `enrich apply PROPOSAL\|-` · `enrich list [--consumer C]` · `enrich forget ID` | Model-inferred edges, gated and stored apart from the projection |
 | `code build [PATH …]` · `code import` · `code status` | Extract the repository graph, import one, re-check it — `build` needs `[code]`. Given `PATH`s, merges that subset into the stored graph instead of replacing it |
 | `code affected` · `code path` · `code hubs` | Queries over that graph, on the base install |
 | `code communities` · `code cycles` · `code diff` | Delegated to the vendored analysis — needs `[code]` |
@@ -466,6 +491,24 @@ base install, so a graph extracted elsewhere can be imported and queried with
 no extra at all. A command that does need it fails with the install hint rather
 than a stack trace.
 
+`[code]` pins grammars for the thirteen most common languages — Python, JS/TS,
+Go, Rust, Java, C/C++, C#, Ruby, PHP, Bash and JSON. The vendored extractors can
+drive sixteen more (SQL, Swift, Terraform/HCL, Kotlin, Objective-C, Groovy,
+PowerShell, Fortran, Lua, Elixir, Julia, Scala, Zig, Verilog, Pascal, DM), and
+without its grammar an extractor is unreachable. `bk code build` surveys the
+scan before running it, names the grammars this repository actually needs, and
+offers to install them — with the command that works for *this* interpreter,
+which is not always `pip`: a uv tool environment does not contain one. Decline
+and the build proceeds, reporting what could not be parsed rather than
+succeeding quietly. Install one grammar, or all of them up front:
+
+```bash
+uv tool install '/path/to/brainkit[code-all]'   # every language, a much larger download
+```
+
+The split is deliberate — grammars are compiled wheels, and `code-all` roughly
+triples an already large install for languages most repositories do not contain.
+
 ```bash
 bk code build                     # extract in-process and store graph/code.json
 bk code import GRAPH.json         # or take one an external extractor produced
@@ -492,6 +535,150 @@ is normalised on the way in rather than trusted as given. `communities`,
 are delegated to the vendored analysis; `affected`, `path` and `hubs` use
 brainkit's own traversal, which needs no dependency and already answers under a
 `--consumer`.
+
+## Enrichment
+
+An agent can already enrich this vault's graph with no special machinery:
+propose a wiki page whose body cites its sources, let `bk apply` gate it, and
+`bk graph` derives the `sourced_from` and `links_to` edges from what was
+written. The edge is then a *consequence of a cited claim*, and every guarantee
+holds because the claim carries source hashes and those hashes carry branches.
+
+`bk enrich` is for the relationship that does not want to be a page — "these
+two entities are the same", "this concept supersedes that one" — where the
+claim *is* the edge. Three rules make that admissible, and all three come from
+invariants that already existed:
+
+| Rule | Why it is not negotiable |
+|---|---|
+| **Never enters `graph/graph.json`** | That file is a projection: `bk graph` rewrites it from the wiki every time, so an edge written there is destroyed on the next build. Enrichment lives in `.brain/enrichment.json` and is joined at read time. |
+| **Every edge names its evidence** | The privacy filter decides by the branch a *source record* lives in. An edge with nothing behind it is unclassifiable, and the filter runs after graph expansion precisely so an edge cannot pull a restricted node back into view. An edge that cannot name its provenance is refused, not stored and hidden. |
+| **Marked wherever it appears** | `provenance: "model"`, with derived edges labelled `"derived"`, so no reader has to work out which edges were extracted and which were argued for. |
+
+An edge inherits the **strictest** policy across the sources it was derived
+from — the same rule the judgment router applies to evidence spanning branches,
+shared as one function rather than written twice. One `never-ingest` source
+withholds the whole edge. Provenance that no longer resolves fails closed
+(treated as `never-ingest`) and is reported by `bk lint` as
+`enrichment.unresolved_source`, so it can be repaired rather than lingering
+invisible.
+
+```json
+{
+  "edges": [
+    {
+      "source": "page:wiki/concepts/compiled-memory.md",
+      "target": "page:wiki/concepts/provenance.md",
+      "relation": "supersedes",
+      "derived_from": ["<64-char sha256>"],
+      "model": "qwen2.5:3b",
+      "note": "proposed during a digest run"
+    }
+  ]
+}
+```
+
+```bash
+bk --vault ./my-vault enrich apply proposal.json
+bk --vault ./my-vault enrich list --consumer local
+bk --vault ./my-vault enrich forget 1eeda80f
+```
+
+The gate mirrors `bk apply`: the whole batch is validated before any of it is
+stored, an endpoint that is not a node in the graph is refused the way an
+unresolved `[[wiki-link]]` is, and identity is the `(source, relation, target)`
+triple — so an agent that re-runs proposes one edge, not two.
+
+**What this does not do.** It infers nothing on its own; it is a gate for
+claims a model has already made. And the benchmark in the next section is the
+reason to be careful with the tier above it: graphify's LLM-extracted graph
+reached a coverage ceiling of 0.575 because entity extraction *discards*.
+Enrichment that adds edges over a corpus it did not fully retain inherits that
+ceiling.
+
+## Benchmarks
+
+`benchmarks/` measures two things the engine claims: that the code graph
+indexes what it says it can, and that vault retrieval finds what a question is
+actually about. Both are reproducible from a clean checkout.
+
+**Coverage, not node count.** A graph can grow while an entire language falls
+silently out of it — which is exactly what happened here once, and the reason
+the headline metric is *files that produced at least one node ÷ files whose
+extension has an extractor*. A node count would have called that build a
+success.
+
+### Code graph
+
+Ten repositories pinned by commit, spanning the languages the shipped
+extractors claim, plus a hermetic 26-language fixture that runs inside the test
+suite with no network.
+
+| | |
+|---|---|
+| **Coverage** | **100%** on all ten repositories and the fixture |
+| Corpus | 1,766 files · 26,706 nodes · 54,745 edges · 21.7 MB of graph |
+| Cost | 30.2 s total (~58 files/s), no LLM calls |
+| Largest | commons-lang, 625 files in 13.6 s |
+
+Deliberate skips are excluded from the denominator. `extract_json` declines
+data-shaped JSON on purpose, and counting that as a failure once made a
+repository read as 82.4% covered when every source file it owned had in fact
+been parsed.
+
+```bash
+python benchmarks/run.py                    # hermetic fixture, seconds
+python benchmarks/run.py --corpus           # clone and measure the ten repositories
+python benchmarks/run.py --corpus --check   # fail on regression against baseline.json
+```
+
+### LOCOMO retrieval
+
+Long-conversation question answering, scored against the gold evidence turns
+LOCOMO ships — so no judge is involved and no model choice can confound the
+number. Both systems run through **one** harness: the same ten conversations,
+the same 1,536 questions, the same retrieval unit (one document per dialogue
+turn), the same scorer, the same k.
+
+| System | recall@10 | ceiling | ranking eff. | MRR | index | query |
+|---|---|---|---|---|---|---|
+| **brainkit** | **0.519** | 1.000 | 0.519 | 0.376 | 0.6 min · no LLM | 4 ms |
+| graphify | 0.302 | 0.575 | 0.525 | 0.185 | 58.4 min · ~3.3M LLM tokens | 132 ms |
+
+`ceiling` is the best recall a *perfect* ranker could reach over what each
+system actually stored, and it is the column that makes the result readable.
+brainkit indexes every turn, so nothing is out of reach and its score is purely
+ranking. graphify condenses ~590 turns into ~70 entities per conversation,
+leaving **536 of 1,536 questions with no evidence turn in its graph at all** —
+scored zero before ranking began. `ranking eff.` is recall ÷ ceiling: measured
+against what each system kept, the two are tied (0.525 against 0.519). **The
+gap is coverage, not ranking.**
+
+```bash
+# LOCOMO's release is not vendored
+git clone --depth 1 https://github.com/snap-research/locomo /tmp/locomo
+cp /tmp/locomo/data/locomo10.json benchmarks/memory/
+
+python benchmarks/memory/run_locomo.py --limit 300        # brainkit alone
+python benchmarks/memory/run_locomo_graphify.py --index   # build graphify's graphs
+python benchmarks/memory/run_locomo_graphify.py           # both, one harness
+```
+
+**What these numbers do not establish.** graphify scores 0.497 in its own
+published harness and 0.302 here, so this is not reproducing that setup: the
+per-turn document unit was chosen to make scoring exact against LOCOMO's
+turn-level evidence, and that choice suits a system retrieving turns while
+handicapping one retrieving entities. Turn-level recall is not what an entity
+graph is built to win. Same-harness is what makes two numbers comparable; it is
+not what makes one of them a verdict.
+
+Two further cautions, both learned by getting them wrong first. A 300-question
+sample of LOCOMO carries a ~95% band of roughly ±0.06 — wide enough that an
+early "graphify ranks better" finding (+0.052 at n=383) vanished to +0.006 over
+the full population. And graphify's result depends entirely on the model
+indexing it: piloted with a 3B local model it extracted two entities from
+thirty turns, so any figure for an LLM-backed system is a figure about that
+LLM. The runs above use `claude-cli`.
 
 ## Persistent integrations
 
@@ -800,6 +987,16 @@ your own instructions keep their content and their position. An existing skill
 or a pre-existing `pre-commit` hook is reported rather than overwritten; pass
 `--force` to replace them. A workspace without git still installs everything
 else.
+
+A `.claude/settings.json` carried over from somewhere else — a previous
+install at a different `--root`, or a `.claude/` copied wholesale from another
+project — has its stale `brainkit-gate`/`brainkit-status` entries replaced,
+not left running alongside the new ones: the idempotency key is the hook's
+*identity* (its template name), not the literal command path, so a command
+pointing at a different vault or workspace is recognised as superseded and
+pruned. Reported in `settings.pruned` and on stderr. Unrelated tooling
+registered on the same event is never touched — only a command whose name
+matches `brainkit-gate.sh`/`brainkit-status.sh` is ever considered stale.
 
 ### The vault is not always the workspace
 

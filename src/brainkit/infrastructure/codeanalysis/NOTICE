@@ -69,14 +69,41 @@ the `code` extra. Do not work around it by editing anything in this directory.
 What was changed
 ----------------
 
-Nothing inside this directory. The files are byte-identical to upstream so that
-a future re-vendor is a copy rather than a merge, and so that any behaviour seen
-here can be reported against Graphify without first subtracting our edits.
+The rule is that adaptation lives OUTSIDE this directory, in the adapter that
+implements Brainkit's `CodeExtractorPort`. That is where the vault is excluded
+from its own graph, prose nodes are dropped, and the result is normalised to
+Brainkit's node shape. Keeping this tree close to upstream is what makes a
+re-vendor a copy rather than a merge, and what lets behaviour seen here be
+reported against Graphify without first subtracting our edits.
 
-Adaptation lives outside this directory, in the adapter that implements
-Brainkit's `CodeExtractorPort`. That is also where Brainkit's own rules are
-applied — the vault is excluded from its own graph, prose nodes are dropped, and
-the result is normalised to Brainkit's node shape.
+Three files depart from that rule. They are listed here because Apache-2.0
+section 4(b) requires modified files to carry prominent notice, and because a
+claim of byte-identity that is not true is worse than no claim at all — the AST
+cache is namespaced by a hash of this tree precisely so that a change here
+cannot be served from a cache built before it.
+
+`tests/test_vendoring.py` pins this list. A fourth edit fails that test until it
+is declared here, which is the point: the exception must stay visible and
+argued for rather than accumulating quietly.
+
+  extract.py
+      1. `skipped` results are cached and excluded from the "produced zero
+         nodes" warning (#1666). `extract_json` deliberately skips data-shaped
+         JSON (#1224) and already said so by returning a `skipped` marker; two
+         of the three places that read a result checked only `nodes` and
+         `error`, so a deliberate skip read as an anomaly, warned on every
+         build, and was re-derived forever because the cache write tested the
+         same condition.
+      2. The missing-grammar hint is derived from the module named in the error
+         (`tree_sitter_x` -> `tree-sitter-x`) instead of an extension->extra
+         table. The table pointed at `graphifyy` extras; Brainkit vendors this
+         code and does not depend on that distribution, so following the hint
+         installed something unrelated while the grammar stayed missing.
+
+  detect.py, google_workspace.py
+      Two user-facing strings that told the reader to `pip install graphifyy[…]`
+      now name Brainkit's own extra, or say plainly that the capability is not
+      vendored. Message text only; no behaviour.
 
 
 Consequences that are not obvious

@@ -47,6 +47,7 @@ paying.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import os
 import sys
@@ -56,9 +57,21 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
 
-from brainkit.domain.model import ValidationError
+from brainkit.domain.model import GrammarNeed, ScanSurvey, ValidationError
 
-_INSTALL_HINT = "Install the optional grammars with: pip install brainkit[code]"
+
+def _install_hint() -> str:
+    """Derived per call, never a constant.
+
+    Which command installs a package is a property of how `bk` itself was
+    installed, and the constant this replaces named `pip` — which a uv tool
+    environment does not contain. See `pyenv`.
+    """
+
+    from brainkit.infrastructure.pyenv import grammar_install_hint
+
+    return grammar_install_hint()
+
 
 # Brainkit's own private state directory (`infrastructure/vault.py`). Wherever
 # it appears in a scanned tree — nested at any depth, since a vault commonly
@@ -84,24 +97,221 @@ _VAULT_STATE_DIR = ".brain"
 # header says so); hashing it whole, rather than parsing out just the
 # "Revision:"/"Version:" lines, means any edit that accompanies a re-vendor
 # invalidates the cache, not only the two fields anticipated today.
-_NOTICE_PATH = Path(__file__).resolve().parent / "codeanalysis" / "NOTICE"
+_VENDORED_DIR = Path(__file__).resolve().parent / "codeanalysis"
+_NOTICE_PATH = _VENDORED_DIR / "NOTICE"
 
 
+@lru_cache(maxsize=1)
 def _cache_format_marker() -> str:
     """A short token that changes whenever the vendored extractor does.
 
-    A missing or unreadable `NOTICE` (it ships beside the vendored source, so
-    this should not normally happen) falls back to a fixed token rather than
-    failing extraction: every entry under a marker's directory is still keyed
-    by file content hash underneath, so the marker can only ever cost a cold
-    cache on a wrong guess, never serve a wrong answer.
+    Hashes the **extractor's own source**, not only `NOTICE`. Hashing the
+    notice alone assumed the tree beside it never changes except at a
+    re-vendor, and that assumption broke the first time it mattered: three
+    files in that directory were edited -- one of them changing which results
+    are written to the cache -- while `NOTICE` was untouched, so the marker
+    stayed the same and entries written by the old extractor remained live
+    under the new one. That is the exact "stale cache, wrong graph" failure
+    this token exists to prevent.
+
+    Reading the tree also makes the marker true by construction rather than by
+    remembering to update a file, which is a weaker guarantee than the cache
+    needs. It costs one pass over ~600 KB, once per process.
+
+    An unreadable tree falls back to a fixed token rather than failing
+    extraction: every entry under a marker's directory is still keyed by file
+    content hash underneath, so a wrong guess can only cost a cold cache, never
+    serve a wrong answer.
     """
 
+    digest = hashlib.sha256()
     try:
-        digest = hashlib.sha256(_NOTICE_PATH.read_bytes()).hexdigest()
+        for path in sorted(_VENDORED_DIR.rglob("*.py")):
+            digest.update(path.relative_to(_VENDORED_DIR).as_posix().encode())
+            digest.update(path.read_bytes())
+        digest.update(_NOTICE_PATH.read_bytes())
     except OSError:
         return "unversioned"
-    return digest[:16]
+    return digest.hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def _enable_parallel_workers() -> bool:
+    """Make `graphify` resolvable in a *freshly spawned* interpreter.
+
+    The extractor parallelises above 20 files with a `ProcessPoolExecutor`, and
+    a pool pickles work by qualified name -- `graphify.extract.extract_python`.
+    On macOS (and anywhere the start method is `spawn`) the child is a brand
+    new interpreter that re-imports `__main__` and inherits none of the
+    parent's `sys.modules`. `graphify` exists only as a synthetic alias this
+    package registers at runtime, so the child could not resolve it, every
+    worker died, and its files produced **nothing** -- reported as coverage,
+    not as an error. A polyglot fixture whose every file parses correctly in
+    isolation measured 7.7%.
+
+    It went unnoticed because `bk` happens to be immune: its console script
+    imports the CLI, which imports this package, so a child re-importing
+    `__main__` registers the alias on the way in. Anything else embedding the
+    extractor -- pytest, a notebook, a plain script that imports brainkit
+    inside a function -- got the silent version.
+
+    The fix is to stop relying on that accident. `spawn` hands the child the
+    parent's `sys.path`, so a real, importable `graphify` package on that path
+    resolves in any interpreter. The package is three lines: a `__path__`
+    pointing at the vendored tree, which is exactly what the in-process alias
+    already does.
+
+    **Appended, never prepended.** A genuine Graphify installation earlier on
+    the path keeps winning; this only fills a gap that would otherwise be a
+    crash. Failure to write the shim is not fatal -- `_run` degrades to
+    sequential extraction, which is slower and correct, and `CodeGraph`
+    reports any file that went unexplained regardless.
+    """
+
+    directory = _shim_root()
+    if directory is None:
+        return False
+    entry = str(directory)
+    if entry not in sys.path:
+        sys.path.append(entry)
+    return True
+
+
+
+
+@lru_cache(maxsize=1)
+def _skipping_extensions() -> frozenset[str]:
+    """Extensions whose extractor can decline a file on purpose.
+
+    Detected rather than listed: an extractor with a deliberate-skip path
+    returns a `skipped` marker, and the string appears in its own source. Today
+    that is JSON alone (`extract_json` refuses data-shaped documents, upstream
+    #1224), but a list would go stale the moment a second one learns to.
+    """
+
+    found: set[str] = set()
+    try:
+        importlib.import_module("brainkit.infrastructure.codeanalysis")
+        dispatch = importlib.import_module("graphify.extract")._DISPATCH
+    except Exception:
+        return frozenset()
+    for extension, function in dispatch.items():
+        module = sys.modules.get(getattr(function, "__module__", ""), None)
+        source_file = getattr(module, "__file__", None)
+        if not source_file:
+            continue
+        try:
+            source = Path(source_file).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if '"skipped"' in source or "'skipped'" in source:
+            found.add(extension.lower())
+    return frozenset(found)
+
+
+def _deliberate_skips(paths: list[Path], cap: int = 400) -> int:
+    """Files the extractor will decline to index, counted before the build.
+
+    Without this the shortfall check accuses the extractor of losing files it
+    never intended to keep. Six JSON Schema documents in brainkit's own tree
+    were reported as "produced nothing, and no reason was given" -- the reason
+    existed, it just had nowhere to be read from.
+
+    Only extensions with a skip path are probed, and only up to `cap`, so the
+    cost is bounded by how much data-shaped JSON a tree holds rather than by
+    its size.
+    """
+
+    extensions = _skipping_extensions()
+    if not extensions:
+        return 0
+    try:
+        get_extractor = importlib.import_module("graphify.extract")._get_extractor
+    except Exception:
+        return 0
+    skipped = 0
+    probed = 0
+    for path in paths:
+        if path.suffix.lower() not in extensions:
+            continue
+        probed += 1
+        if probed > cap:
+            break
+        extractor = get_extractor(path)
+        if extractor is None:
+            continue
+        try:
+            result = extractor(path)
+        except Exception:  # noqa: S112 -- an extractor that raises is not a
+            # deliberate skip; leaving it uncounted keeps it in the shortfall,
+            # which is where a genuine failure belongs.
+            continue
+        if result.get("skipped") and not (result.get("nodes") or []):
+            skipped += 1
+    return skipped
+
+
+def _present_on_disk(root: Path, targets: list[Path], cap: int = 64) -> int:
+    """Files with a known extension that simply exist, ignoring every rule.
+
+    The extractor's walk honours `.gitignore` and prunes conventionally noisy
+    directory names, which is right almost always and catastrophic in the one
+    case where the scan root *is* such a directory: it collects nothing, the
+    graph comes out empty, and the only message anyone gets is "no code nodes"
+    -- which reads as a broken extractor rather than an ignored path. Ten
+    repositories cached under `benchmarks/.cache/` all measured zero this way,
+    and working out why took longer than writing the benchmark did.
+
+    Counting is capped because the answer is only ever compared against zero.
+    """
+
+    known = _extension_grammars()
+    seen = 0
+    for target in targets:
+        base = target if target.is_absolute() else root / target
+        if base.is_file():
+            seen += 1 if base.suffix.lower() in known else 0
+            continue
+        for _, directories, filenames in os.walk(base):
+            directories[:] = [d for d in directories if d != ".git"]
+            for name in filenames:
+                if Path(name).suffix.lower() in known:
+                    seen += 1
+                    if seen >= cap:
+                        return seen
+    return seen
+
+
+def _parallel_allowed() -> bool:
+    """Whether to use the worker pool at all.
+
+    `BK_NO_PARALLEL=1` forces the sequential path. It exists because the
+    difference between "a worker pool is broken" and "extraction is broken" is
+    otherwise invisible from the outside, and that ambiguity cost real time:
+    one escape hatch turns an hour of guessing into one run.
+    """
+
+    if os.environ.get("BK_NO_PARALLEL"):
+        return False
+    return _enable_parallel_workers()
+
+
+def _shim_root() -> Path | None:
+    package = Path(tempfile.gettempdir()) / f"brainkit-graphify-{_cache_format_marker()}"
+    module = package / "graphify" / "__init__.py"
+    if module.is_file():
+        return package
+    try:
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(
+            '"""Generated by brainkit. Resolves the vendored Graphify tree in a\n'
+            "spawned worker, which inherits sys.path but not sys.modules.\n"
+            f'"""\n\n__path__ = [{str(_VENDORED_DIR)!r}]\n',
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return package
 
 
 @lru_cache(maxsize=4096)
@@ -142,9 +352,111 @@ def _is_vault_file(path: Path, root: Path) -> bool:
     return _VAULT_STATE_DIR in relative.parts
 
 
+#: The tree-sitter runtime and a bundle nothing here uses -- neither is a
+#: grammar anyone can be told to install. Same exclusions, for the same reason,
+#: as `tests/test_code_grammars.py`.
+_NOT_GRAMMARS = frozenset({"tree_sitter", "tree_sitter_version", "tree_sitter_languages"})
+
+
+@lru_cache(maxsize=1)
+def _extension_grammars() -> dict[str, tuple[str, ...]]:
+    """Extension -> the grammar modules its extractor needs.
+
+    Read off the *function*, not its module: `graphify.extract` is one 260 KB
+    file holding many extractors, so attributing its imports by module told us
+    that `.swift` needed `tree_sitter_python`. Per-function is exact, and two
+    shapes have to be covered because the extractors use both:
+
+    - **direct** — `extract_sql` does `import tree_sitter_sql` in its own body,
+      which appears in `co_names`;
+    - **engine-driven** — `extract_python` delegates to `_extract_generic(path,
+      _PYTHON_CONFIG)`, and the grammar is `_PYTHON_CONFIG.ts_module`. That
+      config is a live `LanguageConfig` reachable through the function's
+      globals, so it is read rather than parsed.
+
+    Reading bytecode names and a runtime attribute means no regex can drift
+    against a refactor of the extractors, and nothing in the vendored directory
+    has to be edited to expose the mapping.
+
+    Extensions that resolve to nothing are extractors that do not use
+    tree-sitter at all (`.md`, `.sln`, `.csproj`, `.dart` — regex and XML
+    readers). Absent from the mapping is the correct answer for them: there is
+    no grammar to be missing.
+    """
+
+    # Order matters and must survive an import sorter. `graphify` is a
+    # synthetic alias that importing the vendored package registers, so it has
+    # to be registered *before* anything asks for it -- and an `import`
+    # statement here gets hoisted above the one it depends on the first time
+    # `ruff --fix` runs, at which point `bk doctor` silently reports zero
+    # grammars known instead of failing. `import_module` is a call, not an
+    # import statement, so nothing may reorder it.
+    importlib.import_module("brainkit.infrastructure.codeanalysis")
+    dispatch = importlib.import_module("graphify.extract")._DISPATCH
+
+    mapping: dict[str, tuple[str, ...]] = {}
+    cache: dict[int, tuple[str, ...]] = {}
+    for extension, function in dispatch.items():
+        key = id(function)
+        if key not in cache:
+            cache[key] = _grammars_for_function(function)
+        if cache[key]:
+            mapping[extension.lower()] = cache[key]
+    return mapping
+
+
+def _grammars_for_function(function: Any) -> tuple[str, ...]:
+    LanguageConfig = importlib.import_module(
+        "graphify.extractors.models"
+    ).LanguageConfig
+
+    code = getattr(function, "__code__", None)
+    if code is None:
+        return ()
+    globals_ = getattr(function, "__globals__", None) or {}
+    found: set[str] = set()
+
+    def visit(block: Any) -> None:
+        for name in getattr(block, "co_names", ()):
+            if name.startswith("tree_sitter_"):
+                found.add(name)
+            referenced = globals_.get(name)
+            if isinstance(referenced, LanguageConfig):
+                module = getattr(referenced, "ts_module", "")
+                if module:
+                    found.add(module)
+        # Inner functions and comprehensions compile to nested code objects,
+        # and an extractor that defers its import into a closure would
+        # otherwise look grammar-free.
+        for const in getattr(block, "co_consts", ()):
+            if hasattr(const, "co_names"):
+                visit(const)
+
+    visit(code)
+    return tuple(sorted(found - _NOT_GRAMMARS))
+
+
+def _grammars_for_extension(extension: str) -> tuple[str, ...]:
+    try:
+        return _extension_grammars().get(extension.lower(), ())
+    except Exception:
+        # A survey is advisory. If the vendored dispatch table cannot be read,
+        # the caller loses the install offer, not the ability to build.
+        return ()
+
+
 class _ExtractFn(Protocol):
+    #: `parallel` was always part of the vendored signature; this Protocol
+    #: simply had not declared it, because nothing here passed it. Brainkit
+    #: does now -- a worker pool whose children cannot resolve the extractor
+    #: has to be able to degrade to sequential rather than lose files silently.
     def __call__(
-        self, paths: list[Path], cache_root: Path | None = None, *, root: Path | None = None
+        self,
+        paths: list[Path],
+        cache_root: Path | None = None,
+        *,
+        root: Path | None = None,
+        parallel: bool = True,
     ) -> dict[str, Any]: ...
 
 
@@ -178,7 +490,7 @@ def _load() -> tuple[_ExtractFn, _CollectFn]:
         except ImportError as exc:
             raise ValidationError(
                 "Code extraction requires the optional tree-sitter grammars",
-                details={"hint": _INSTALL_HINT},
+                details={"hint": _install_hint()},
             ) from exc
         _extract, _collect_files = extract, collect_files
     return _extract, _collect_files
@@ -186,6 +498,71 @@ def _load() -> tuple[_ExtractFn, _CollectFn]:
 
 class GraphifyExtractor:
     """Extracts a repository's code graph in-process via vendored Graphify."""
+
+    def survey(self, root: Path, paths: list[Path] | None = None) -> ScanSurvey:
+        """Measure a scan without performing it: how many files, which grammars.
+
+        Both answers come from one walk because both were missing for the same
+        reason -- nothing looked at a scan before running it. The file count is
+        what `CodeGraph.build` refuses on; the grammar list is what the CLI
+        offers to install.
+
+        The grammar half reads the vendored extractors rather than editing them
+        (that directory has its own rules -- see its `NOTICE`). Every extractor
+        defers `import tree_sitter_<lang>` into the function body, so the
+        mapping extension -> grammar is recoverable statically: `_DISPATCH`
+        gives extension -> extractor function, `__module__` gives the file, and
+        the import statement in that file names the grammar. `find_spec` then
+        answers whether it is installed, without importing a compiled parser
+        this process may never need.
+
+        Reading source rather than asking the extractor is not the shortest
+        route, it is the only one: the extractor discovers a missing grammar
+        per file, counts it into a local, prints a warning and returns
+        `{"nodes", "edges"}` -- by the time a caller could observe the problem,
+        the scan it should have prevented has already run.
+        """
+
+        _, collect_fn = _load()
+        resolved_root = root.resolve()
+        targets = paths or [resolved_root]
+        seen: set[Path] = set()
+        by_extension: dict[str, int] = {}
+        for target in targets:
+            candidate = target if target.is_absolute() else resolved_root / target
+            for found in collect_fn(candidate, root=resolved_root):
+                if found in seen or _is_vault_file(found, resolved_root):
+                    continue
+                seen.add(found)
+                by_extension[found.suffix.lower()] = (
+                    by_extension.get(found.suffix.lower(), 0) + 1
+                )
+
+        needs: dict[str, dict[str, Any]] = {}
+        for extension, count in by_extension.items():
+            for module in _grammars_for_extension(extension):
+                entry = needs.setdefault(
+                    module, {"extensions": set(), "files": 0}
+                )
+                entry["extensions"].add(extension)
+                entry["files"] += count
+        grammars = tuple(
+            GrammarNeed(
+                module=module,
+                distribution=module.replace("_", "-"),
+                installed=importlib.util.find_spec(module) is not None,
+                extensions=tuple(sorted(entry["extensions"])),
+                files=entry["files"],
+            )
+            for module, entry in sorted(needs.items())
+        )
+        return ScanSurvey(
+            root=str(resolved_root),
+            files=len(seen),
+            grammars=grammars,
+            present=_present_on_disk(resolved_root, targets),
+            skipped=_deliberate_skips(sorted(seen)),
+        )
 
     def available(self) -> bool:
         """Whether the optional tree-sitter grammars are installed.
@@ -267,6 +644,7 @@ class GraphifyExtractor:
         cache_dir: Path,
         root: Path,
     ) -> dict[str, Any]:
+        _enable_parallel_workers()
         try:
             # The vendored extractor prints its own cold-cache progress lines
             # straight to stdout (no `file=sys.stderr`) once a scan crosses its
@@ -278,11 +656,13 @@ class GraphifyExtractor:
             # (which stays byte-identical to upstream) while still surfacing
             # the progress lines on stderr instead of discarding them.
             with redirect_stdout(sys.stderr):
-                result = extract_fn(files, cache_dir, root=root)
+                result = extract_fn(
+                    files, cache_dir, root=root, parallel=_parallel_allowed()
+                )
         except ImportError as exc:
             raise ValidationError(
                 "Code extraction requires the optional tree-sitter grammars",
-                details={"hint": _INSTALL_HINT},
+                details={"hint": _install_hint()},
             ) from exc
         return {"nodes": result.get("nodes", []), "edges": result.get("edges", [])}
 
@@ -314,3 +694,28 @@ class GraphifyExtractor:
         except OSError:
             return None
         return candidate
+
+
+def grammar_inventory() -> dict[str, bool]:
+    """Every grammar the shipped extractors can drive, and whether it is here.
+
+    Derived from the extractors themselves rather than from `pyproject.toml`'s
+    extras: the extras are what someone chose to pin, the dispatch table is
+    what the code will actually reach for, and the gap between the two *was*
+    the bug — 29 grammars imported, 13 pinned, the other 16 unreachable with no
+    way to notice short of building a graph and spotting an absent language.
+
+    An unreadable extractor tree (tree-sitter absent, so the vendored closure
+    never imported) yields an empty inventory rather than raising: at that
+    point "cannot say" is the honest answer, and `bk doctor` reports it as
+    zero known instead of failing.
+    """
+
+    try:
+        modules = {m for grammars in _extension_grammars().values() for m in grammars}
+    except Exception:
+        return {}
+    return {
+        module.replace("_", "-"): importlib.util.find_spec(module) is not None
+        for module in sorted(modules)
+    }

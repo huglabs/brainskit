@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -189,6 +190,193 @@ class CodeSource:
 
     def to_dict(self) -> dict[str, str]:
         return {"path": self.path, "hash": self.content_hash}
+
+
+#: See `VaultConfig.code_scan_limit`. Chosen above the largest repository
+#: anyone has pointed brainkit at and far below the 55,295-file accident that
+#: motivated it, so it refuses the mistake without ever refusing the work.
+DEFAULT_CODE_SCAN_LIMIT = 20_000
+
+
+def _code_scan_limit(raw: dict[str, Any]) -> int:
+    if "code_scan_limit" not in raw or raw["code_scan_limit"] is None:
+        return DEFAULT_CODE_SCAN_LIMIT
+    value = raw["code_scan_limit"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError("code_scan_limit must be an integer")
+    if value < 1:
+        raise ValidationError(
+            "code_scan_limit must be positive",
+            details={"code_scan_limit": value, "hint": "Omit the key for the default"},
+        )
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class GrammarNeed:
+    """One tree-sitter grammar a scan would use, and whether it is installed.
+
+    Exists because the extractor answers this question only by *printing*: a
+    file whose grammar is absent yields `{"nodes": [], "error": "… not
+    installed"}`, the extractor counts those into a stderr warning, and the
+    counts never leave the function. So `bk code build` could report success,
+    write a two-node graph for a four-file repository, and `bk code status`
+    could then call that graph `fresh`.
+    """
+
+    module: str
+    distribution: str
+    installed: bool
+    extensions: tuple[str, ...] = ()
+    files: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "module": self.module,
+            "distribution": self.distribution,
+            "installed": self.installed,
+            "extensions": list(self.extensions),
+            "files": self.files,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScanSurvey:
+    """What a scan of `root` would cover, measured before committing to it."""
+
+    root: str
+    files: int
+    grammars: tuple[GrammarNeed, ...] = ()
+    #: Files with a known extension that exist on disk under `root`, counted by
+    #: a plain walk that honours no ignore rules. `files` is what the extractor
+    #: agreed to collect. The two diverging is the only evidence that a scan
+    #: root is being *ignored* rather than being empty.
+    present: int = 0
+    #: Files the extractor will decline on purpose (data-shaped JSON). A third
+    #: outcome, and the shortfall check must not read it as a loss.
+    skipped: int = 0
+
+    @property
+    def missing(self) -> tuple[GrammarNeed, ...]:
+        return tuple(g for g in self.grammars if not g.installed)
+
+    @property
+    def unreachable_files(self) -> int:
+        """Files whose language is supported but whose grammar is absent."""
+
+        return sum(g.files for g in self.missing)
+
+    @property
+    def parseable_files(self) -> int:
+        """Files an extractor claims *and* whose grammar is installed here."""
+
+        return max(
+            sum(g.files for g in self.grammars if g.installed) - self.skipped, 0
+        )
+
+    @property
+    def ignored_entirely(self) -> bool:
+        """The extractor collected nothing from a root that is not empty."""
+
+        return self.files == 0 and self.present > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": self.root,
+            "files": self.files,
+            "grammars_missing": [g.to_dict() for g in self.missing],
+            "unreachable_files": self.unreachable_files,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichmentEdge:
+    """A relationship a model argued for, kept apart from the derived graph.
+
+    The vault's own graph is a *projection*: `sourced_from` comes from a page's
+    frontmatter, `links_to` from its `[[wiki-links]]`, and `bk graph` rewrites
+    the whole file from those every time. An edge written into it would be
+    destroyed by the next build — and, worse, would be unclassifiable: the
+    privacy filter decides by the branch a *source record* lives in, so an edge
+    with nothing behind it gives the filter nothing to act on, in a graph where
+    filtering deliberately runs after expansion so an edge cannot pull a
+    restricted node back into view.
+
+    `derived_from` is what makes an inferred edge admissible at all. It names
+    the sources the claim was made from, so the edge inherits their branches
+    and therefore their privacy — the strictest of them, the same rule the
+    judgment router already applies to evidence spanning several branches.
+
+    Identity is the triple, not a random id: proposing the same relationship
+    twice is one edge, so an agent that re-runs does not inflate the graph.
+    """
+
+    source: str
+    target: str
+    relation: str
+    #: Content hashes of the evidence the claim was drawn from. Never empty —
+    #: `Enrichment.apply` rejects an edge that cannot name its sources.
+    derived_from: tuple[str, ...]
+    model: str
+    created_at: str
+    note: str = ""
+
+    @property
+    def id(self) -> str:
+        digest = hashlib.sha256(
+            "\u0000".join((self.source, self.relation, self.target)).encode("utf-8")
+        )
+        return digest.hexdigest()[:16]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source": self.source,
+            "target": self.target,
+            "relation": self.relation,
+            "derived_from": list(self.derived_from),
+            "model": self.model,
+            "created_at": self.created_at,
+            #: Stamped on the way out, never inferred by a reader.
+            "provenance": "model",
+            **({"note": self.note} if self.note else {}),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> EnrichmentEdge:
+        if not isinstance(raw, dict):
+            raise ValidationError("An enrichment edge must be an object")
+        missing = sorted(
+            {"source", "target", "relation", "derived_from", "model"} - raw.keys()
+        )
+        if missing:
+            raise ValidationError(
+                "Enrichment edge is incomplete", details={"missing": missing}
+            )
+        sources = raw["derived_from"]
+        if not isinstance(sources, list) or not sources:
+            raise ValidationError(
+                "An enrichment edge must name the sources it was derived from",
+                details={"hint": "Without them the privacy boundary cannot be decided"},
+            )
+        source, target = str(raw["source"]).strip(), str(raw["target"]).strip()
+        relation = str(raw["relation"]).strip()
+        if not source or not target or not relation:
+            raise ValidationError("source, target and relation cannot be empty")
+        if source == target:
+            raise ValidationError(
+                "An enrichment edge cannot point a node at itself",
+                details={"node": source},
+            )
+        return cls(
+            source=source,
+            target=target,
+            relation=relation,
+            derived_from=tuple(str(item) for item in sources),
+            model=str(raw["model"]).strip() or "unknown",
+            created_at=str(raw.get("created_at") or utc_now()),
+            note=str(raw.get("note") or ""),
+        )
 
 
 def _code_root(raw: dict[str, Any]) -> str | None:
@@ -475,9 +663,14 @@ class VaultConfig:
     #: An explicitly empty list is honoured as a deliberate "ignore nothing".
     ignore: tuple[str, ...] = DEFAULT_IGNORE_PATTERNS
     #: Where `code_sources` paths resolve. Absent means "discover it": walk up
-    #: from the vault for a `.git` directory, since a vault at `repo/docs/brain`
+    #: from the vault for a `.git` directory, since a vault at `repo/.brainkit`
     #: wants repo-relative paths and nothing else in the layout says so.
     code_root: str | None = None
+    #: Most files `bk code build` will scan before refusing. Not a performance
+    #: knob -- a backstop against the code root resolving to something far
+    #: larger than a project, which is how one vault came to index 55,295 files
+    #: from every unrelated repository on the machine.
+    code_scan_limit: int = DEFAULT_CODE_SCAN_LIMIT
     version: int = 3
 
     @classmethod
@@ -550,6 +743,7 @@ class VaultConfig:
             novelty=NoveltyPolicy.from_dict(raw["novelty"]),
             ignore=_ignore_patterns(raw),
             code_root=_code_root(raw),
+            code_scan_limit=_code_scan_limit(raw),
             integrations={
                 name: IntegrationPolicy.from_dict(name, value)
                 for name, value in raw_integrations.items()
@@ -580,6 +774,11 @@ class VaultConfig:
             "novelty": self.novelty.to_dict(),
             "ignore": list(self.ignore),
             **({"code_root": self.code_root} if self.code_root is not None else {}),
+            **(
+                {"code_scan_limit": self.code_scan_limit}
+                if self.code_scan_limit != DEFAULT_CODE_SCAN_LIMIT
+                else {}
+            ),
             "integrations": {
                 name: policy.to_dict()
                 for name, policy in sorted(self.integrations.items())
