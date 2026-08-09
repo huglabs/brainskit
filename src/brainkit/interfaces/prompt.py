@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import os
 import select as _select
+import shlex
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import IO, Any, Generic, TypeVar
 
@@ -310,10 +311,13 @@ def select(
     selectable = [i for i, c in enumerate(choices) if c.enabled]
     if not selectable:
         raise ValueError("select() needs at least one enabled choice")
-    if not supports_interactive(stream=stream):
-        return _select_fallback(title, choices, default=default)
-
+    # Resolved before the branch so both paths start from the same row: the
+    # fallback used to take `default` verbatim, which off a terminal would
+    # index out of range or answer with a disabled choice.
     cursor = default if default in selectable else selectable[0]
+    if not supports_interactive(stream=stream):
+        return _select_fallback(title, choices, default=cursor)
+
     out = sys.stdout
     out.write(_question(title, hint, stream=stream) + "\n")
     drawn = 0
@@ -416,20 +420,65 @@ def multiselect(
     return [choices[i].value for i in picked]
 
 
+def shell_value(raw: str) -> str:
+    """What the operator *meant*, after the shell conventions they pasted.
+
+    A path reaches a prompt the way the operator obtained it, and the two
+    common ways both carry shell syntax: dragging a file into a terminal
+    escapes its spaces (`/a/b\\ c.pdf`), and tab-completion or a copied command
+    wraps it in quotes (`'/a/b c.pdf'`). Passing either through verbatim
+    produces a path that cannot exist -- brainkit answered a real drag-and-drop
+    with "No file at …" and echoed the filename with the quotes still in it,
+    which reads as brainkit failing rather than as one layer of quoting nobody
+    removed.
+
+    `shlex` already knows both conventions, so the rule is: if the value parses
+    to exactly **one** token, that token is what was meant. Anything that parses
+    to several is ordinary prose -- a search query, a title -- and is returned
+    untouched. Unbalanced quotes raise, and are likewise left alone rather than
+    guessed at.
+    """
+
+    value = raw.strip()
+    if not value:
+        return value
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    if len(tokens) == 1:
+        value = tokens[0]
+    return os.path.expanduser(value) if value.startswith("~") else value
+
+
 def text(
     title: str,
     default: str = "",
     *,
     validate: object = None,
+    normalize: Callable[[str], str] | None = shell_value,
     stream: IO[str] | None = None,
 ) -> str:
     """Ask for a line of text, re-asking until `validate` accepts it.
+
+    `normalize` runs **before** `validate`, which is the whole reason it is a
+    parameter here rather than something the caller applies to the result: a
+    quoted path validated raw fails the check that was meant to accept it, and
+    the operator is re-asked with no way to satisfy the prompt. Pass `None` for
+    a prompt that genuinely wants the bytes as typed.
 
     `validate` returns an error message for a bad value and `None` for a good
     one. Validating *here* rather than when the finished policy is assembled
     is the whole point: the old wizard checked its answers only in
     `VaultConfig.from_dict`, so a value rejected there took every other answer
     down with it.
+
+    An exhausted input stream ends the loop rather than re-entering it. EOF
+    means no further answer is coming, so a default the validator rejects can
+    never become acceptable: `bk search` with no argument asked for a query,
+    took Ctrl-D as the empty string, and printed "This one is required."
+    forever. Accepting the default is still right when it *does* validate,
+    which is what lets a here-doc drive a wizard by pressing Enter through it.
     """
 
     label = console.style(title, console.BOLD, stream=stream)
@@ -437,18 +486,23 @@ def text(
         console.style(f" [{default}]", console.MUTED, stream=stream) if default else ""
     )
     while True:
+        exhausted = False
         try:
             raw = input(f"{label}{suffix}: ").strip()
         except EOFError:
-            raw = ""
+            raw, exhausted = "", True
         except KeyboardInterrupt:
             raise Cancelled() from None
         value = raw or default
+        if normalize is not None:
+            value = normalize(value)
         if validate is None:
             return value
         problem = validate(value)  # type: ignore[operator]
         if not problem:
             return value
+        if exhausted:
+            raise Cancelled() from None
         print(console.style(str(problem), console.WARN, stream=stream))
 
 

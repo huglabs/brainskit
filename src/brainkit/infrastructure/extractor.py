@@ -50,6 +50,7 @@ import hashlib
 import importlib
 import importlib.util
 import os
+import stat
 import sys
 import tempfile
 from contextlib import redirect_stdout
@@ -296,8 +297,53 @@ def _parallel_allowed() -> bool:
     return _enable_parallel_workers()
 
 
+def _shim_owner() -> str:
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        return str(getuid())
+    return os.environ.get("USERNAME") or "user"
+
+
+def _private_directory(path: Path) -> Path | None:
+    """`path`, but only if it is a real directory this user alone can write.
+
+    `mkdir(mode=0o700)` does not chmod a directory that already exists, so the
+    permission bits are checked rather than assumed, and `lstat` is used so a
+    symlink pointing somewhere writable cannot pass as the directory itself.
+    """
+
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
+        return None
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None and info.st_uid != getuid():
+        return None
+    return path
+
+
 def _shim_root() -> Path | None:
-    package = Path(tempfile.gettempdir()) / f"brainkit-graphify-{_cache_format_marker()}"
+    """Where the generated `graphify` package lives, in a directory we own.
+
+    This path ends up on `sys.path` and spawned workers import from it, so
+    whoever can create the file decides what runs inside a build. The name is a
+    hash of the shipped tree and is therefore identical on every install, and
+    `gettempdir()` is world-writable `/tmp` on Linux -- so a bare shared path
+    could be pre-created by another local user and would then be trusted on
+    sight. Namespacing by uid and refusing a directory that is not 0700 and
+    ours means a planted shim is ignored; failing that check costs the worker
+    pool, never correctness (`_parallel_allowed` degrades to sequential).
+    """
+
+    home = _private_directory(
+        Path(tempfile.gettempdir()) / f"brainkit-graphify-{_shim_owner()}"
+    )
+    if home is None:
+        return None
+    package = home / _cache_format_marker()
     module = package / "graphify" / "__init__.py"
     if module.is_file():
         return package

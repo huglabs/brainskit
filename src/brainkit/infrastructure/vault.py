@@ -903,6 +903,7 @@ class FileVault:
             collection = {
                 "freshness": "pages",
                 "integration-state": "integrations",
+                "enrichment": "edges",
             }.get(name, "proposals")
             return {"version": 1, collection: {}}
         raw = json.loads(path.read_text(encoding="utf-8"))

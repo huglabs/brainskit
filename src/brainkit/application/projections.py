@@ -160,7 +160,9 @@ class Projections:
             "written": written,
         }
 
-    def graph_data(self, *, consumer: str = "human") -> dict[str, Any]:
+    def graph_data(
+        self, *, consumer: str = "human", enrichment: bool = False
+    ) -> dict[str, Any]:
         if not self.graph_port:
             raise BrainkitError("Graph adapter is not configured")
         _validate_consumer(consumer)
@@ -183,7 +185,7 @@ class Projections:
             privacy = _evidence_privacy(node, content, records, config)
             if _consumer_allows(consumer, privacy):
                 allowed.add(node_id)
-        return {
+        filtered = {
             **graph,
             "nodes": [node for node in graph["nodes"] if node["id"] in allowed],
             "edges": [
@@ -194,14 +196,44 @@ class Projections:
             "consumer": consumer,
             "redacted_nodes": len(graph["nodes"]) - len(allowed),
         }
+        if not enrichment:
+            return filtered
+        # This is the "joined at read time" half of `application/enrichment.py`:
+        # model-inferred edges are never written into `graph/graph.json`, which
+        # `bk graph` rewrites from the wiki, so the only place they can appear
+        # is here. Off by default and named by the caller, because an inferred
+        # edge is a weaker claim than a derived one and nothing should start
+        # emitting them because a dependency grew a feature.
+        #
+        # Deliberately after the filter above: `merge_into` keeps only edges
+        # whose *both* endpoints survived it, so an inferred edge cannot be the
+        # thing that reintroduces a node this consumer was not allowed to see.
+        from brainkit.application.enrichment import Enrichment
+
+        return Enrichment(self.vault).merge_into(filtered, consumer=consumer)
 
     def export(
-        self, target: str, *, consumer: str = DEFAULT_EXPORT_CONSUMER
+        self,
+        target: str,
+        *,
+        consumer: str = DEFAULT_EXPORT_CONSUMER,
+        enrichment: bool = False,
     ) -> dict[str, Any]:
         if not self.graph_port:
             raise BrainkitError("Graph adapter is not configured")
         _validate_consumer(consumer)
         if target in INTEGRATION_TARGETS:
+            # An integration's contents follow its own policy, and enrichment
+            # is not part of one. Refuse rather than quietly ignore the flag:
+            # silently dropping it would read as "these edges were included".
+            if enrichment:
+                raise ValidationError(
+                    "Integration exports do not carry enrichment",
+                    details={
+                        "target": target,
+                        "hint": "Export a file target, or read bk enrich list",
+                    },
+                )
             # An integration owns its boundary through its own policy. Refuse a
             # different consumer instead of silently widening or narrowing it.
             if consumer != DEFAULT_EXPORT_CONSUMER:
@@ -220,11 +252,14 @@ class Projections:
         suffix = EXPORT_SUFFIXES.get(target)
         if suffix is None:
             raise ValidationError("Unsupported export target", details={"target": target})
-        graph = self.graph_data(consumer=consumer)
+        graph = self.graph_data(consumer=consumer, enrichment=enrichment)
         payload = self.graph_port.export(graph, target)
         path = f"output/export-{target}.{suffix}"
         self.vault.write_generated(path, payload)
-        return {"target": target, "path": path, "consumer": consumer}
+        result = {"target": target, "path": path, "consumer": consumer}
+        if enrichment:
+            result["enrichment_edges"] = graph.get("enrichment_edges", 0)
+        return result
 
     def integration_configure(
         self,

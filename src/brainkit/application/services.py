@@ -314,10 +314,16 @@ class BrainkitService:
         return self.projections.graph_data(consumer=consumer)
 
     def export(
-        self, target: str, *, consumer: str = DEFAULT_EXPORT_CONSUMER
+        self,
+        target: str,
+        *,
+        consumer: str = DEFAULT_EXPORT_CONSUMER,
+        enrichment: bool = False,
     ) -> dict[str, Any]:
         """Write the graph to a target, carrying the boundary. See `Projections`."""
-        return self.projections.export(target, consumer=consumer)
+        return self.projections.export(
+            target, consumer=consumer, enrichment=enrichment
+        )
 
     def integration_configure(
         self,

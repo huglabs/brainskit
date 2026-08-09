@@ -135,7 +135,9 @@ class CodeGraph:
                     "hint": "Extract with --code-only; prose belongs in the wiki",
                 },
             )
-        return self._write(nodes, edges, dropped, survey=survey)
+        return self._write(
+            nodes, edges, dropped, survey=survey, scoped=paths is not None
+        )
 
     def survey(self, paths: list[Path] | None = None) -> ScanSurvey | None:
         """What a build would cover, or None when the extractor cannot say.
@@ -342,6 +344,7 @@ class CodeGraph:
         dropped: int,
         *,
         survey: ScanSurvey | None = None,
+        scoped: bool = False,
     ) -> dict[str, Any]:
         # Hashed at import, compared at status. This is the artefact's input
         # set, and the only reason the graph can ever be called stale.
@@ -366,8 +369,9 @@ class CodeGraph:
         # a complete one are indistinguishable the moment the build output
         # scrolls away -- which is how a two-node graph of a four-file
         # repository came to be reported as `fresh`.
-        if survey is not None:
-            graph["coverage"] = survey.to_dict()
+        coverage = self._coverage(survey, scoped=scoped)
+        if coverage is not None:
+            graph["coverage"] = coverage
         self.vault.write_generated(
             CODE_PROJECTION, json.dumps(graph, indent=2, ensure_ascii=False) + "\n"
         )
@@ -382,9 +386,60 @@ class CodeGraph:
         if survey is not None and survey.missing:
             result["missing_grammars"] = [g.to_dict() for g in survey.missing]
             result["unreachable_files"] = survey.unreachable_files
-        if survey is not None:
+        # Only for a whole-root build. `files` is the *merged* graph's input
+        # set, so on a scoped build the numerator and the denominator describe
+        # different things -- a one-file scope against a thousand-file graph
+        # makes the gap negative and the check silently unreachable, which is
+        # worse than not offering it.
+        if survey is not None and not scoped:
             result.update(self._unexplained(survey, covered=len(files)))
         return result
+
+    def _coverage(
+        self, survey: ScanSurvey | None, *, scoped: bool
+    ) -> dict[str, Any] | None:
+        """What this graph is blind to, as recorded in the artefact.
+
+        A scoped build surveyed only its scope, so its survey cannot describe
+        the graph that scope was merged into. Writing it whole recorded
+        `files: 1` and an empty `grammars_missing` over a thousand-file graph,
+        and `staleness` then called that graph `fresh` -- the precise answer
+        `partial` exists to prevent, reached by rebuilding a single file.
+
+        So a scoped build carries the stored coverage forward and unions in
+        anything its own scope newly found missing. Erring towards `partial` is
+        deliberate: a grammar installed since the last whole-root build keeps
+        being reported until one is run, which is a prompt to rebuild rather
+        than a claim of completeness nobody measured.
+        """
+
+        if survey is None:
+            return self._stored_coverage() if scoped else None
+        fresh = survey.to_dict()
+        if not scoped:
+            return fresh
+        previous = self._stored_coverage() or {}
+        by_distribution: dict[str, Any] = {
+            str(entry.get("distribution", "")): entry
+            for entry in (previous.get("grammars_missing") or [])
+            if isinstance(entry, dict)
+        }
+        for entry in fresh["grammars_missing"]:
+            by_distribution.setdefault(str(entry.get("distribution", "")), entry)
+        missing = [by_distribution[name] for name in sorted(by_distribution)]
+        return {
+            **previous,
+            "root": fresh["root"],
+            "grammars_missing": missing,
+            "unreachable_files": sum(int(e.get("files") or 0) for e in missing),
+        }
+
+    def _stored_coverage(self) -> dict[str, Any] | None:
+        """The coverage the last build recorded, or None if there is none."""
+
+        graph = self._maybe_read()
+        coverage = graph.get("coverage") if isinstance(graph, dict) else None
+        return coverage if isinstance(coverage, dict) else None
 
     @staticmethod
     def _unexplained(survey: ScanSurvey, *, covered: int) -> dict[str, Any]:

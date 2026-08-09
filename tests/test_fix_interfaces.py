@@ -108,7 +108,17 @@ class CliExportConsumerTest(unittest.TestCase):
         name, args, kwargs = self.service.calls[-1]
         self.assertEqual(name, "export")
         self.assertEqual(args, ("json",))
-        self.assertEqual(kwargs, {"consumer": "local"})
+        # By key rather than by whole dict: this test is about the boundary,
+        # and pinning every kwarg makes any unrelated flag look like a defect.
+        self.assertEqual(kwargs["consumer"], "local")
+
+    def test_export_omits_enrichment_unless_it_is_asked_for(self) -> None:
+        # Model-inferred edges are a weaker claim than derived ones, so the
+        # default has to stay off wherever the graph leaves the vault.
+        self._run(["--json", "export", "--target", "json"])
+        self.assertFalse(self.service.calls[-1][2]["enrichment"])
+        self._run(["--json", "export", "--target", "json", "--enrichment"])
+        self.assertTrue(self.service.calls[-1][2]["enrichment"])
 
     def test_export_forwards_explicit_consumer(self) -> None:
         for consumer in ("human", "local", "cloud"):
@@ -116,7 +126,7 @@ class CliExportConsumerTest(unittest.TestCase):
                 self._run(
                     ["--json", "export", "--target", "graphml", "--consumer", consumer]
                 )
-                self.assertEqual(self.service.calls[-1][2], {"consumer": consumer})
+                self.assertEqual(self.service.calls[-1][2]["consumer"], consumer)
 
     def test_export_rejects_an_unknown_consumer(self) -> None:
         with redirect_stderr(io.StringIO()):

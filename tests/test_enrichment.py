@@ -225,6 +225,73 @@ class TheProjectionStaysDerivedTest(EnrichmentTestCase):
         self.assertIn("model", provenances)
 
 
+class ReadTimeJoinTest(EnrichmentTestCase):
+    """The join has to be reachable, and off unless it is asked for.
+
+    `merge_into` was correct, tested, and called by nothing outside the tests
+    — so every documented consumer of "joined at read time" got a graph with
+    no enrichment in it, and no way to ask for one.
+    """
+
+    def test_graph_data_omits_enrichment_by_default(self) -> None:
+        self.service.enrich_apply({"edges": [self._edge(relation="argued_edge")]})
+        data = self.service.projections.graph_data(consumer="human")
+        self.assertNotIn("enrichment_edges", data)
+        self.assertNotIn(
+            "argued_edge", {str(edge.get("type")) for edge in data["edges"]}
+        )
+
+    def test_graph_data_joins_enrichment_when_asked(self) -> None:
+        self.service.enrich_apply({"edges": [self._edge(relation="argued_edge")]})
+        data = self.service.projections.graph_data(
+            consumer="human", enrichment=True
+        )
+        self.assertEqual(data["enrichment_edges"], 1)
+        self.assertIn("argued_edge", {str(edge.get("type")) for edge in data["edges"]})
+
+    def test_export_carries_the_flag_through_to_the_written_file(self) -> None:
+        self.service.enrich_apply({"edges": [self._edge(relation="argued_edge")]})
+
+        plain = self.service.export("json", consumer="human")
+        self.assertNotIn("enrichment_edges", plain)
+        self.assertNotIn("argued_edge", (self.vault.root / plain["path"]).read_text())
+
+        joined = self.service.export("json", consumer="human", enrichment=True)
+        self.assertEqual(joined["enrichment_edges"], 1)
+        self.assertIn("argued_edge", (self.vault.root / joined["path"]).read_text())
+
+    def test_an_exported_edge_still_answers_to_the_consumer(self) -> None:
+        """The flag asks for enrichment; it does not widen the boundary.
+
+        This edge spans a `never-ingest` endpoint, so `local` drops it — and
+        the export is the path where getting that wrong would write restricted
+        evidence to a file on disk.
+        """
+
+        self.service.enrich_apply({"edges": [self._edge(relation="argued_edge")]})
+        result = self.service.export("json", consumer="local", enrichment=True)
+        self.assertEqual(result["enrichment_edges"], 0)
+        self.assertNotIn("argued_edge", (self.vault.root / result["path"]).read_text())
+
+    def test_an_integration_export_refuses_the_flag(self) -> None:
+        # Silently dropping it would read as "these edges were included".
+        with self.assertRaises(ValidationError):
+            self.service.export("obsidian", enrichment=True)
+
+    def test_the_cli_exposes_the_flag(self) -> None:
+        # Wiring, not logic: a parameter no command can reach is the shape of
+        # bug this class exists to catch.
+        from brainkit.interfaces import cli
+
+        args = cli.build_parser().parse_args(
+            ["export", "--target", "json", "--enrichment"]
+        )
+        self.assertTrue(args.enrichment)
+        self.assertFalse(
+            cli.build_parser().parse_args(["export", "--target", "json"]).enrichment
+        )
+
+
 class LintAndForgetTest(EnrichmentTestCase):
     def test_lint_reports_an_edge_whose_evidence_was_forgotten(self) -> None:
         self.service.enrich_apply({"edges": [self._edge()]})

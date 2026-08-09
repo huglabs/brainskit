@@ -42,7 +42,7 @@ from brainkit.domain.model import (
     ValidationError,
     VaultConfig,
 )
-from brainkit.infrastructure import pyenv
+from brainkit.infrastructure import extractor, pyenv
 from brainkit.infrastructure.vault import (
     DERIVED_DIRECTORIES,
     GENERATED_DIRECTORIES,
@@ -399,9 +399,108 @@ class CoverageReportingTest(unittest.TestCase):
         # must not be reported as partial on that account alone.
         self.assertEqual(self._store(None).staleness()["state"], "fresh")
 
+    def test_a_scoped_build_does_not_overwrite_the_graphs_coverage(self) -> None:
+        """Rebuilding one file must not relabel the whole graph as complete.
 
-if __name__ == "__main__":
-    unittest.main()
+        `build(paths)` merges its nodes into the stored graph but surveyed only
+        its scope, so writing that survey whole recorded `files: 1` and an
+        empty `grammars_missing` over a graph of a thousand — and `staleness`
+        then called `fresh` a graph still blind to a language. Measured on this
+        repository before the fix: a one-file survey against a 112-file graph.
+        """
+
+        graph = self._store(
+            {
+                "root": "/repo",
+                "files": 112,
+                "grammars_missing": [{"distribution": "tree-sitter-sql", "files": 3}],
+                "unreachable_files": 3,
+            }
+        )
+        scoped = ScanSurvey(root="/repo", files=1, grammars=(), present=1)
+
+        carried = graph._coverage(scoped, scoped=True)
+
+        assert carried is not None
+        self.assertEqual(carried["files"], 112)
+        self.assertEqual(
+            [entry["distribution"] for entry in carried["grammars_missing"]],
+            ["tree-sitter-sql"],
+        )
+        self.assertEqual(carried["unreachable_files"], 3)
+
+    def test_a_scoped_build_adds_a_grammar_its_own_scope_found_missing(self) -> None:
+        graph = self._store(
+            {
+                "root": "/repo",
+                "files": 112,
+                "grammars_missing": [{"distribution": "tree-sitter-sql", "files": 3}],
+                "unreachable_files": 3,
+            }
+        )
+        scoped = ScanSurvey(
+            root="/repo",
+            files=1,
+            grammars=(
+                GrammarNeed(
+                    module="tree_sitter_swift",
+                    distribution="tree-sitter-swift",
+                    installed=False,
+                    files=2,
+                ),
+            ),
+        )
+
+        carried = graph._coverage(scoped, scoped=True)
+
+        assert carried is not None
+        self.assertEqual(
+            [entry["distribution"] for entry in carried["grammars_missing"]],
+            ["tree-sitter-sql", "tree-sitter-swift"],
+        )
+        self.assertEqual(carried["unreachable_files"], 5)
+
+    def test_the_written_artefact_keeps_the_coverage_on_a_scoped_write(self) -> None:
+        # Through `_write`, because that is where the bug lived: `_coverage`
+        # can be perfectly correct and still never be consulted.
+        graph = self._store(
+            {
+                "root": "/repo",
+                "files": 112,
+                "grammars_missing": [{"distribution": "tree-sitter-sql", "files": 3}],
+                "unreachable_files": 3,
+            }
+        )
+        scoped = ScanSurvey(root="/repo", files=1, grammars=(), present=1)
+
+        graph._write(
+            {"n": {"id": "n", "path": "app.py", "kind": "function"}},
+            [],
+            0,
+            survey=scoped,
+            scoped=True,
+        )
+
+        written = json.loads(
+            (self.vault.root / "graph" / "code.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(written["coverage"]["files"], 112)
+        self.assertEqual(written["coverage"]["unreachable_files"], 3)
+        self.assertEqual(CodeGraph(self.vault).staleness()["state"], "partial")
+
+    def test_a_whole_root_build_replaces_the_coverage_outright(self) -> None:
+        # The other half of the rule: a full build measured everything, so its
+        # answer supersedes whatever a previous partial one recorded.
+        graph = self._store(
+            {"grammars_missing": [{"distribution": "tree-sitter-sql", "files": 3}]}
+        )
+        full = ScanSurvey(root="/repo", files=112, grammars=(), present=112)
+
+        fresh = graph._coverage(full, scoped=False)
+
+        assert fresh is not None
+        self.assertEqual(fresh["grammars_missing"], [])
+        self.assertEqual(fresh["files"], 112)
 
 
 class IgnoredScanRootTest(unittest.TestCase):
@@ -619,3 +718,44 @@ class PastedValueTest(unittest.TestCase):
         _, options = self.cli._ALTERNATIVES["capture"]
         by_file = next(o for o in options if o.flag is None)
         self.assertIs(by_file.validate, self.cli._looks_like_source)
+
+
+class ShimIsolationTest(unittest.TestCase):
+    """The generated `graphify` package must live where only this user writes.
+
+    Its path reaches `sys.path` and spawned workers import from it, so whoever
+    can create the file decides what runs inside a build. The name is a hash of
+    the shipped tree — identical on every install — and `gettempdir()` is
+    world-writable `/tmp` on Linux, so a bare shared path could be planted in
+    advance and would then be trusted on sight.
+    """
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+
+    def test_a_fresh_directory_is_created_private(self) -> None:
+        target = extractor._private_directory(self.root / "new")
+        assert target is not None
+        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_a_world_writable_directory_is_refused(self) -> None:
+        planted = self.root / "planted"
+        planted.mkdir(mode=0o777)
+        planted.chmod(0o777)
+        self.assertIsNone(extractor._private_directory(planted))
+
+    def test_a_symlink_is_not_mistaken_for_the_directory(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        link = self.root / "link"
+        link.symlink_to(elsewhere)
+        self.assertIsNone(extractor._private_directory(link))
+
+    def test_the_shim_path_is_namespaced_per_user(self) -> None:
+        # Two users on one machine must not resolve to the same directory, or
+        # the ownership check is the only thing standing between them.
+        root = extractor._shim_root()
+        assert root is not None
+        self.assertIn(f"brainkit-graphify-{extractor._shim_owner()}", str(root))

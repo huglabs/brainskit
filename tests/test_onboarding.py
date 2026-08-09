@@ -209,6 +209,10 @@ class FallbackTest(unittest.TestCase):
     wizard needs a pty to be exercised.
     """
 
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+
     def test_select_falls_back_to_the_default_on_empty_input(self) -> None:
         with patch("sys.stdin", StringIO("\n")), patch("sys.stdout", StringIO()):
             picked = prompt.select(
@@ -243,6 +247,66 @@ class FallbackTest(unittest.TestCase):
         ):
             self.assertEqual(prompt.text("q", "", validate=validate), "ok")
         self.assertIsNone(next(problems))
+
+    def test_text_gives_up_when_the_input_stream_ends(self) -> None:
+        """EOF cannot become a valid answer, so re-asking loops forever.
+
+        `bk search` with no argument asked for a query, took Ctrl-D as the
+        empty string, failed the required-value check and asked again --
+        printing "This one is required." until the process was killed. The
+        fix is not to accept a rejected default but to stop asking.
+        """
+
+        def eof(_: str) -> str:
+            raise EOFError
+
+        with patch("builtins.input", eof), patch("sys.stdout", StringIO()):
+            with self.assertRaises(prompt.Cancelled):
+                prompt.text("q", "", validate=lambda value: value or "required")
+
+    def test_text_still_accepts_a_default_that_validates_at_eof(self) -> None:
+        # What a here-doc pressing Enter through a wizard relies on: the stream
+        # ending is only fatal when the answer it leaves behind is unusable.
+        with patch("builtins.input", self._raise_eof), patch("sys.stdout", StringIO()):
+            self.assertEqual(
+                prompt.text("q", "fallback", validate=lambda _: None), "fallback"
+            )
+
+    def test_text_normalises_before_it_validates(self) -> None:
+        """The ordering is the bug, not the normalisation.
+
+        Reported live: a PDF dragged into the terminal arrived quoted, and
+        `capture`'s validator ran on the raw string. It rejected a path that
+        exists -- "No file at '…'", quotes included -- and re-asked, with no
+        input that could ever satisfy it, because unquoting was applied to the
+        *return* value of a call that never returned.
+        """
+
+        target = Path(self._temp.name) / "Vant · relatório de negócio.pdf"
+        target.write_text("x")
+        seen: list[str] = []
+
+        def validate(value: str) -> str | None:
+            seen.append(value)
+            return None if Path(value).is_file() else "no such file"
+
+        with patch("builtins.input", lambda _: f"'{target}'"), patch(
+            "sys.stdout", StringIO()
+        ):
+            self.assertEqual(prompt.text("value", "", validate=validate), str(target))
+        self.assertEqual(seen, [str(target)])
+
+    @staticmethod
+    def _raise_eof(_: str) -> str:
+        raise EOFError
+
+    def test_select_falls_back_to_an_enabled_row(self) -> None:
+        # Off a terminal the fallback took `default` verbatim, so an index that
+        # is out of range or disabled answered with the wrong choice -- or
+        # raised IndexError inside a prompt.
+        choices = [Choice("a", "A", enabled=False), Choice("b", "B")]
+        with patch("builtins.input", self._raise_eof), patch("sys.stdout", StringIO()):
+            self.assertEqual(prompt.select("q", choices, stream=StringIO()), "b")
 
     def test_interactive_is_refused_when_stdout_is_not_a_terminal(self) -> None:
         self.assertFalse(prompt.supports_interactive(stream=StringIO()))

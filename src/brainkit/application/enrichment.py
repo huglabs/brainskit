@@ -14,7 +14,12 @@ existing invariants rather than from taste:
 - **It never enters `graph/graph.json`.** That file is a projection: `bk graph`
   rewrites it from the wiki every time, so anything written there is destroyed
   on the next build. Enrichment lives in `.brain/enrichment.json` and is joined
-  at read time, opt-in.
+  at read time by `Projections.graph_data(enrichment=True)` — reachable as
+  `bk export --enrichment` and `bk enrich list`, and off everywhere else. The
+  opt-in is the point: an inferred edge is a weaker claim than a derived one,
+  so a caller has to ask for it rather than receive it because this module
+  exists. Integration exports refuse the flag outright; what they carry is
+  their own policy's business.
 - **Every edge names the sources it was derived from.** The privacy filter
   decides by the branch a *source record* lives in, so an edge with nothing
   behind it is unclassifiable — and filtering deliberately runs after graph

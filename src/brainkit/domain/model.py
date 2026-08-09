@@ -209,7 +209,7 @@ def _code_scan_limit(raw: dict[str, Any]) -> int:
             "code_scan_limit must be positive",
             details={"code_scan_limit": value, "hint": "Omit the key for the default"},
         )
-    return value
+    return int(value)
 
 
 @dataclass(frozen=True, slots=True)

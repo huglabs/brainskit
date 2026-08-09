@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import os
 import re
 import shlex
 import subprocess
@@ -283,6 +282,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Privacy boundary written into the export; defaults to local, "
             "which excludes never-ingest branches"
         ),
+    )
+    export.add_argument(
+        "--enrichment",
+        action="store_true",
+        help="Also emit model-inferred edges, each marked provenance: model",
     )
 
     ingest = commands.add_parser("ingest", help="Run the configured ingest judgment")
@@ -645,7 +649,10 @@ def _browse_commands(parser: argparse.ArgumentParser) -> int:
         # time, and it must not differ from what the browser just showed them.
         print(_subcommand_help(parser, chosen))
         outcome = _offer_to_run(parser, chosen)
-        if outcome is _BACK:
+        # Narrowed on the type, not on identity with `_BACK`: an exit code is
+        # an int and the sentinel deliberately is not, so this cannot be
+        # confused with returning 0.
+        if not isinstance(outcome, int):
             continue
         return outcome
 
@@ -655,7 +662,9 @@ def _browse_commands(parser: argparse.ArgumentParser) -> int:
 _BACK = object()
 
 
-def _offer_to_run(parser: argparse.ArgumentParser, command: str) -> Any:
+def _offer_to_run(
+    parser: argparse.ArgumentParser, command: str
+) -> int | object:
     """Let the browser finish the job it just helped someone find.
 
     The browser used to end at `--help` and exit. That is a dead end in the
@@ -776,35 +785,11 @@ class _Needed(NamedTuple):
 
 
 
-def _typed_value(raw: str) -> str:
-    """What the operator *meant*, after the shell conventions they pasted.
-
-    A path reaches this prompt the way the operator obtained it, and the two
-    common ways both carry shell syntax: dragging a file into a terminal
-    escapes its spaces (`/a/b\\ c.pdf`), and tab-completion or a copied
-    command wraps it in quotes (`'/a/b c.pdf'`). Passing either through
-    verbatim produces a path that cannot exist -- brainkit answered a real
-    drag-and-drop with "Capture source is not a file" and echoed a filename
-    with the quotes still in it, which reads as brainkit failing rather than
-    as one layer of quoting nobody removed.
-
-    `shlex` already knows both conventions, so the rule is: if the value parses
-    to exactly **one** token, that token is what was meant. Anything that
-    parses to several is ordinary prose -- a search query, a title -- and is
-    returned untouched. Unbalanced quotes raise, and are likewise left alone
-    rather than guessed at.
-    """
-
-    value = raw.strip()
-    if not value:
-        return value
-    try:
-        tokens = shlex.split(value)
-    except ValueError:
-        return value
-    if len(tokens) == 1:
-        value = tokens[0]
-    return os.path.expanduser(value) if value.startswith("~") else value
+#: Lives in `prompt` so it can run *before* a prompt's validator rather than on
+#: its result -- the ordering is what makes a quoted path pass the check that
+#: exists to accept it. Re-exported under the old name because this is where
+#: the convention is documented for the CLI's own callers.
+_typed_value = prompt.shell_value
 
 
 def _looks_like_source(value: str) -> str | None:
@@ -883,22 +868,23 @@ def requirements(parser: argparse.ArgumentParser, path: Sequence[str]) -> list[_
     `--all`), and prompting for a path would hide them.
     """
 
-    current: argparse.ArgumentParser | None = parser
+    current = parser
     for token in path:
-        action = _subparsers_of(current) if current else None
-        if action is None or token not in action.choices:
+        subparsers = _subparsers_of(current)
+        if subparsers is None or token not in subparsers.choices:
             return []
-        current = action.choices[token]
-    if current is None or _subparsers_of(current) is not None:
+        current = subparsers.choices[token]
+    if _subparsers_of(current) is not None:
         return []
 
     needed = []
     for action in current._actions:
         if action.dest in ("help", "command"):
             continue
-        required = action.required if action.option_strings else action.nargs not in (
-            "?",
-            "*",
+        required = (
+            action.required
+            if action.option_strings
+            else action.nargs not in ("?", "*")
         )
         if not required:
             continue
@@ -915,7 +901,7 @@ def requirements(parser: argparse.ArgumentParser, path: Sequence[str]) -> list[_
 
 def _subparsers_of(
     parser: argparse.ArgumentParser,
-) -> argparse._SubParsersAction | None:
+) -> argparse._SubParsersAction[argparse.ArgumentParser] | None:
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
             return action
@@ -939,10 +925,13 @@ def _ask_for(needed: Sequence[_Needed], command: str) -> list[str] | None:
             )
             if not picked.takes_value:
                 return [picked.flag] if picked.flag else []
-            value = _typed_value(
-                prompt.text(
-                    picked.flag or "value", "", validate=picked.validate or _non_empty
-                )
+            # Unquoting happens inside `text`, before the validator runs. Doing
+            # it to the *return* value -- which is what this used to do -- meant
+            # a pasted `'/a/b c.pdf'` was checked with its quotes still on, so
+            # `_looks_like_source` rejected a path that exists and re-asked
+            # forever.
+            value = prompt.text(
+                picked.flag or "value", "", validate=picked.validate or _non_empty
             )
         except prompt.Cancelled:
             return None
@@ -953,13 +942,13 @@ def _ask_for(needed: Sequence[_Needed], command: str) -> list[str] | None:
             if item.choices:
                 value = str(
                     prompt.select(
-                        f"{label}{console.DASH and ''}",
+                        label,
                         [prompt.Choice(c, c) for c in item.choices],
-                        hint=item.help or None,
+                        hint=item.help or "",
                     )
                 )
             else:
-                value = _typed_value(prompt.text(label, "", validate=_non_empty))
+                value = prompt.text(label, "", validate=_non_empty)
         except prompt.Cancelled:
             return None
         if item.flag:
@@ -974,10 +963,10 @@ def _non_empty(value: str) -> str | None:
 
 
 def _subcommand_help(parser: argparse.ArgumentParser, name: str) -> str:
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction) and name in action.choices:
-            return action.choices[name].format_help().rstrip()
-    return ""
+    subparsers = _subparsers_of(parser)
+    if subparsers is None or name not in subparsers.choices:
+        return ""
+    return subparsers.choices[name].format_help().rstrip()
 
 
 def _mistyped_command(
@@ -1100,11 +1089,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         wrapped = BrainkitError(str(exc))
         _emit_error(wrapped, json_mode=args.json)
         return 2
-    except prompt.Cancelled:
+    except prompt.Cancelled as exc:
         # Dismissing a prompt is the operator declining, not the tool failing:
         # same exit status as the interrupt it stands in for, and no error
-        # envelope claiming something went wrong.
-        _emit_error(BrainkitError("Cancelled — nothing was written"), json_mode=args.json)
+        # envelope claiming something went wrong. A `Cancelled` raised *with* a
+        # reason keeps it -- `bk init` inside another vault explains the nesting
+        # rule, and swallowing that left "Cancelled" as the entire answer.
+        reason = str(exc) or "Cancelled — nothing was written"
+        _emit_error(BrainkitError(reason), json_mode=args.json)
         return 130
     except KeyboardInterrupt:
         _emit_error(BrainkitError("Interrupted"), json_mode=args.json)
@@ -1261,7 +1253,11 @@ def _dispatch(args: argparse.Namespace) -> Any:
             against = _read_json(args.graph) if args.graph else None
             return service.code_diff(against, consumer=args.consumer)
     if args.command == "export":
-        return service.export(args.target, consumer=args.consumer or "local")
+        return service.export(
+            args.target,
+            consumer=args.consumer or "local",
+            enrichment=args.enrichment,
+        )
     if args.command == "ingest":
         return service.ingest(
             args.item,
@@ -1741,7 +1737,9 @@ def _prune_stale_hook_entries(
         kept = []
         for item in entry["hooks"]:
             command = item.get("command") if isinstance(item, dict) else None
-            if _is_stale_hook_command(command, template, current):
+            if isinstance(command, str) and _is_stale_hook_command(
+                command, template, current
+            ):
                 removed.append(command)
                 continue
             kept.append(item)
@@ -2123,7 +2121,9 @@ def _doctor(service: BrainkitService) -> dict[str, Any]:
 
 def _offer_missing_grammars(
     service: BrainkitService,
-    paths: list[Path] | None,
+    #: As argparse produced them. `code_survey` resolves them against the code
+    #: root, which is the only place that knows what they are relative to.
+    paths: list[str] | None,
     *,
     choice: bool | None,
     json_mode: bool,
