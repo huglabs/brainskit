@@ -1,0 +1,81 @@
+# The gate CONTRIBUTING asks every contributor to run by hand, run automatically.
+#
+# Order is deliberate. `lint` and `types` are fast and fail on the whole tree,
+# so they gate the slower jobs. `wheel` is last because it is the only job that
+# proves what actually ships: packaged prompt specs, output schemas and
+# templates cannot be verified from the source tree, where they exist
+# regardless of what the wheel contains.
+#
+# `ruff format --check` is intentionally absent. This project is lint-clean, not
+# format-clean; adding it here would fail every run on a pre-existing diff
+# rather than on anything a contributor did.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  check:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --all-extras --group dev
+      - run: uv run ruff check
+      - run: uv run mypy
+
+  tests:
+    # The interpreter this project pins is 3.13; `requires-python` allows 3.11+.
+    # An installed `bk` has to work on the floor of that range, not only on the
+    # version a maintainer happens to develop on.
+    name: tests (python ${{ matrix.python }})
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --python ${{ matrix.python }} --all-extras --group dev
+      - run: uv run --python ${{ matrix.python }} pytest -q
+
+  wheel:
+    name: shipped wheel
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: ./scripts/verify-wheel.sh
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a capability, or a change to an existing contract
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Anything that changes a contract — the apply gate, the privacy filter,
+        an error code, the vault layout, an integration lifecycle — is worth
+        agreeing on here before the code exists.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What you were trying to do, and where the engine got in the way. Please
+        describe the situation rather than the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: dropdown
+    id: invariant
+    attributes:
+      label: Does this touch one of the invariants?
+      description: >-
+        Listed in the README. Saying so is not a reason for refusal — it tells a
+        reviewer what has to be argued.
+      options:
+        - "No, it is additive"
+        - "Raw evidence is immutable"
+        - "Only the gate writes the wiki"
+        - "Every claim carries provenance"
+        - "Privacy is a declared boundary"
+        - "Mechanical stays LLM-free"
+        - "A write is one unit of work"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried or considered instead

@@ -1,16 +1,53 @@
+# PEP 639 — `license` as an SPDX expression and `license-files` as globs — is
+# understood from setuptools 77. An older backend would silently drop the
+# NOTICE the Apache licence requires the distribution to carry.
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "brainkit"
 version = "0.4.0"
-description = "Local-first, LLM-agnostic second-brain engine"
+description = "Local-first, LLM-agnostic second-brain engine: the compilation gate between raw evidence and knowledge an agent may act on"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "HugLabs" }]
+keywords = [
+  "knowledge-base",
+  "second-brain",
+  "provenance",
+  "retrieval",
+  "knowledge-graph",
+  "code-graph",
+  "mcp",
+  "agents",
+  "local-first",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Documentation",
+  "Topic :: Text Processing :: Indexing",
+  "Topic :: Utilities",
+]
 dependencies = ["jsonschema[format]>=4.20,<5"]
+
+[project.urls]
+Homepage = "https://github.com/huglabs/brainskit"
+Documentation = "https://github.com/huglabs/brainskit/blob/main/docs/README.md"
+Repository = "https://github.com/huglabs/brainskit"
+Issues = "https://github.com/huglabs/brainskit/issues"
+Changelog = "https://github.com/huglabs/brainskit/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 convert = ["markitdown"]
@@ -99,6 +136,7 @@ brainkit = [
   "templates/default/*.json",
   "templates/agents/*.md",
   "templates/agents/*.sh",
+  "templates/web/*.js",
 ]
 
 [tool.pytest.ini_options]
@@ -157,8 +195,14 @@ ignore = [
 #   S105 — the flagged constant is a redaction placeholder, not a credential.
 "src/brainkit/infrastructure/integrations.py" = ["S104", "S105", "S603", "S607", "S608"]
 # The flagged strings are the literal key name "token", used to look up an
-# environment variable's name — never a value.
+# environment variable's name — never a value. The two subprocess calls carry
+# their reasoning inline, at the site.
 "src/brainkit/interfaces/cli.py" = ["S105"]
+#   S607 — one fixed argument vector with no shell, asking `git` where it runs
+#     hooks from. It must be the same `git` the operator's commit will use, so
+#     it is invoked by name on PATH; an absolute path would answer for a
+#     different install than the one that matters.
+"src/brainkit/application/health.py" = ["S607"]
 
 [tool.mypy]
 python_version = "3.11"

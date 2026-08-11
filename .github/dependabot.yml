@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Actions are the supply chain of the job that publishes to PyPI, so they are
+  # the pins most worth keeping current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+
+  # The core has one runtime dependency; almost everything here is the dev
+  # toolchain and the optional extras. Monthly keeps the noise proportional.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"
+    groups:
+      tree-sitter-grammars:
+        patterns: ["tree-sitter*"]
+      dev-tools:
+        patterns: ["ruff", "mypy", "pytest"]

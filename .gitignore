@@ -34,6 +34,9 @@ env/
 # covered by the .gitignore that `bk init` writes into the vault itself.
 work/
 outputs/
+# The comparison graph an external graphify run leaves behind: ~17 MB of
+# regenerated JSON/HTML, derived from this tree and never an input to it.
+graphify-out/
 
 # Agent scaffolding: worktrees nested in the repo would otherwise be staged as
 # broken gitlinks by `git add -A`. Only worktrees — .claude/settings.json and

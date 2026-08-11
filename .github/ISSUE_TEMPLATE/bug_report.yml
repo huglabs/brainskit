@@ -1,0 +1,67 @@
+name: Bug report
+description: Something the engine does that it should not, or refuses that it should not
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If this is a security issue, do not file it here — see
+        [SECURITY.md](https://github.com/huglabs/brainskit/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, and what it did instead of what you expected.
+      placeholder: |
+        `bk --vault ./v apply proposal.json --json` returned `conflict`, but the
+        page it names has never been written.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >-
+        The smallest sequence of commands that shows it, starting from
+        `bk init` where possible.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: >-
+        Paste the `--json` output if the command has it — `error.code` is the
+        fastest thing to triage from. Redact vault content freely; the code and
+        the shape are what matter.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: brainkit version
+      description: "`bk --version`, or the commit if you installed from a checkout"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Python and OS
+      placeholder: "Python 3.13 · macOS 15.5"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extras
+    attributes:
+      label: Anything relevant about the vault
+      description: >-
+        Extras installed (`code`, `integrations`, `convert`), whether the vault
+        is nested inside another project, which integrations are enabled, and
+        the output of `bk doctor` if the problem involves hooks or the write
+        gate.

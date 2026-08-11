@@ -276,11 +276,14 @@ Two process lessons from the repair round itself:
   worse than a failed upload. Tokens reach uv through `UV_PUBLISH_PASSWORD`
   rather than `-p`, keeping them out of the process arguments.
 - Git access and API access are different privileges on the same host. The
-  stored credential clones and fetches, yet `/api/v4/projects/...` answers
-  `insufficient_scope` under `PRIVATE-TOKEN`, `Bearer` and `JOB-TOKEN`.
-  Publishing to the GitLab PyPI registry therefore needs a separate token with
-  `write_package_registry`, plus the numeric project id the API would return —
-  a working `git clone` proves nothing about the package registry.
+  stored credential cloned and fetched, yet `/api/v4/projects/...` answered
+  `insufficient_scope` under `PRIVATE-TOKEN`, `Bearer` and `JOB-TOKEN` — so
+  publishing needed a second token and the numeric project id, and a working
+  `git clone` proved nothing about the package registry. The registry this was
+  learned against is no longer the target: releases now go to PyPI through
+  Trusted Publishing, which has no token at all (see `docs/development.md`).
+  The lesson survives the move — read access to a repository is not evidence of
+  publish access to anything.
 
 ## Agent workspace learnings (2026-08-02)
 
