@@ -64,7 +64,7 @@ integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.2,<4"]
 # against; a grammar is a parser, and a newer one changes the shape of the tree
 # the extractors walk.
 code = [
-  "tree-sitter>=0.23.0,<0.26",
+  "tree-sitter>=0.26.0,<0.27",
   "tree-sitter-python>=0.23,<0.26",
   "tree-sitter-javascript>=0.23,<0.26",
   "tree-sitter-typescript>=0.23,<0.25",
