@@ -10,25 +10,26 @@ from contextlib import redirect_stderr, redirect_stdout
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import ValidationError
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
-from brainkit.interfaces import cli, console
-from brainkit.interfaces.mcp import (
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import NotFoundError, ValidationError
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
+from brainskit.interfaces import cli, console, onboarding, prompt
+from brainskit.interfaces.mcp import (
     MCP_MAX_REQUEST_BYTES,
     MCP_PROTOCOL_VERSION,
-    BrainkitMcpHttpHandler,
-    BrainkitMcpHttpServer,
+    BrainskitMcpHttpHandler,
+    BrainskitMcpHttpServer,
     _safe_reason,
     _tool_definitions,
     run_stdio,
 )
-from brainkit.interfaces.web import build_server
+from brainskit.interfaces.web import build_server
 
 
 def policy() -> dict:
@@ -68,7 +69,7 @@ def policy() -> dict:
 
 
 class RecordingService:
-    """Stands in for BrainkitService so interface tests stay hermetic."""
+    """Stands in for BrainskitService so interface tests stay hermetic."""
 
     def __init__(self, failures: set[str] | None = None):
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
@@ -206,6 +207,186 @@ class CliSafetyNetTest(unittest.TestCase):
         self.assertEqual(code, 130)
 
 
+class CliWebNoBrowserFlagTest(unittest.TestCase):
+    """`--no-browser` must exist on both `web` and its `web serve` alias."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        FileVault.initialize(self.root, policy())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_the_flag_parses_on_both_the_alias_and_the_command_it_stands_in_for(
+        self,
+    ) -> None:
+        parser = cli.build_parser()
+        self.assertFalse(parser.parse_args(["web"]).no_browser)
+        self.assertTrue(parser.parse_args(["web", "--no-browser"]).no_browser)
+        self.assertTrue(
+            parser.parse_args(["web", "serve", "--no-browser"]).no_browser
+        )
+
+    def test_the_flag_reaches_run_web_as_open_browser_false(self) -> None:
+        with mock.patch("brainskit.interfaces.web.run_web") as run_web_mock:
+            code = cli.main(["--vault", str(self.root), "web", "--no-browser"])
+        self.assertEqual(code, 0)
+        run_web_mock.assert_called_once()
+        self.assertFalse(run_web_mock.call_args.kwargs["open_browser"])
+
+    def test_without_the_flag_open_browser_defaults_to_true(self) -> None:
+        with mock.patch("brainskit.interfaces.web.run_web") as run_web_mock:
+            cli.main(["--vault", str(self.root), "web"])
+        self.assertTrue(run_web_mock.call_args.kwargs["open_browser"])
+
+
+class CliWebNoVaultPromptTest(unittest.TestCase):
+    """`bk web` with no vault offers to run `bk init` instead of just erring.
+
+    A person clicking their way to `bk web` has no other way to discover
+    `bk init` short of reading the error; a script piping into it must never
+    block on a question nobody is there to answer.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.empty = Path(self.temporary.name) / "no-vault-here"
+        self.empty.mkdir()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_non_interactive_keeps_the_plain_refusal(self) -> None:
+        with (
+            mock.patch.object(prompt, "supports_interactive", return_value=False),
+            mock.patch.object(prompt, "confirm") as confirm_mock,
+        ):
+            code = cli.main(["--vault", str(self.empty), "web"])
+        self.assertEqual(code, 2)
+        confirm_mock.assert_not_called()
+        self.assertFalse((self.empty / ".brain" / "config.json").exists())
+
+    def test_json_mode_keeps_the_plain_refusal_even_if_a_tty_is_present(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(prompt, "supports_interactive", return_value=True),
+            mock.patch.object(prompt, "confirm") as confirm_mock,
+        ):
+            code = cli.main(["--json", "--vault", str(self.empty), "web"])
+        self.assertEqual(code, 2)
+        confirm_mock.assert_not_called()
+
+    def test_declining_the_prompt_falls_through_to_the_same_refusal(self) -> None:
+        with (
+            mock.patch.object(prompt, "supports_interactive", return_value=True),
+            mock.patch.object(prompt, "confirm", return_value=False) as confirm_mock,
+        ):
+            code = cli.main(["--vault", str(self.empty), "web"])
+        self.assertEqual(code, 2)
+        confirm_mock.assert_called_once()
+        self.assertFalse((self.empty / ".brain" / "config.json").exists())
+
+    def test_accepting_the_prompt_initializes_and_then_serves_the_vault(self) -> None:
+        outcome = onboarding.Outcome(policy=policy(), wire_agent=False, vault=self.empty)
+        with (
+            mock.patch.object(prompt, "supports_interactive", return_value=True),
+            mock.patch.object(prompt, "confirm", return_value=True),
+            mock.patch.object(cli, "_guided_init", return_value=outcome) as init_mock,
+            mock.patch("brainskit.interfaces.web.run_web") as run_web_mock,
+        ):
+            code = cli.main(["--vault", str(self.empty), "web", "--no-browser"])
+        self.assertEqual(code, 0)
+        init_mock.assert_called_once_with(self.empty.expanduser().resolve())
+        self.assertTrue((self.empty / ".brain" / "config.json").exists())
+        run_web_mock.assert_called_once()
+
+
+class CliEmitErrorHumanRenderingTest(unittest.TestCase):
+    """The non-JSON error path must read like prose, never like a JSON dump.
+
+    `json_mode=True` is the machine contract and must stay byte-for-byte the
+    same regardless of `details` shape -- that half of each test here is the
+    regression guard for `--json`, MCP, and every script that parses it.
+    """
+
+    def test_json_mode_output_is_unchanged_for_a_hint_bearing_error(self) -> None:
+        error = NotFoundError(
+            "No brainskit vault found",
+            details={"start": "/private/tmp/no-vault-test", "hint": "Pass --vault or run bk init"},
+        )
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli._emit_error(error, json_mode=True)
+        self.assertEqual(
+            out.getvalue(),
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "not_found",
+                        "message": "No brainskit vault found",
+                        "details": {
+                            "start": "/private/tmp/no-vault-test",
+                            "hint": "Pass --vault or run bk init",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+        )
+
+    def test_human_mode_hint_line_has_no_json_punctuation(self) -> None:
+        error = NotFoundError(
+            "No brainskit vault found",
+            details={"start": "/private/tmp/no-vault-test", "hint": "Pass --vault or run bk init"},
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cli._emit_error(error, json_mode=False)
+        rendered = err.getvalue()
+        self.assertIn("bk: No brainskit vault found", rendered)
+        self.assertIn("Pass --vault or run bk init", rendered)
+        # The hint line specifically -- not merely "somewhere in the output" --
+        # must carry none of json.dumps's punctuation.
+        hint_line = next(
+            line for line in rendered.splitlines() if "Pass --vault" in line
+        )
+        for char in ("{", "}", '"'):
+            self.assertNotIn(char, hint_line)
+
+    def test_human_mode_renders_a_list_of_conflicts_without_json_dumps(self) -> None:
+        error = ValidationError(
+            "Apply proposal rejected; no files were written",
+            details={
+                "failures": [
+                    {"path": "wiki/concepts/a.md", "code": "stale_page"},
+                    {"path": "wiki/concepts/b.md", "code": "missing_base_hash"},
+                ]
+            },
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cli._emit_error(error, json_mode=False)
+        rendered = err.getvalue()
+        self.assertNotIn("{", rendered)
+        self.assertNotIn("}", rendered)
+        self.assertNotIn('"', rendered)
+        self.assertIn("wiki/concepts/a.md", rendered)
+        self.assertIn("stale_page", rendered)
+        self.assertIn("wiki/concepts/b.md", rendered)
+        self.assertIn("missing_base_hash", rendered)
+
+    def test_human_mode_prints_nothing_extra_when_details_is_empty(self) -> None:
+        error = ValidationError("Unknown command")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cli._emit_error(error, json_mode=False)
+        self.assertEqual(err.getvalue().strip().splitlines(), ["bk: Unknown command"])
+
+
 class McpStdioSafetyNetTest(unittest.TestCase):
     def test_stdio_loop_survives_an_unexpected_exception(self) -> None:
         service = RecordingService(failures={"search"})
@@ -258,8 +439,8 @@ class McpHttpContractTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.service = RecordingService(failures={"search"})
-        self.server = BrainkitMcpHttpServer(
-            ("127.0.0.1", 0), BrainkitMcpHttpHandler
+        self.server = BrainskitMcpHttpServer(
+            ("127.0.0.1", 0), BrainskitMcpHttpHandler
         )
         self.server.service = self.service  # type: ignore[assignment]
         self.server.token = "test-secret"
@@ -530,7 +711,7 @@ class AgentInstallTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -546,7 +727,7 @@ class AgentInstallTest(unittest.TestCase):
         return (self.root / cli.INSTRUCTION_FILES[agent]).read_text(encoding="utf-8")
 
     def skill_path(self) -> Path:
-        return self.root / ".claude" / "skills" / "brainkit" / "SKILL.md"
+        return self.root / ".claude" / "skills" / "brainskit" / "SKILL.md"
 
     def test_a_vault_without_git_still_installs(self) -> None:
         result = self.install()
@@ -559,7 +740,7 @@ class AgentInstallTest(unittest.TestCase):
         content = self.skill_path().read_text(encoding="utf-8")
         self.assertNotIn("{{vault}}", content)
         self.assertIn(str(self.root), content)
-        self.assertTrue(content.startswith("---\nname: brainkit\n"))
+        self.assertTrue(content.startswith("---\nname: brainskit\n"))
 
     def test_the_instructions_describe_how_the_graph_is_formed(self) -> None:
         self.install()
@@ -641,7 +822,7 @@ class WebViewerBoundaryTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
         )
         self.service.reindex()
@@ -1162,7 +1343,7 @@ class GroupedHelpTests(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             code = cli.main(["--help"])
         self.assertEqual(0, code)
-        self.assertIn("brainkit", out.getvalue())
+        self.assertIn("brainskit", out.getvalue())
         self.assertIn("HugLabs", out.getvalue())
         self.assertIn("Vault & capture", out.getvalue())
         self.assertIn("Code graph", out.getvalue())

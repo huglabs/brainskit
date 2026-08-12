@@ -23,16 +23,16 @@ from typing import Any
 
 from test_projections import policy
 
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import (
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import (
     CODE_CITATION_RE,
     CodeSource,
     PageOperation,
     ValidationError,
 )
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
 
 
 def sha256(text: str) -> str:
@@ -163,7 +163,7 @@ class LifecycleTest(unittest.TestCase):
         # `code_root` discovery is built for.
         vault = FileVault.initialize(self.repo / "docs" / "brain", policy())
         self.vault = vault
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.service.reindex()

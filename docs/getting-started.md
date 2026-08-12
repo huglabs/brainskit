@@ -80,7 +80,7 @@ normal apply does not pay for a full rebuild.
 `$schema` URI. The gate supports the complete vocabulary implemented by
 `jsonschema` for that draft, including combinators, conditionals, formats,
 `$defs`, local `$ref`, `dependentRequired` and `unevaluatedProperties`, before
-applying brainkit's provenance, citation, link and reserved-field invariants.
+applying brainskit's provenance, citation, link and reserved-field invariants.
 
 Remote `$ref` retrieval is deliberately denied: a vault schema cannot cause an
 implicit network request or leak local policy data. Bundle referenced schemas

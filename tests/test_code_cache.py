@@ -13,9 +13,9 @@ inside the vendored code but a wiring choice one layer up, in
   than a wrong or partial graph;
 - the cache lands under the vault's own `.brain/`, never in the scanned
   repository or the process cwd; and
-- a brainkit vault's own `.brain/*.json` state files are never handed to the
+- a brainskit vault's own `.brain/*.json` state files are never handed to the
   extractor at all, so the upstream "please report the file(s) (#1666)"
-  warning about files brainkit excluded from the graph on purpose never
+  warning about files brainskit excluded from the graph on purpose never
   fires.
 
 `GraphifyExtractor.extract` is exercised directly (not through `CodeGraph` or
@@ -35,8 +35,8 @@ from typing import Any
 
 from test_projections import policy
 
-from brainkit.infrastructure.extractor import GraphifyExtractor, _cache_format_marker
-from brainkit.infrastructure.vault import FileVault
+from brainskit.infrastructure.extractor import GraphifyExtractor, _cache_format_marker
+from brainskit.infrastructure.vault import FileVault
 
 
 def _code_extra_installed() -> bool:
@@ -187,7 +187,7 @@ class ContainmentTest(CodeCacheFixture):
         import os
 
         cwd_before = Path.cwd()
-        os.chdir(self.temporary.name)  # somewhere that is neither the repo nor brainkit's own tree
+        os.chdir(self.temporary.name)  # somewhere that is neither the repo nor brainskit's own tree
         try:
             self.build(cache_root=self.vault.code_cache_dir)
         finally:
@@ -196,7 +196,7 @@ class ContainmentTest(CodeCacheFixture):
         self.assertTrue(self.vault.code_cache_dir.is_dir())
         self.assertTrue(any(self.vault.code_cache_dir.rglob("*.json")))
         # The vendored cache is free to write its own `graphify-out/` *inside*
-        # the directory brainkit handed it; what must never happen is one
+        # the directory brainskit handed it; what must never happen is one
         # appearing anywhere else — beside the user's source, at the repo
         # root, or in whatever the cwd happened to be.
         cache_dir = self.vault.code_cache_dir.resolve()
@@ -245,7 +245,7 @@ class VaultStateFilterTest(CodeCacheFixture):
         # `code_root()` is the repo, which contains the vault
         # (`docs/brain/.brain/*.json`) — the layout that used to trip
         # upstream's "please report the file(s) (#1666)" warning about files
-        # brainkit already excludes from the graph on purpose.
+        # brainskit already excludes from the graph on purpose.
         buffer = io.StringIO()
         with contextlib.redirect_stderr(buffer):
             result = self.build()
@@ -293,7 +293,7 @@ class StdoutIsolationTest(unittest.TestCase):
 
         stdout_buffer, stderr_buffer = io.StringIO(), io.StringIO()
         with unittest.mock.patch(
-            "brainkit.infrastructure.extractor._load",
+            "brainskit.infrastructure.extractor._load",
             return_value=(noisy_extract, collect_one),
         ):
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(

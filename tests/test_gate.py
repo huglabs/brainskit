@@ -8,13 +8,13 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from brainkit.application.gate import (
+from brainskit.application.gate import (
     DEFAULT_DENY_PREFIXES,
     GateDecision,
     check_write,
     load_gate_policy,
 )
-from brainkit.application.services import BrainkitService
+from brainskit.application.services import BrainskitService
 
 DECISION_KEYS = {"allowed", "path", "reason", "remediation", "rule"}
 
@@ -93,7 +93,7 @@ class GateMatchingTest(GateFixture):
         self.assertEqual(decision.path, "wiki/index.md")
 
     def test_backslash_is_read_as_a_separator(self) -> None:
-        # brainkit is POSIX-only, so a backslash is a stray Windows separator
+        # brainskit is POSIX-only, so a backslash is a stray Windows separator
         # rather than a filename character. Reading it as one over-denies at
         # worst; ignoring it would be a bypass.
         self.assertDenied("wiki\\index.md", "wiki/")
@@ -431,8 +431,8 @@ class _StubIndex:
 
 
 class GateServiceDelegationTest(GateFixture):
-    def service(self) -> BrainkitService:
-        return BrainkitService(_StubVault(self.root), _StubIndex())  # type: ignore[arg-type]
+    def service(self) -> BrainskitService:
+        return BrainskitService(_StubVault(self.root), _StubIndex())  # type: ignore[arg-type]
 
     def test_service_returns_the_decision_as_a_dict(self) -> None:
         payload = self.service().gate_check_write("wiki/index.md")

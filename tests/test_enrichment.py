@@ -23,17 +23,17 @@ from tempfile import TemporaryDirectory
 
 from test_projections import policy as _base_policy
 
-from brainkit.application.enrichment import Enrichment
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import (
+from brainskit.application.enrichment import Enrichment
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import (
     EnrichmentEdge,
     NotFoundError,
     PrivacyMode,
     ValidationError,
 )
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
 
 
 def policy() -> dict:
@@ -55,7 +55,7 @@ class EnrichmentTestCase(unittest.TestCase):
         self.vault = FileVault.initialize(
             Path(self._temp.name).resolve() / "vault", policy()
         )
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
         )
         self.open_hash = self._capture("A public note.", "open", "10-open")
@@ -281,7 +281,7 @@ class ReadTimeJoinTest(EnrichmentTestCase):
     def test_the_cli_exposes_the_flag(self) -> None:
         # Wiring, not logic: a parameter no command can reach is the shape of
         # bug this class exists to catch.
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         args = cli.build_parser().parse_args(
             ["export", "--target", "json", "--enrichment"]

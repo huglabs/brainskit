@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The same LOCOMO measurement, run against graphify instead of brainkit.
+"""The same LOCOMO measurement, run against graphify instead of brainskit.
 
 Published benchmark tables compare systems that each ran on their own harness,
-and the earlier comparison in this repo inherited that problem: brainkit scored
+and the earlier comparison in this repo inherited that problem: brainskit scored
 0.519 and graphify's published figure was 0.497, but the two numbers came from
 different question samples, different retrieval units and different scoring
 code, so the gap was uninterpretable. This runs both through *one* harness.
@@ -10,7 +10,7 @@ code, so the gap was uninterpretable. This runs both through *one* harness.
 Everything that can be held constant is:
 
 - **the same conversations and the same questions** — whichever subset is
-  selected here is re-scored for brainkit by `--brainkit` in the same process;
+  selected here is re-scored for brainskit by `--brainskit` in the same process;
 - **the same retrieval unit** — one document per dialogue turn, so a retrieved
   node maps to exactly one `dia_id` for both systems;
 - **the same scorer** — `run_locomo.score`, imported rather than reimplemented;
@@ -18,13 +18,13 @@ Everything that can be held constant is:
 
 What cannot be held constant, and must be read alongside any number:
 
-- **graphify needs an LLM to index prose; brainkit needs none.** That is a real
+- **graphify needs an LLM to index prose; brainskit needs none.** That is a real
   difference in kind, not a nuisance parameter, so it is reported as tokens and
   wall-clock rather than hidden. The backend is named in the output because the
   result depends on it: piloted with `qwen2.5:3b`, graphify extracted **two**
   distinct entities from 30 turns (both speaker names) and the graph was
   useless. A weak model does not measure graphify.
-- **graphify retrieves entities, brainkit retrieves turns.** Its `query` is a
+- **graphify retrieves entities, brainskit retrieves turns.** Its `query` is a
   BFS over an extracted graph, so one hit can carry a turn that keyword search
   would never rank. The `--budget` is set high and the list truncated to 10
   afterwards, which gives graphify the most generous reading of "top 10".
@@ -76,7 +76,7 @@ class SystemResult:
     recall_at_k: float = 0.0
     #: The best recall this system could reach with a *perfect* ranker over
     #: what it actually indexed. Separating this from `recall_at_k` is what
-    #: turns a horse race into a diagnosis: brainkit indexes every turn, so its
+    #: turns a horse race into a diagnosis: brainskit indexes every turn, so its
     #: ceiling is 1.0 and its score is purely ranking; graphify condenses turns
     #: into entities, so part of its score is decided before ranking begins.
     ceiling: float = 1.0
@@ -97,7 +97,7 @@ def corpus_dir(sample_id: str) -> Path:
 
 
 def write_turns(sample: dict) -> Path:
-    """One file per dialogue turn — the same unit the brainkit run indexes."""
+    """One file per dialogue turn — the same unit the brainskit run indexes."""
 
     target = corpus_dir(str(sample["sample_id"])) / "turns"
     target.mkdir(parents=True, exist_ok=True)
@@ -317,11 +317,11 @@ def main() -> int:
                    strict=True)),
     )
 
-    # Brainkit, re-scored on exactly these questions rather than reusing an
+    # Brainskit, re-scored on exactly these questions rather than reusing an
     # earlier figure computed over a different sample.
     import tempfile
 
-    brainkit_seconds = 0.0
+    brainskit_seconds = 0.0
     services = {}
     scratch = tempfile.TemporaryDirectory()
     for sample in samples:
@@ -330,12 +330,12 @@ def main() -> int:
             turns_of(sample["conversation"]),
             Path(scratch.name) / re.sub(r"\W", "_", str(sample["sample_id"])),
         )
-        brainkit_seconds += time.monotonic() - started
-    brainkit_result = evaluate(
-        "brainkit",
+        brainskit_seconds += time.monotonic() - started
+    brainskit_result = evaluate(
+        "brainskit",
         questions,
         lambda q: retrieved_ids(services[q.conversation], q.question, args.k),
-        brainkit_seconds,
+        brainskit_seconds,
         0,
         "none",
     )
@@ -345,7 +345,7 @@ def main() -> int:
         "conversations": len(samples),
         "k": args.k,
         "questions": len(questions),
-        "systems": [asdict(graphify_result), asdict(brainkit_result)],
+        "systems": [asdict(graphify_result), asdict(brainskit_result)],
     }
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -360,7 +360,7 @@ def main() -> int:
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for item in (graphify_result, brainkit_result):
+    for item in (graphify_result, brainskit_result):
         print(
             f"  {item.system:<11}{item.recall_at_k:>10.3f}{item.ceiling:>9.3f}"
             f"{item.ranking_efficiency:>10.3f}{item.hit_rate:>8.3f}{item.mrr:>7.3f}"
@@ -371,7 +371,7 @@ def main() -> int:
     print("  rank.eff = recall / ceiling, i.e. how well it ranks what it kept")
     print(f"  graphify left {graphify_result.unreachable_questions} question(s) with no evidence turn in its graph at all")
     if graphify_result.llm_input_tokens:
-        print(f"\n  graphify indexing consumed {graphify_result.llm_input_tokens:,} input tokens; brainkit consumed 0.")
+        print(f"\n  graphify indexing consumed {graphify_result.llm_input_tokens:,} input tokens; brainskit consumed 0.")
     print()
     return 0
 

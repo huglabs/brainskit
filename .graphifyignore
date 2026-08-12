@@ -1,0 +1,16 @@
+# Scopes `bk code build`'s scan to brainkit's own authored code.
+#
+# Neither directory is excluded from git — both are real, tracked, working
+# code — but neither is *brainkit's* code either, and both dominate the
+# code graph's hub/community/affected answers with noise once included:
+#
+# - infrastructure/codeanalysis/ is vendored, byte-identical to upstream
+#   (see its own NOTICE). It is analysis input, not analysis subject.
+# - templates/web/three.min.js is a single vendored third-party bundle —
+#   the single most-connected node in the graph before this file existed.
+#
+# Tests are deliberately NOT listed here: `tests/*.py` is brainkit's own
+# authored code, and "what tests exercise this symbol" is a real, useful
+# `bk code affected` answer, not noise.
+src/brainkit/infrastructure/codeanalysis/
+src/brainkit/templates/web/

@@ -69,7 +69,7 @@ anything.
 # 1. bump [project].version and add the CHANGELOG entry, then commit
 git commit -am 'Release 0.5.0'
 # 2. tag the exact commit the artifact will be built from
-git tag -a v0.5.0 -m 'brainkit 0.5.0'
+git tag -a v0.5.0 -m 'brainskit 0.5.0'
 # 3. push the commit and the tag together
 git push origin main --follow-tags
 ```
@@ -79,7 +79,7 @@ Maintainers configure the publisher once, at
 `huglabs/brainskit`, workflow `release.yml` and environment `pypi`.
 
 To rehearse the whole path without spending a version number, publish a
-pre-release (`0.5.0rc1`) — PyPI accepts it and `uv tool install brainkit` will
+pre-release (`0.5.0rc1`) — PyPI accepts it and `uv tool install brainskit` will
 not select it without `--prerelease allow`.
 
 ## Conventions
@@ -89,7 +89,7 @@ for — are recorded in [`AGENTS.md`](../AGENTS.md). Read it before changing the
 apply gate, the privacy filter or an integration lifecycle, and record any new
 defect class there.
 
-`src/brainkit/infrastructure/codeanalysis/` is vendored third-party source, kept
+`src/brainskit/infrastructure/codeanalysis/` is vendored third-party source, kept
 byte-identical to upstream so a re-vendor is a copy rather than a merge. It is
 excluded from ruff and mypy for that reason; the adapter that calls it is
 checked, which is where the boundary that matters actually is. Provenance is in

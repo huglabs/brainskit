@@ -18,7 +18,7 @@ import ast
 import unittest
 from pathlib import Path
 
-SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src" / "brainkit"
+SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src" / "brainskit"
 
 #: Byte-identical vendored third-party source. It is excluded from Ruff and
 #: mypy for the same reason it is excluded here: it was never written against
@@ -64,20 +64,20 @@ def _imports(path: Path, module: str) -> set[str]:
                 package = module.rsplit(".", node.level)[0] if "." in module else ""
                 target = f"{package}.{node.module}" if node.module else package
                 found.add(target.strip("."))
-            elif node.module and node.module.startswith("brainkit."):
-                found.add(node.module[len("brainkit.") :])
+            elif node.module and node.module.startswith("brainskit."):
+                found.add(node.module[len("brainskit.") :])
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("brainkit."):
-                    found.add(alias.name[len("brainkit.") :])
-    # `importlib.import_module("brainkit.…")` is an import too. The codegraph
+                if alias.name.startswith("brainskit."):
+                    found.add(alias.name[len("brainskit.") :])
+    # `importlib.import_module("brainskit.…")` is an import too. The codegraph
     # module uses one deliberately, and a static reader that ignored it would
     # report a layering violation that the exception list already covers as
     # clean -- an enforcement gap disguised as a pass.
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if node.value.startswith("brainkit.") and "codeanalysis" in node.value:
-                found.add(node.value[len("brainkit.") :])
+            if node.value.startswith("brainskit.") and "codeanalysis" in node.value:
+                found.add(node.value[len("brainskit.") :])
     return {name for name in found if name}
 
 
@@ -142,7 +142,7 @@ class LayeringTests(unittest.TestCase):
 
         for module in sorted(graph):
             walk(module, [])
-        self.assertEqual([], cycles, "import cycle(s) in brainkit")
+        self.assertEqual([], cycles, "import cycle(s) in brainskit")
 
 
 if __name__ == "__main__":

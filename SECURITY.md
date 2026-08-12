@@ -2,12 +2,12 @@
 
 ## Supported versions
 
-brainkit is pre-1.0. Security fixes land on the latest released version only;
+brainskit is pre-1.0. Security fixes land on the latest released version only;
 there are no maintained back-branches.
 
 | Version | Supported |
 |---|---|
-| latest release on [PyPI](https://pypi.org/project/brainkit/) | ✅ |
+| latest release on [PyPI](https://pypi.org/project/brainskit/) | ✅ |
 | anything older | ❌ |
 
 ## Reporting a vulnerability
@@ -28,7 +28,7 @@ published. Credit is given unless you ask otherwise.
 
 ## What is in scope
 
-brainkit runs on a workstation, owns no account system and holds no
+brainskit runs on a workstation, owns no account system and holds no
 credentials, so the interesting boundaries are narrow and specific:
 
 - **The privacy boundary.** Any path where evidence from a branch reaches a
@@ -51,12 +51,12 @@ credentials, so the interesting boundaries are narrow and specific:
 
 ## What is out of scope
 
-- The behaviour of the models you configure. brainkit gates and validates model
+- The behaviour of the models you configure. brainskit gates and validates model
   output; it does not claim a model cannot produce bad content.
 - Anything requiring an attacker who already has write access to the vault
   directory, `.brain/`, or the environment `bk` runs in.
 - Missing hardening on a deliberately unauthenticated loopback bind that the
   operator started.
-- Vulnerabilities in optional dependencies, unless brainkit's use of them is
+- Vulnerabilities in optional dependencies, unless brainskit's use of them is
   what makes the issue exploitable. Report those upstream; tell us too, and we
   will bump the pin.

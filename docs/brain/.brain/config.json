@@ -1,0 +1,138 @@
+{
+  "version": 3,
+  "wiki_language": "English",
+  "inbox_policy": {
+    "privacy": "local-only",
+    "filing": "approve-each"
+  },
+  "branches": {
+    "10-work": {
+      "privacy": "local-only",
+      "filing": "approve-each"
+    },
+    "20-knowledge": {
+      "privacy": "cloud",
+      "filing": "approve-each"
+    },
+    "30-product": {
+      "privacy": "local-only",
+      "filing": "approve-each"
+    },
+    "40-research": {
+      "privacy": "cloud",
+      "filing": "auto+digest-review"
+    },
+    "90-private": {
+      "privacy": "never-ingest",
+      "filing": "approve-each"
+    }
+  },
+  "providers": {
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434"
+    }
+  },
+  "job_models": {
+    "ingest": {
+      "provider": "ollama",
+      "model": "qwen2.5:3b"
+    },
+    "query": {
+      "provider": "ollama",
+      "model": "qwen2.5:3b"
+    },
+    "digest": {
+      "provider": "ollama",
+      "model": "qwen2.5:3b"
+    },
+    "lint-semantic": {
+      "provider": "ollama",
+      "model": "qwen2.5:3b"
+    },
+    "file-proposal": {
+      "provider": "ollama",
+      "model": "qwen2.5:3b"
+    },
+    "resurface": {
+      "provider": "ollama",
+      "model": "qwen2.5:3b"
+    }
+  },
+  "sources": [],
+  "schedule": {
+    "digest": "0 8 * * *"
+  },
+  "taxonomy_seed": [
+    "work",
+    "knowledge",
+    "product",
+    "research",
+    "private"
+  ],
+  "novelty": {
+    "duplicate_similarity_threshold": 0.9,
+    "min_new_token_ratio": 0.15,
+    "stale_after_days": 30
+  },
+  "ignore": [
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".gradle",
+    ".terraform",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".idea",
+    ".vscode",
+    ".DS_Store",
+    "Thumbs.db",
+    "*.pyc",
+    "*.pyo",
+    "*.so",
+    "*.o",
+    "*.class",
+    "*.lock",
+    "*.log",
+    "*.tmp",
+    "*.swp"
+  ],
+  "integrations": {
+    "neo4j": {
+      "enabled": false,
+      "managed": false,
+      "options": {}
+    },
+    "obsidian": {
+      "enabled": false,
+      "managed": false,
+      "options": {}
+    },
+    "postgres": {
+      "enabled": false,
+      "managed": false,
+      "options": {}
+    },
+    "web": {
+      "enabled": false,
+      "managed": true,
+      "options": {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "consumer": "human"
+      }
+    }
+  }
+}

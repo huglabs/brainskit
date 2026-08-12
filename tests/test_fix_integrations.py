@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from brainkit.domain.model import BrainkitError, ValidationError
-from brainkit.infrastructure import integrations as integrations_module
-from brainkit.infrastructure.integrations import (
+from brainskit.domain.model import BrainskitError, ValidationError
+from brainskit.infrastructure import integrations as integrations_module
+from brainskit.infrastructure.integrations import (
     READY_STABLE_SECONDS,
     READY_TIMEOUT_SECONDS,
     NativeIntegrations,
@@ -37,7 +37,7 @@ from brainkit.infrastructure.integrations import (
     _vendor_stage,
     _wait_database_ready,
 )
-from brainkit.infrastructure.vault import FileVault
+from brainskit.infrastructure.vault import FileVault
 
 NEO4J_PASSWORD = "n30-canary-password"
 POSTGRES_PASSWORD = "pg-canary-password"
@@ -305,7 +305,7 @@ class VaultFixture(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def payload(self, error: BrainkitError) -> str:
+    def payload(self, error: BrainskitError) -> str:
         return json.dumps(
             {"message": str(error), "details": error.details}, ensure_ascii=False
         )
@@ -329,13 +329,13 @@ class VendorErrorContractTest(VaultFixture):
         )
 
     def configure_postgres(self, *, managed: bool = True) -> None:
-        options: dict[str, Any] = {"consumer": "local", "schema": "brainkit"}
+        options: dict[str, Any] = {"consumer": "local", "schema": "brainskit"}
         if managed:
             options.update(
                 {
                     "password_env": "BRAINKIT_TEST_PG_PASSWORD",
-                    "user": "brainkit",
-                    "database": "brainkit",
+                    "user": "brainskit",
+                    "database": "brainskit",
                     "port": 5461,
                 }
             )
@@ -345,11 +345,11 @@ class VendorErrorContractTest(VaultFixture):
             "postgres", enabled=True, managed=managed, options=options
         )
 
-    def sync_neo4j(self, modules: dict[str, types.ModuleType]) -> BrainkitError:
+    def sync_neo4j(self, modules: dict[str, types.ModuleType]) -> BrainskitError:
         self.configure_neo4j()
         with patch.dict(os.environ, {"BRAINKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
             with patch.dict(sys.modules, modules):
-                with self.assertRaises(BrainkitError) as caught:
+                with self.assertRaises(BrainskitError) as caught:
                     self.integrations.sync("neo4j", graph())
         return caught.exception
 
@@ -361,21 +361,21 @@ class VendorErrorContractTest(VaultFixture):
 
     def sync_postgres(
         self, module: types.ModuleType, *, managed: bool = True
-    ) -> BrainkitError:
+    ) -> BrainskitError:
         self.configure_postgres(managed=managed)
         environment = {
             "BRAINKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD,
             "BRAINKIT_TEST_PG_DSN": (
-                f"postgresql://brainkit:{EMBEDDED_PASSWORD}@127.0.0.1:5999/brainkit"
+                f"postgresql://brainskit:{EMBEDDED_PASSWORD}@127.0.0.1:5999/brainskit"
             ),
         }
         with patch.dict(os.environ, environment):
             with patch.dict(sys.modules, {"psycopg": module}):
-                with self.assertRaises(BrainkitError) as caught:
+                with self.assertRaises(BrainskitError) as caught:
                     self.integrations.sync("postgres", graph())
         return caught.exception
 
-    def test_neo4j_connection_failure_becomes_a_brainkit_error(self) -> None:
+    def test_neo4j_connection_failure_becomes_a_brainskit_error(self) -> None:
         modules, driver = self.neo4j_modules()
         driver.connect_error = modules["neo4j.exceptions"].ServiceUnavailable(  # type: ignore[attr-defined]
             "Couldn't connect to 127.0.0.1:7691"
@@ -420,9 +420,9 @@ class VendorErrorContractTest(VaultFixture):
                 with self.assertRaises(ValidationError) as caught:
                     self.integrations.sync("neo4j", graph())
         self.assertEqual(str(caught.exception), "Neo4j sync requires the official driver")
-        self.assertEqual(caught.exception.details, {"hint": "Install brainkit[neo4j]"})
+        self.assertEqual(caught.exception.details, {"hint": "Install brainskit[neo4j]"})
 
-    def test_postgres_connection_failure_becomes_a_brainkit_error(self) -> None:
+    def test_postgres_connection_failure_becomes_a_brainskit_error(self) -> None:
         module = fake_psycopg_module()
         module.failures["connect"] = module.OperationalError(  # type: ignore[attr-defined]
             'connection to server at "127.0.0.1", port 5461 failed: Connection refused'
@@ -433,12 +433,12 @@ class VendorErrorContractTest(VaultFixture):
         self.assertEqual(error.details["stage"], "connection")
         self.assertEqual(error.details["host"], "127.0.0.1")
         self.assertEqual(error.details["port"], 5461)
-        self.assertEqual(error.details["database"], "brainkit")
+        self.assertEqual(error.details["database"], "brainskit")
 
     def test_postgres_authentication_failure_never_echoes_the_password(self) -> None:
         module = fake_psycopg_module()
         module.failures["connect"] = module.OperationalError(  # type: ignore[attr-defined]
-            'FATAL:  password authentication failed for user "brainkit"'
+            'FATAL:  password authentication failed for user "brainskit"'
         )
         error = self.sync_postgres(module)
         self.assertEqual(error.details["stage"], "authentication")
@@ -448,7 +448,7 @@ class VendorErrorContractTest(VaultFixture):
         module = fake_psycopg_module()
         module.failures["connect"] = module.OperationalError(  # type: ignore[attr-defined]
             "connection failed for "
-            f"postgresql://brainkit:{EMBEDDED_PASSWORD}@127.0.0.1:5999/brainkit"
+            f"postgresql://brainskit:{EMBEDDED_PASSWORD}@127.0.0.1:5999/brainskit"
         )
         error = self.sync_postgres(module, managed=False)
         payload = self.payload(error)
@@ -463,7 +463,7 @@ class VendorErrorContractTest(VaultFixture):
         error = self.sync_postgres(module)
         self.assertEqual(error.details["stage"], "query")
         self.assertEqual(error.details["driver_error"], "ProgrammingError")
-        self.assertEqual(error.details["schema"], "brainkit")
+        self.assertEqual(error.details["schema"], "brainskit")
 
     def test_postgres_missing_driver_keeps_its_install_hint(self) -> None:
         self.configure_postgres()
@@ -472,9 +472,9 @@ class VendorErrorContractTest(VaultFixture):
                 with self.assertRaises(ValidationError) as caught:
                     self.integrations.sync("postgres", graph())
         self.assertEqual(str(caught.exception), "PostgreSQL sync requires psycopg")
-        self.assertEqual(caught.exception.details, {"hint": "Install brainkit[postgres]"})
+        self.assertEqual(caught.exception.details, {"hint": "Install brainskit[postgres]"})
 
-    def test_boundary_lets_brainkit_errors_through_unchanged(self) -> None:
+    def test_boundary_lets_brainskit_errors_through_unchanged(self) -> None:
         original = ValidationError("Integration is disabled", details={"integration": "neo4j"})
         with self.assertRaises(ValidationError) as caught:
             with _vendor_boundary(
@@ -503,14 +503,14 @@ class VendorErrorContractTest(VaultFixture):
         self.assertEqual(_vendor_stage(ConnectionResetError("reset")), "connection")
 
     def test_redaction_removes_known_secrets_and_embedded_credentials(self) -> None:
-        text = f"failed for postgresql://brainkit:{EMBEDDED_PASSWORD}@host:5432/db"
+        text = f"failed for postgresql://brainskit:{EMBEDDED_PASSWORD}@host:5432/db"
         self.assertNotIn(EMBEDDED_PASSWORD, _redact_secrets(text, ()))
         self.assertNotIn(
             NEO4J_PASSWORD, _redact_secrets(f"auth {NEO4J_PASSWORD}", (NEO4J_PASSWORD,))
         )
 
     def test_postgres_target_and_secrets_are_derived_without_the_password(self) -> None:
-        dsn = f"postgresql://brainkit:{EMBEDDED_PASSWORD}@db.internal:6543/graph"
+        dsn = f"postgresql://brainskit:{EMBEDDED_PASSWORD}@db.internal:6543/graph"
         target = _postgres_target(dsn)
         self.assertEqual(target["host"], "db.internal")
         self.assertEqual(target["port"], 6543)
@@ -521,7 +521,7 @@ class VendorErrorContractTest(VaultFixture):
         self.assertIn(EMBEDDED_PASSWORD, _postgres_secrets(stored, dsn))
 
     def test_postgres_target_ignores_non_uri_dsn_forms(self) -> None:
-        self.assertEqual(_postgres_target("host=127.0.0.1 port=5432 dbname=brainkit"), {})
+        self.assertEqual(_postgres_target("host=127.0.0.1 port=5432 dbname=brainskit"), {})
 
 
 def shared_graph() -> dict:
@@ -577,7 +577,7 @@ class PostgresVaultScopeTest(unittest.TestCase):
             managed=False,
             options={
                 "consumer": "local",
-                "schema": "brainkit",
+                "schema": "brainskit",
                 "dsn_env": "BRAINKIT_TEST_PG_DSN",
             },
         )
@@ -587,7 +587,7 @@ class PostgresVaultScopeTest(unittest.TestCase):
         self, integrations: NativeIntegrations, module: types.ModuleType
     ) -> dict:
         environment = {
-            "BRAINKIT_TEST_PG_DSN": "postgresql://brainkit@127.0.0.1:5999/brainkit"
+            "BRAINKIT_TEST_PG_DSN": "postgresql://brainskit@127.0.0.1:5999/brainskit"
         }
         with patch.dict(os.environ, environment):
             with patch.dict(sys.modules, {"psycopg": module}):
@@ -675,12 +675,12 @@ class PostgresVaultScopeTest(unittest.TestCase):
 
     def test_the_schema_adds_the_vault_column_to_an_already_deployed_table(self) -> None:
         """`CREATE TABLE IF NOT EXISTS` cannot add a column to an existing table."""
-        statements = _postgres_schema_statements("brainkit", "vault-abc")
+        statements = _postgres_schema_statements("brainskit", "vault-abc")
         text = [statement for statement, _ in statements]
         for table in ("nodes", "edges"):
             self.assertTrue(
                 any(
-                    f'ALTER TABLE "brainkit".{table} '
+                    f'ALTER TABLE "brainskit".{table} '
                     "ADD COLUMN IF NOT EXISTS vault_id text" in statement
                     for statement in text
                 ),
@@ -688,14 +688,14 @@ class PostgresVaultScopeTest(unittest.TestCase):
             )
             self.assertTrue(
                 any(
-                    f'ALTER TABLE "brainkit".{table} '
+                    f'ALTER TABLE "brainskit".{table} '
                     "ALTER COLUMN vault_id SET NOT NULL" in statement
                     for statement in text
                 )
             )
             self.assertIn(
                 (
-                    f'UPDATE "brainkit".{table} SET vault_id = %s '
+                    f'UPDATE "brainskit".{table} SET vault_id = %s '
                     "WHERE vault_id IS NULL",
                     ("vault-abc",),
                 ),
@@ -705,7 +705,7 @@ class PostgresVaultScopeTest(unittest.TestCase):
     def test_the_migration_backfills_before_it_demands_a_value(self) -> None:
         text = [
             statement
-            for statement, _ in _postgres_schema_statements("brainkit", "vault-abc")
+            for statement, _ in _postgres_schema_statements("brainskit", "vault-abc")
         ]
         added = next(i for i, s in enumerate(text) if "ADD COLUMN IF NOT EXISTS" in s)
         filled = next(i for i, s in enumerate(text) if "SET vault_id = %s" in s)
@@ -716,13 +716,13 @@ class PostgresVaultScopeTest(unittest.TestCase):
     def test_both_tables_index_the_column_every_query_filters_on(self) -> None:
         text = [
             statement
-            for statement, _ in _postgres_schema_statements("brainkit", "vault-abc")
+            for statement, _ in _postgres_schema_statements("brainskit", "vault-abc")
         ]
         for table in ("nodes", "edges"):
             self.assertTrue(
                 any(
                     "CREATE INDEX IF NOT EXISTS" in statement
-                    and f'"brainkit".{table}(vault_id)' in statement
+                    and f'"brainskit".{table}(vault_id)' in statement
                     for statement in text
                 ),
                 f"{table}.vault_id is unindexed",
@@ -745,9 +745,9 @@ class ManagedContainerReconciliationTest(VaultFixture):
             managed=True,
             options={
                 "password_env": "BRAINKIT_TEST_PG_PASSWORD",
-                "user": "brainkit",
-                "database": "brainkit",
-                "schema": "brainkit",
+                "user": "brainskit",
+                "database": "brainskit",
+                "schema": "brainskit",
                 "port": port,
                 "consumer": "local",
             },
@@ -898,7 +898,7 @@ class ObsidianExportBoundaryTest(VaultFixture):
             "obsidian",
             enabled=True,
             managed=False,
-            options={"path": str(destination), "subdirectory": "brainkit", **options},
+            options={"path": str(destination), "subdirectory": "brainskit", **options},
         )
 
     def destination(self) -> Path:
@@ -914,7 +914,7 @@ class ObsidianExportBoundaryTest(VaultFixture):
         )
         self.configure(target, consumer="local")
         result = self.integrations.sync("obsidian", graph())
-        exported = (target / "brainkit" / "graph" / "graph.json").read_text(
+        exported = (target / "brainskit" / "graph" / "graph.json").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("neverIngestCanary", exported)
@@ -937,8 +937,8 @@ class ObsidianExportBoundaryTest(VaultFixture):
         self.configure(target, consumer="human")
         self.integrations.sync("obsidian", graph())
         outside = target / "human-note.md"
-        inside = target / "brainkit" / "minha-anotacao.md"
-        nested = target / "brainkit" / "wiki" / "human-inside.md"
+        inside = target / "brainskit" / "minha-anotacao.md"
+        nested = target / "brainskit" / "wiki" / "human-inside.md"
         nested.parent.mkdir(parents=True, exist_ok=True)
         for path in (outside, inside, nested):
             path.write_text("humano", encoding="utf-8")
@@ -950,14 +950,14 @@ class ObsidianExportBoundaryTest(VaultFixture):
         target = self.destination()
         self.configure(target, consumer="human")
         self.integrations.sync("obsidian", graph())
-        stale = target / "brainkit" / "wiki" / "gone.md"
+        stale = target / "brainskit" / "wiki" / "gone.md"
         stale.write_text("stale", encoding="utf-8")
         self.integrations._record(
             "obsidian", {"managed_files": ["wiki/gone.md", "graph/graph.json"]}
         )
         self.integrations.sync("obsidian", graph())
         self.assertFalse(stale.exists())
-        self.assertTrue((target / "brainkit" / "graph" / "graph.json").is_file())
+        self.assertTrue((target / "brainskit" / "graph" / "graph.json").is_file())
 
     def test_raw_is_excluded_unless_requested(self) -> None:
         target = self.destination()
@@ -966,10 +966,10 @@ class ObsidianExportBoundaryTest(VaultFixture):
         raw.write_text("raw bytes", encoding="utf-8")
         self.configure(target, consumer="human")
         self.integrations.sync("obsidian", graph())
-        self.assertFalse((target / "brainkit" / "raw").exists())
+        self.assertFalse((target / "brainskit" / "raw").exists())
         self.configure(target, include_raw=True)
         result = self.integrations.sync("obsidian", graph())
-        self.assertTrue((target / "brainkit" / "raw" / "_inbox" / "note.md").is_file())
+        self.assertTrue((target / "brainskit" / "raw" / "_inbox" / "note.md").is_file())
         self.assertIn("graph/graph.json", result["managed_files"])
 
     def test_in_place_export_only_writes_the_obsidian_app_config(self) -> None:
@@ -997,7 +997,7 @@ class ReadinessProbeTest(unittest.TestCase):
     """A managed service is ready only when it stays ready."""
 
     def policy_for(self, **options: Any) -> Any:
-        from brainkit.domain.model import IntegrationPolicy
+        from brainskit.domain.model import IntegrationPolicy
 
         return IntegrationPolicy(enabled=True, managed=True, options=options)
 
@@ -1044,7 +1044,7 @@ class ReadinessProbeTest(unittest.TestCase):
         ):
             _wait_database_ready(
                 "postgres",
-                self.policy_for(user="brainkit", database="brainkit"),
+                self.policy_for(user="brainskit", database="brainskit"),
                 "container",
             )
         elapsed.append(clock["now"])
@@ -1072,7 +1072,7 @@ class ReadinessProbeTest(unittest.TestCase):
         ):
             _wait_database_ready(
                 "postgres",
-                self.policy_for(user="brainkit", database="brainkit"),
+                self.policy_for(user="brainskit", database="brainskit"),
                 "container",
             )
         self.assertTrue(seen, "readiness never probed")

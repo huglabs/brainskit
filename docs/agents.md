@@ -7,7 +7,7 @@ infers one:
 bk --vault ./my-vault hooks install --agent claude
 ```
 
-It installs `.claude/skills/brainkit/SKILL.md`, appends a managed block to the
+It installs `.claude/skills/brainskit/SKILL.md`, appends a managed block to the
 agent's instruction file (`CLAUDE.md`, or `AGENTS.md`/`GEMINI.md` for the other
 agents) covering how the graph is formed, where the privacy boundary applies and
 which commands may write, and installs a `pre-commit` hook running `bk lint`
@@ -25,7 +25,7 @@ documents something other than a code repository, or when a slow first
 extraction should not block onboarding.
 
 Everything it writes is safe to re-run. The instruction block is fenced by
-`<!-- brainkit:start -->` / `<!-- brainkit:end -->` and replaced in place, so
+`<!-- brainskit:start -->` / `<!-- brainskit:end -->` and replaced in place, so
 your own instructions keep their content and their position. An existing skill
 or a pre-existing `pre-commit` hook is reported rather than overwritten; pass
 `--force` to replace them. A workspace without git still installs everything
@@ -70,13 +70,13 @@ replace an existing hook, not which directory git executes.
 
 A `.claude/settings.json` carried over from somewhere else — a previous
 install at a different `--root`, or a `.claude/` copied wholesale from another
-project — has its stale `brainkit-gate`/`brainkit-status` entries replaced,
+project — has its stale `brainskit-gate`/`brainskit-status` entries replaced,
 not left running alongside the new ones: the idempotency key is the hook's
 *identity* (its template name), not the literal command path, so a command
 pointing at a different vault or workspace is recognised as superseded and
 pruned. Reported in `settings.pruned` and on stderr. Unrelated tooling
 registered on the same event is never touched — only a command whose name
-matches `brainkit-gate.sh`/`brainkit-status.sh` is ever considered stale.
+matches `brainskit-gate.sh`/`brainskit-status.sh` is ever considered stale.
 
 ## The vault is not always the workspace
 

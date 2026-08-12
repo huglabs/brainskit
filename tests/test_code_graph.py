@@ -1,6 +1,6 @@
-"""The repository graph as a projection brainkit owns but does not build.
+"""The repository graph as a projection brainskit owns but does not build.
 
-Brainkit has no parser and should not grow one. What it has, and what no code
+Brainskit has no parser and should not grow one. What it has, and what no code
 graph tool in the companion analysis had, is a way to say *when the artefact
 stopped being true* and *who may read it*. So the split is: an extractor
 produces the graph, and this module owns the contract, the freshness and the
@@ -31,13 +31,13 @@ from typing import Any
 
 from test_projections import policy
 
-from brainkit.application.codegraph import CODE_PROJECTION
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import NotFoundError, ValidationError
-from brainkit.infrastructure.extractor import GraphifyExtractor
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
+from brainskit.application.codegraph import CODE_PROJECTION
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import NotFoundError, ValidationError
+from brainskit.infrastructure.extractor import GraphifyExtractor
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
 
 
 def _code_extra_installed() -> bool:
@@ -90,7 +90,7 @@ class CodeGraphFixture(unittest.TestCase):
 
         vault = FileVault.initialize(self.repo / "docs" / "brain", policy())
         self.vault = vault
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.service.reindex()
@@ -384,7 +384,7 @@ class VendoredImportTest(unittest.TestCase):
         # alias bug that shadowed one) would still fail this.
         import importlib
 
-        from brainkit.infrastructure import codeanalysis  # noqa: F401
+        from brainskit.infrastructure import codeanalysis  # noqa: F401
 
         importlib.import_module("graphify.extract")
         importlib.import_module("graphify.detect")
@@ -419,7 +419,7 @@ class VendoredImportTest(unittest.TestCase):
         script = (
             "import sys\n"
             "sys.modules['tree_sitter'] = None\n"
-            "from brainkit.infrastructure import codeanalysis\n"
+            "from brainskit.infrastructure import codeanalysis\n"
             "import graphify.extract\n"
             "import graphify.detect\n"
             "print('ok')\n"
@@ -431,18 +431,18 @@ class VendoredImportTest(unittest.TestCase):
         self.assertIn("ok", completed.stdout)
 
     def test_normalize_id_is_idempotent(self) -> None:
-        from brainkit.infrastructure.codeanalysis import normalize_id
+        from brainskit.infrastructure.codeanalysis import normalize_id
 
         value = normalize_id("Hello, World!!  -- foo_bar")
         self.assertEqual(normalize_id(value), value)
 
     def test_normalize_id_collapses_non_word_runs(self) -> None:
-        from brainkit.infrastructure.codeanalysis import normalize_id
+        from brainskit.infrastructure.codeanalysis import normalize_id
 
         self.assertEqual(normalize_id("foo--bar..baz"), "foo_bar_baz")
 
     def test_normalize_id_casefolds(self) -> None:
-        from brainkit.infrastructure.codeanalysis import normalize_id
+        from brainskit.infrastructure.codeanalysis import normalize_id
 
         self.assertEqual(normalize_id("FooBar"), "foobar")
 
@@ -472,7 +472,7 @@ class MissingDependencyTest(CodeGraphFixture):
         self.assertIn("bk code import", caught.exception.details["hint"])
 
     def test_build_refuses_clearly_when_the_extractor_is_unavailable(self) -> None:
-        service = BrainkitService(
+        service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -480,9 +480,9 @@ class MissingDependencyTest(CodeGraphFixture):
         )
         with self.assertRaises(ValidationError) as caught:
             service.code_build()
-        self.assertIn("brainkit[code]", caught.exception.details["needs"])
+        self.assertIn("brainskit[code]", caught.exception.details["needs"])
 
-    def test_extract_translates_a_missing_grammar_into_a_brainkit_error(self) -> None:
+    def test_extract_translates_a_missing_grammar_into_a_brainskit_error(self) -> None:
         # `graphify.extract` re-checks tree-sitter on every call (not just at
         # import time), so blocking it here reaches the same failure a
         # genuinely bare environment would hit, regardless of import order
@@ -501,7 +501,7 @@ class MissingDependencyTest(CodeGraphFixture):
         # The extractor is infrastructure, so it may resolve the install
         # command itself and ships a ready `hint`. The application layer
         # cannot -- it names `needs` and the CLI resolves it (`_install_hint_for`).
-        self.assertIn("brainkit[code]", caught.exception.details["hint"])
+        self.assertIn("brainskit[code]", caught.exception.details["hint"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
 
@@ -541,7 +541,7 @@ class CodeBuildFixture(unittest.TestCase):
 
         vault = FileVault.initialize(self.repo / "docs" / "brain", policy())
         self.vault = vault
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             vault,
             SqliteFtsIndex(vault.index_path),
             graph=MarkdownGraph(),
@@ -611,7 +611,7 @@ class BuildTest(CodeBuildFixture):
     def test_excludes_the_vault_from_its_own_graph_on_the_build_path(self) -> None:
         # Real extraction, not a simulated payload: an extractor pointed at
         # the repo indexes the vault's own `.brain/schema.json` (tree-sitter
-        # parses JSON too) unless brainkit excludes it.
+        # parses JSON too) unless brainskit excludes it.
         self.service.code_build()
         paths = {node["path"] for node in self.graph_file()["nodes"]}
         self.assertFalse(any(path.startswith("docs/brain/") for path in paths))

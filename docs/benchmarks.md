@@ -44,12 +44,12 @@ turn), the same scorer, the same k.
 
 | System | recall@10 | ceiling | ranking eff. | MRR | index | query |
 |---|---|---|---|---|---|---|
-| **brainkit** | **0.519** | 1.000 | 0.519 | 0.376 | 0.6 min · no LLM | 4 ms |
+| **brainskit** | **0.519** | 1.000 | 0.519 | 0.376 | 0.6 min · no LLM | 4 ms |
 | graphify | 0.302 | 0.575 | 0.525 | 0.185 | 58.4 min · ~3.3M LLM tokens | 132 ms |
 
 `ceiling` is the best recall a *perfect* ranker could reach over what each
 system actually stored, and it is the column that makes the result readable.
-brainkit indexes every turn, so nothing is out of reach and its score is purely
+brainskit indexes every turn, so nothing is out of reach and its score is purely
 ranking. graphify condenses ~590 turns into ~70 entities per conversation,
 leaving **536 of 1,536 questions with no evidence turn in its graph at all** —
 scored zero before ranking began. `ranking eff.` is recall ÷ ceiling: measured
@@ -61,7 +61,7 @@ gap is coverage, not ranking.**
 git clone --depth 1 https://github.com/snap-research/locomo /tmp/locomo
 cp /tmp/locomo/data/locomo10.json benchmarks/memory/
 
-python benchmarks/memory/run_locomo.py --limit 300        # brainkit alone
+python benchmarks/memory/run_locomo.py --limit 300        # brainskit alone
 python benchmarks/memory/run_locomo_graphify.py --index   # build graphify's graphs
 python benchmarks/memory/run_locomo_graphify.py           # both, one harness
 ```

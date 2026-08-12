@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="brainkit">
+  <title>brainkit</title>
+  <rect width="96" height="96" rx="24" fill="#ee502c"/>
+  <g stroke="#ffffff" stroke-linecap="round" fill="none">
+    <g stroke-width="2.5" opacity="0.5">
+      <path d="M24 28h17"/>
+      <path d="M24 48h17"/>
+      <path d="M24 68h17"/>
+    </g>
+    <path d="M55 48h10" stroke-width="2.5" opacity="0.5"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="22" cy="28" r="4.5"/>
+    <circle cx="22" cy="48" r="4.5"/>
+    <circle cx="22" cy="68" r="4.5"/>
+    <rect x="43" y="20" width="6" height="56" rx="3"/>
+    <rect x="64" y="31" width="16" height="34" rx="4"/>
+  </g>
+</svg>

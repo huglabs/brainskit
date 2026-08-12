@@ -26,19 +26,19 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brainkit.application.codegraph import CODE_PROJECTION
-from brainkit.application.freshness import (
+from brainskit.application.codegraph import CODE_PROJECTION
+from brainskit.application.freshness import (
     GRAPH_PROJECTION,
     PROJECTION_RAW_FIELDS,
     VIEWS_PROJECTION,
     _fingerprint_row,
     _projection_source_hash,
 )
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import SourceRecord
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import SourceRecord
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
 
 PROJECTION_CODES = {"graph.stale", "views.stale"}
 
@@ -85,7 +85,7 @@ class ProjectionFixture(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -403,7 +403,7 @@ class UnrecordedProjectionTest(ProjectionFixture):
         self.vault.mutate_state("freshness", mutate)
 
     def test_an_artefact_with_no_record_is_stale(self) -> None:
-        # What a vault written by an older brainkit looks like: the files are
+        # What a vault written by an older brainskit looks like: the files are
         # there, nothing says which pages they cover.
         self.drop_records()
         self.assertEqual(self.projection_codes(), PROJECTION_CODES)
@@ -575,9 +575,9 @@ class SourceHashTest(ProjectionFixture):
     def hash_in_subprocess(self, seed: str, artifact: str) -> str:
         program = (
             "import json, sys;"
-            "from brainkit.application.freshness import"
+            "from brainskit.application.freshness import"
             " _projection_source_hash, PROJECTION_RAW_FIELDS;"
-            "from brainkit.domain.model import SourceRecord;"
+            "from brainskit.domain.model import SourceRecord;"
             "pages = json.load(open(sys.argv[1]))['pages'];"
             "raw = json.load(open(sys.argv[2]))['sources'];"
             "records = {k: SourceRecord.from_dict(v) for k, v in raw.items()};"

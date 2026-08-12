@@ -43,7 +43,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: brainkit version
+      label: brainskit version
       description: "`bk --version`, or the commit if you installed from a checkout"
     validations:
       required: true

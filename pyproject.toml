@@ -6,8 +6,8 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "brainkit"
-version = "0.4.0"
+name = "brainskit"
+version = "0.5.0"
 description = "Local-first, LLM-agnostic second-brain engine: the compilation gate between raw evidence and knowledge an agent may act on"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -93,7 +93,7 @@ code = [
 # asserts that every grammar the extractors import appears in one of the two
 # lists, so a new extractor cannot quietly land without one.
 code-all = [
-  "brainkit[code]",
+  "brainskit[code]",
   "tree-sitter-sql>=0.3,<1",
   "tree-sitter-swift>=0.7,<1",
   "tree-sitter-hcl>=1.2,<2",
@@ -113,7 +113,7 @@ code-all = [
 ]
 
 [project.scripts]
-bk = "brainkit.interfaces.cli:main"
+bk = "brainskit.interfaces.cli:main"
 
 [dependency-groups]
 dev = [
@@ -130,7 +130,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-brainkit = [
+brainskit = [
   "jobs/*.md",
   "jobs/_output-schemas/*.json",
   "templates/default/*.json",
@@ -152,9 +152,9 @@ target-version = "py311"
 # re-vendor is a copy rather than a merge, which means it cannot also satisfy a
 # lint contract it was never written against — and reformatting it would make
 # the next upstream diff unreadable. Scoped to the one path; everything
-# Brainkit wrote is still gated.
+# Brainskit wrote is still gated.
 # Provenance and the full reasoning: that directory's NOTICE.
-extend-exclude = ["src/brainkit/infrastructure/codeanalysis"]
+extend-exclude = ["src/brainskit/infrastructure/codeanalysis"]
 
 [tool.ruff.lint]
 select = [
@@ -193,16 +193,16 @@ ignore = [
 #     first (`^[a-z_][a-z0-9_]{0,62}$`); every value is bound normally.
 #   S104 — "0.0.0.0" appears in a published-port comparison, not in a bind.
 #   S105 — the flagged constant is a redaction placeholder, not a credential.
-"src/brainkit/infrastructure/integrations.py" = ["S104", "S105", "S603", "S607", "S608"]
+"src/brainskit/infrastructure/integrations.py" = ["S104", "S105", "S603", "S607", "S608"]
 # The flagged strings are the literal key name "token", used to look up an
 # environment variable's name — never a value. The two subprocess calls carry
 # their reasoning inline, at the site.
-"src/brainkit/interfaces/cli.py" = ["S105"]
+"src/brainskit/interfaces/cli.py" = ["S105"]
 #   S607 — one fixed argument vector with no shell, asking `git` where it runs
 #     hooks from. It must be the same `git` the operator's commit will use, so
 #     it is invoked by name on PATH; an absolute path would answer for a
 #     different install than the one that matters.
-"src/brainkit/application/health.py" = ["S607"]
+"src/brainskit/application/health.py" = ["S607"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -215,4 +215,24 @@ disallow_any_generics = true
 # Vendored third-party source: byte-identical to upstream, so it cannot satisfy
 # a strict contract it was never written against. The adapter that calls it is
 # checked, which is where the boundary that matters actually is.
-exclude = ["^src/brainkit/infrastructure/codeanalysis/"]
+exclude = ["^src/brainskit/infrastructure/codeanalysis/"]
+
+# numpy arrives through the `code-all` grammars and ships stubs written with
+# `type` statements, which are a syntax error to a checker told to target
+# 3.11 -- and one syntax error in a followed import stops the run before any
+# of `src` is checked. `requires-python` is what decides the floor, so the
+# floor stays and the third-party stubs are simply not parsed.
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+ignore_errors = true
+
+# neo4j, psycopg and markitdown ship type information, so an inline
+# `import-not-found` ignore on them is unused wherever the extra is installed
+# and required wherever it is not -- `warn_unused_ignores` makes that pair
+# unsatisfiable. Declaring it here instead is true in both environments, which
+# is what lets the same command check a bare install and a full one.
+[[tool.mypy.overrides]]
+module = ["neo4j.*", "psycopg.*", "markitdown.*"]
+ignore_missing_imports = true

@@ -1,4 +1,4 @@
-# Contributing to brainkit
+# Contributing to brainskit
 
 Thanks for taking the time. This project has a small, opinionated set of
 invariants, and most of the review effort goes into keeping them true — so the
@@ -46,7 +46,7 @@ The project is **lint-clean, not format-clean**: `ruff format` produces a large
 pre-existing diff and is not part of the gate. Do not reformat files you are not
 otherwise changing.
 
-`src/brainkit/infrastructure/codeanalysis/` is vendored third-party source and
+`src/brainskit/infrastructure/codeanalysis/` is vendored third-party source and
 is excluded from lint and type checks. Keep it byte-identical to upstream so a
 re-vendor stays a copy rather than a merge; changes belong in the adapter that
 calls it. See [`NOTICE`](./NOTICE).

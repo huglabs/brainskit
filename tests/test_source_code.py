@@ -25,7 +25,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from brainkit.infrastructure.converters import (
+from brainskit.infrastructure.converters import (
     PLAIN_TEXT_SUFFIXES,
     SOURCE_CODE_NAMES,
     SOURCE_CODE_TYPES,
@@ -144,17 +144,17 @@ class CaptureTest(unittest.TestCase):
     def setUp(self) -> None:
         from test_projections import policy
 
-        from brainkit.application.services import BrainkitService
-        from brainkit.infrastructure.graph import MarkdownGraph
-        from brainkit.infrastructure.index import SqliteFtsIndex
-        from brainkit.infrastructure.vault import FileVault
+        from brainskit.application.services import BrainskitService
+        from brainskit.infrastructure.graph import MarkdownGraph
+        from brainskit.infrastructure.index import SqliteFtsIndex
+        from brainskit.infrastructure.vault import FileVault
 
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         vault = FileVault.initialize(self.root / "vault", policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.service.reindex()

@@ -1,6 +1,6 @@
-# brainkit documentation
+# brainskit documentation
 
-The [project README](../README.md) covers what brainkit is, how to install it
+The [project README](../README.md) covers what brainskit is, how to install it
 and the first ten minutes. Everything below is the detail that would drown it.
 
 ## Using a vault

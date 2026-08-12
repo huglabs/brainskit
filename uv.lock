@@ -48,8 +48,8 @@ wheels = [
 ]
 
 [[package]]
-name = "brainkit"
-version = "0.4.0"
+name = "brainskit"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema", extra = ["format"] },
@@ -129,7 +129,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "brainkit", extras = ["code"], marker = "extra == 'code-all'" },
+    { name = "brainskit", extras = ["code"], marker = "extra == 'code-all'" },
     { name = "jsonschema", extras = ["format"], specifier = ">=4.20,<5" },
     { name = "markitdown", marker = "extra == 'convert'" },
     { name = "neo4j", marker = "extra == 'integrations'", specifier = ">=5.25,<7" },

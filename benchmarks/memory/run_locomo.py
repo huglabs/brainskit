@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""LOCOMO retrieval, measured against brainkit's own vault.
+"""LOCOMO retrieval, measured against brainskit's own vault.
 
 **What this is, stated before the numbers so nobody mis-reads them.** The
 published LOCOMO figures for Graphify, mem0 and supermemory are for
 *conversational memory systems*: they ingest a long dialogue and answer
-questions about it. Brainkit is a different product — a curated vault whose
+questions about it. Brainskit is a different product — a curated vault whose
 writes go through an apply gate with citations — and it vendors Graphify's
 **code-extraction** closure only, never its memory or retrieval stack. So this
-is not a re-run of that table. It measures brainkit's own retrieval
+is not a re-run of that table. It measures brainskit's own retrieval
 (`capture` → FTS5 → `search`) on the same task, which is the only honest
 comparison available.
 
@@ -128,13 +128,13 @@ def build_vault(turns: list[dict], scratch: Path):
     which one was relevant, which is not what recall@k is asking.
     """
 
-    from brainkit.application.services import BrainkitService
-    from brainkit.infrastructure.index import SqliteFtsIndex
-    from brainkit.infrastructure.vault import FileVault
+    from brainskit.application.services import BrainskitService
+    from brainskit.infrastructure.index import SqliteFtsIndex
+    from brainskit.infrastructure.vault import FileVault
 
     vault = FileVault.initialize(scratch, _policy())
     index = SqliteFtsIndex(vault.index_path)
-    service = BrainkitService(vault, index)
+    service = BrainskitService(vault, index)
 
     for turn in turns:
         speaker = str(turn.get("speaker", ""))
@@ -152,7 +152,7 @@ def build_vault(turns: list[dict], scratch: Path):
 
 
 def _policy() -> dict:
-    from brainkit.domain.model import DEFAULT_IGNORE_PATTERNS, INTEGRATION_NAMES
+    from brainskit.domain.model import DEFAULT_IGNORE_PATTERNS, INTEGRATION_NAMES
 
     jobs = ("digest", "file-proposal", "ingest", "lint-semantic", "query", "resurface")
     return {

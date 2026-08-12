@@ -34,16 +34,16 @@ from tempfile import TemporaryDirectory
 
 from test_projections import policy as _base_policy
 
-from brainkit.application.codegraph import CodeGraph
-from brainkit.domain.model import (
+from brainskit.application.codegraph import CodeGraph
+from brainskit.domain.model import (
     DEFAULT_CODE_SCAN_LIMIT,
     GrammarNeed,
     ScanSurvey,
     ValidationError,
     VaultConfig,
 )
-from brainkit.infrastructure import extractor, pyenv
-from brainkit.infrastructure.vault import (
+from brainskit.infrastructure import extractor, pyenv
+from brainskit.infrastructure.vault import (
     DERIVED_DIRECTORIES,
     GENERATED_DIRECTORIES,
     FileVault,
@@ -94,7 +94,7 @@ class CodeRootBoundsTest(unittest.TestCase):
 
     def test_a_vault_inside_a_repository_names_that_repository(self) -> None:
         repo = _git(self.root / "project")
-        vault = FileVault.initialize(repo / ".brainkit", policy())
+        vault = FileVault.initialize(repo / ".brainskit", policy())
 
         self.assertEqual(vault.code_root(), repo)
         self.assertIn("git repository", vault.code_root_reason()[1])
@@ -115,10 +115,10 @@ class CodeRootBoundsTest(unittest.TestCase):
         self.assertIn("no repository", reason)
 
     def test_an_explicit_code_root_is_honoured(self) -> None:
-        # `..` is the *normal* setting for the `<repo>/.brainkit` layout, so it
+        # `..` is the *normal* setting for the `<repo>/.brainskit` layout, so it
         # must not be mistaken for an escape attempt.
         repo = _git(self.root / "project")
-        vault = FileVault.initialize(repo / ".brainkit", policy(code_root=".."))
+        vault = FileVault.initialize(repo / ".brainskit", policy(code_root=".."))
 
         self.assertEqual(vault.code_root(), repo)
         self.assertIn("configured", vault.code_root_reason()[1])
@@ -134,16 +134,16 @@ class VaultSitingTest(unittest.TestCase):
 
     def test_a_directory_holding_projects_is_refused(self) -> None:
         workspace = self.root / "Projetos"
-        _git(workspace / "brainkit")
+        _git(workspace / "brainskit")
         _git(workspace / "gitlab-mcp")
 
         with self.assertRaises(ValidationError) as caught:
             FileVault.initialize(workspace, policy())
 
         details = caught.exception.details
-        self.assertEqual(details["repositories"], ["brainkit", "gitlab-mcp"])
+        self.assertEqual(details["repositories"], ["brainskit", "gitlab-mcp"])
         # The message has to name a way forward, not only a refusal.
-        self.assertIn(".brainkit", details["hint"])
+        self.assertIn(".brainskit", details["hint"])
 
     def test_a_repository_of_its_own_is_not_a_workspace(self) -> None:
         # A monorepo whose sub-projects each carry a `.git` is one project.
@@ -152,7 +152,7 @@ class VaultSitingTest(unittest.TestCase):
         _git(repo / "packages" / "a")
         _git(repo / "packages" / "b")
 
-        vault = FileVault.initialize(repo / ".brainkit", policy())
+        vault = FileVault.initialize(repo / ".brainskit", policy())
         self.assertEqual(vault.code_root(), repo)
 
     def test_force_overrides_the_workspace_refusal(self) -> None:
@@ -187,6 +187,82 @@ class VaultSitingTest(unittest.TestCase):
         (directory / "loose.txt").parent.mkdir(parents=True, exist_ok=True)
         (directory / "loose.txt").write_text("x")
         self.assertEqual([p.name for p in workspace_repos(directory)], ["real"])
+
+
+class OrphanedBrainDirectoryTest(unittest.TestCase):
+    """`bk init` refuses a `.brain/` a lost setup left behind.
+
+    The incident: `.brain/` already held `code-cache/` and five 0-byte
+    `*.lock` files -- real internal state -- while `config.json` itself was
+    gone, swept away by a `git stash` mid-relocation. `bk init` proceeded
+    without complaint and created a second, disconnected vault on top of the
+    wreckage, indistinguishable on the surface from a genuinely fresh target.
+    """
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name).resolve()
+
+    def test_orphaned_brain_content_without_config_is_refused(self) -> None:
+        target = self.root / "docs" / "brain"
+        cache = target / ".brain" / "code-cache"
+        cache.mkdir(parents=True)
+        (cache / "ast.json").write_text("{}")
+        (target / ".brain" / "write.lock").write_text("")
+
+        with self.assertRaises(ValidationError) as caught:
+            FileVault.initialize(target, policy())
+
+        self.assertEqual(caught.exception.code, "refused")
+        details = caught.exception.details
+        self.assertEqual(details["found"], ["code-cache", "write.lock"])
+        self.assertIn("git stash", details["hint"])
+        self.assertIn("--force", details["hint"])
+
+    def test_an_empty_brain_directory_is_not_orphaned(self) -> None:
+        # A bare `mkdir -p .brain` with nothing in it is not wreckage.
+        target = self.root / "docs" / "brain"
+        (target / ".brain").mkdir(parents=True)
+
+        FileVault.initialize(target, policy())
+
+        self.assertTrue((target / ".brain" / "config.json").is_file())
+
+    def test_a_genuinely_empty_target_still_initializes(self) -> None:
+        target = self.root / "fresh"
+
+        FileVault.initialize(target, policy())
+
+        self.assertTrue((target / ".brain" / "config.json").is_file())
+
+    def test_a_nonexistent_target_still_initializes(self) -> None:
+        target = self.root / "does" / "not" / "exist" / "yet"
+
+        FileVault.initialize(target, policy())
+
+        self.assertTrue((target / ".brain" / "config.json").is_file())
+
+    def test_force_overrides_the_orphaned_brain_refusal(self) -> None:
+        target = self.root / "docs" / "brain"
+        cache = target / ".brain" / "code-cache"
+        cache.mkdir(parents=True)
+        (cache / "ast.json").write_text("{}")
+
+        FileVault.initialize(target, policy(), force=True)
+
+        self.assertTrue((target / ".brain" / "config.json").is_file())
+
+    def test_a_valid_existing_config_is_a_conflict_not_a_refusal(self) -> None:
+        # A different, already-handled case: this check must not intrude on
+        # the ordinary "already initialized" path.
+        target = self.root / "existing"
+        FileVault.initialize(target, policy())
+
+        with self.assertRaises(ValidationError) as caught:
+            FileVault.initialize(target, policy())
+
+        self.assertEqual(caught.exception.code, "conflict")
 
 
 class VaultGitignoreTest(unittest.TestCase):
@@ -230,7 +306,7 @@ class VaultGitignoreTest(unittest.TestCase):
     def test_merging_twice_leaves_exactly_one_block(self) -> None:
         once = merge_gitignore("*.log\n", gitignore_block())
         twice = merge_gitignore(once, gitignore_block())
-        self.assertEqual(twice.count(">>> brainkit >>>"), 1)
+        self.assertEqual(twice.count(">>> brainskit >>>"), 1)
         self.assertEqual(once, twice)
 
 
@@ -332,11 +408,11 @@ class InstallCommandTest(unittest.TestCase):
 
     def test_pipx_injects_into_the_package(self) -> None:
         environment = pyenv.Environment(
-            kind="pipx", executable="/pipx/venvs/brainkit/bin/python", prefix="/pipx"
+            kind="pipx", executable="/pipx/venvs/brainskit/bin/python", prefix="/pipx"
         )
         with unittest.mock.patch.object(pyenv.shutil, "which", lambda _: "/bin/pipx"):
             command = environment.install_command(["tree-sitter-sql"])
-        self.assertEqual(command[:3], ["pipx", "inject", "brainkit"])
+        self.assertEqual(command[:3], ["pipx", "inject", "brainskit"])
 
 
 class CoverageReportingTest(unittest.TestCase):
@@ -592,6 +668,153 @@ class UnexplainedCoverageTest(unittest.TestCase):
         )
         self.assertEqual(CodeGraph._unexplained(survey, covered=80), {})
 
+    def test_two_grammars_needed_by_the_same_files_are_not_double_counted(
+        self,
+    ) -> None:
+        """A real repository, reproduced: a TypeScript extractor dispatches
+        `.js`/`.mjs`/`.ts`/`.tsx` through one function that names *both*
+        `tree_sitter_javascript` and `tree_sitter_typescript` -- so `survey()`
+        reports the same 639 files under each grammar. Before this fix,
+        `parseable_files` summed both entries and manufactured a 639-file
+        shortfall out of files every one of which had actually been indexed
+        (LandingPage: 43% reported unexplained, 0 actually unaccounted for).
+        """
+        shared = (".js", ".mjs", ".ts", ".tsx")
+        survey = ScanSurvey(
+            root="/tmp/x",
+            files=741,
+            grammars=(
+                GrammarNeed("tree_sitter_bash", "tree-sitter-bash", True, (".sh",), 100),
+                GrammarNeed(
+                    "tree_sitter_javascript", "tree-sitter-javascript", True, shared, 639
+                ),
+                GrammarNeed(
+                    "tree_sitter_typescript", "tree-sitter-typescript", True, shared, 639
+                ),
+            ),
+        )
+        # 100 (.sh) + 639 (.js/.mjs/.ts/.tsx, counted once) = 739, not 1378.
+        self.assertEqual(survey.parseable_files, 739)
+        # Every file that was actually indexed accounts for the total: no
+        # phantom shortfall.
+        self.assertEqual(CodeGraph._unexplained(survey, covered=739), {})
+
+    def test_unreachable_files_is_not_double_counted_either(self) -> None:
+        """The install-offer path has the identical shape of bug: a file
+        needing two missing grammars must be counted once, not twice, or the
+        CLI's "N file(s) contribute nothing" figure overstates the impact."""
+        shared = (".js", ".mjs", ".ts", ".tsx")
+        survey = ScanSurvey(
+            root="/tmp/x",
+            files=639,
+            grammars=(
+                GrammarNeed(
+                    "tree_sitter_javascript", "tree-sitter-javascript", False, shared, 639
+                ),
+                GrammarNeed(
+                    "tree_sitter_typescript", "tree-sitter-typescript", False, shared, 639
+                ),
+            ),
+        )
+        self.assertEqual(survey.unreachable_files, 639)
+
+    def test_a_partially_installed_pair_still_blocks_the_shared_files(self) -> None:
+        """One grammar installed, the sibling it depends on not: the shared
+        files are neither parseable nor silently dropped from `unreachable`."""
+        shared = (".ts", ".tsx")
+        survey = ScanSurvey(
+            root="/tmp/x",
+            files=50,
+            grammars=(
+                GrammarNeed(
+                    "tree_sitter_javascript", "tree-sitter-javascript", True, shared, 50
+                ),
+                GrammarNeed(
+                    "tree_sitter_typescript", "tree-sitter-typescript", False, shared, 50
+                ),
+            ),
+        )
+        self.assertEqual(survey.parseable_files, 0)
+        self.assertEqual(survey.unreachable_files, 50)
+
+
+# Module-level, not nested in the test class: `_function_might_skip` reads
+# `__code__.co_consts`, and these exist purely to give it real bytecode to
+# read. Deliberately share this module with the test class below -- that is
+# the exact regression: the old, whole-*file* implementation would have
+# found the word "skipped" somewhere in this file (this comment, even) and
+# flagged every function here, including the one with no skip path at all.
+def _fake_extractor_without_skip(path):
+    return {"nodes": [], "edges": []}
+
+
+def _fake_extractor_with_skip(path):
+    return {"nodes": [], "edges": [], "skipped": "data json (not a config/manifest)"}
+
+
+def _fake_extractor_with_skip_in_a_closure(path):
+    def build_result():
+        return {"nodes": [], "skipped": "nested"}
+
+    return build_result()
+
+
+class SkipDetectionIsPerFunctionTest(unittest.TestCase):
+    """`_skipping_extensions` must judge a dispatch function on its own
+    bytecode, not on the file it happens to share with unrelated extractors.
+
+    The bug this guards: `graphify.extract` is one file holding dozens of
+    extractors, and a whole-file substring search for `"skipped"` flagged
+    every extension dispatched from that file the instant any single one of
+    them used the word -- 41 extensions instead of the one (`.json`) that
+    actually implements a skip path. `_deliberate_skips`'s probe budget then
+    went to confirming, one file at a time, that TypeScript and Python files
+    never skip -- they never do -- and ran out before reaching every `.json`
+    file in a repository large enough to have a few hundred candidates of any
+    kind: a real 43-file HugLabs LandingPage repository, reproduced in
+    miniature by these tests, undercounted `.json` skips 30-for-52 and
+    reported a 43% "unexplained" shortfall that was actually zero.
+    """
+
+    def test_a_function_whose_own_bytecode_returns_skipped_is_detected(self) -> None:
+        self.assertTrue(extractor._function_might_skip(_fake_extractor_with_skip))
+
+    def test_a_function_that_never_returns_skipped_is_not_flagged(self) -> None:
+        self.assertFalse(extractor._function_might_skip(_fake_extractor_without_skip))
+
+    def test_a_skip_path_inside_a_nested_function_is_still_found(self) -> None:
+        # Dict literals with constant keys compile through a nested code
+        # object here (the closure), and `"skipped"` compiles to a *tuple* of
+        # keys (`BUILD_CONST_KEY_MAP`), not a bare string constant -- both
+        # need to survive the walk.
+        self.assertTrue(
+            extractor._function_might_skip(_fake_extractor_with_skip_in_a_closure)
+        )
+
+    def test_sharing_a_module_with_a_skipping_function_does_not_leak(self) -> None:
+        # The regression, direct: both functions live in *this* module, and
+        # this module's own source contains the word "skipped" many times
+        # over (this docstring, for one). Only the function whose own
+        # bytecode names it may be flagged.
+        self.assertFalse(extractor._function_might_skip(_fake_extractor_without_skip))
+        self.assertTrue(extractor._function_might_skip(_fake_extractor_with_skip))
+
+    def test_skipping_extensions_filters_a_fake_dispatch_table_per_function(
+        self,
+    ) -> None:
+        fake_dispatch = {
+            ".json": _fake_extractor_with_skip,
+            ".ts": _fake_extractor_without_skip,
+            ".py": _fake_extractor_without_skip,
+        }
+        extractor._skipping_extensions.cache_clear()
+        try:
+            with unittest.mock.patch("graphify.extract._DISPATCH", fake_dispatch):
+                found = extractor._skipping_extensions()
+        finally:
+            extractor._skipping_extensions.cache_clear()
+        self.assertEqual(found, frozenset({".json"}))
+
 
 class CommandDeadEndTest(unittest.TestCase):
     """Every command must have a way to be given what it needs.
@@ -604,7 +827,7 @@ class CommandDeadEndTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         self.cli = cli
         self.parser = cli.build_parser()
@@ -660,14 +883,14 @@ class PastedValueTest(unittest.TestCase):
 
     Reported from a real session: dragging a PDF into the terminal and pasting
     it at `bk capture`'s prompt produced `'/Users/…/file.pdf'` — quotes and
-    all — which brainkit then treated as a literal filename and rejected with
+    all — which brainskit then treated as a literal filename and rejected with
     "Capture source is not a file", echoing a command line with the quotes
-    still in it. The failure reads as brainkit being broken when it is one
+    still in it. The failure reads as brainskit being broken when it is one
     layer of shell quoting nobody removed.
     """
 
     def setUp(self) -> None:
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         self.cli = cli
         self._temp = TemporaryDirectory()
@@ -758,4 +981,4 @@ class ShimIsolationTest(unittest.TestCase):
         # the ownership check is the only thing standing between them.
         root = extractor._shim_root()
         assert root is not None
-        self.assertIn(f"brainkit-graphify-{extractor._shim_owner()}", str(root))
+        self.assertIn(f"brainskit-graphify-{extractor._shim_owner()}", str(root))

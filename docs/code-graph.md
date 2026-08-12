@@ -31,7 +31,7 @@ and the build proceeds, reporting what could not be parsed rather than
 succeeding quietly. Install one grammar, or all of them up front:
 
 ```bash
-uv tool install 'brainkit[code-all]'   # every language, a much larger download
+uv tool install 'brainskit[code-all]'   # every language, a much larger download
 ```
 
 The split is deliberate — grammars are compiled wheels, and `code-all` roughly
@@ -69,9 +69,9 @@ the paths it was given.
 
 `build` and `import` share one importer, so a graph from an external extractor
 is normalised on the way in rather than trusted as given. `communities`,
-`cycles` and `diff` are the three questions brainkit does not answer itself and
+`cycles` and `diff` are the three questions brainskit does not answer itself and
 are delegated to the vendored analysis; `affected`, `path` and `hubs` use
-brainkit's own traversal, which needs no dependency and already answers under a
+brainskit's own traversal, which needs no dependency and already answers under a
 `--consumer`.
 
 The vendored analysis subset, its upstream revision and the changes made to it

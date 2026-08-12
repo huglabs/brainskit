@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from brainkit.domain.model import NotFoundError, ValidationError
-from brainkit.infrastructure.integrations import NativeIntegrations, vault_id
-from brainkit.infrastructure.vault import FileVault
-from brainkit.infrastructure.vaults import VaultRegistry, default_registry_path
-from brainkit.interfaces import cli
+from brainskit.domain.model import NotFoundError, ValidationError
+from brainskit.infrastructure.integrations import NativeIntegrations, vault_id
+from brainskit.infrastructure.vault import FileVault
+from brainskit.infrastructure.vaults import VaultRegistry, default_registry_path
+from brainskit.interfaces import cli
 
 
 def policy() -> dict:
@@ -178,7 +178,7 @@ class RegistryRoundTripTest(RegistryFixture):
         self.assertEqual(sorted(path.name for path in root.iterdir()), before)
 
     def test_forget_refuses_a_selector_that_matches_nothing(self) -> None:
-        registry = VaultRegistry(self.config_home / "brainkit" / "vaults.json")
+        registry = VaultRegistry(self.config_home / "brainskit" / "vaults.json")
         with self.assertRaises(NotFoundError):
             registry.forget("no-such-label")
 
@@ -187,7 +187,7 @@ class RegistryRoundTripTest(RegistryFixture):
         second = self.make_vault("two/docs")
         self.result(["vaults", "register", str(first)])
         self.result(["vaults", "register", str(second)])
-        registry = VaultRegistry(self.config_home / "brainkit" / "vaults.json")
+        registry = VaultRegistry(self.config_home / "brainskit" / "vaults.json")
         with self.assertRaises(ValidationError) as raised:
             registry.forget("docs")
         self.assertEqual(len(raised.exception.details["paths"]), 2)
@@ -222,8 +222,8 @@ class RegistrationContractTest(RegistryFixture):
         self.assertEqual(code, 2)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "validation_error")
-        self.assertIn("Not a brainkit vault", payload["error"]["message"])
-        self.assertFalse((self.config_home / "brainkit" / "vaults.json").exists())
+        self.assertIn("Not a brainskit vault", payload["error"]["message"])
+        self.assertFalse((self.config_home / "brainskit" / "vaults.json").exists())
 
     def test_a_missing_path_is_refused_rather_than_registered_blindly(self) -> None:
         code, payload = self.run_cli(
@@ -252,11 +252,63 @@ class RegistrationContractTest(RegistryFixture):
         self.assertEqual(registered["vault"], str(root))
 
 
+class FileVaultDiscoverTest(RegistryFixture):
+    """The large majority of this user's real registered vaults live at
+    ``<project root>/docs/brain`` -- a descendant, not an ancestor, of the
+    project root someone actually ``cd``s into. The guided wizard's own
+    default, ``<project root>/.brainskit``, is a descendant too. `discover()`
+    must find both conventions at every level of its ancestor walk, without
+    guessing any other subdirectory name."""
+
+    def test_finds_a_vault_at_the_direct_dot_brain_location(self) -> None:
+        """Regression guard: the pre-existing, most direct case is untouched."""
+        root = self.make_vault("direct")
+        self.assertEqual(FileVault.discover(start=root).root, root)
+
+    def test_finds_a_vault_nested_under_docs_brain_from_the_project_root(self) -> None:
+        vault_root = self.make_vault("myproject/docs/brain")
+        project_root = vault_root.parent.parent
+        self.assertEqual(FileVault.discover(start=project_root).root, vault_root)
+
+    def test_finds_docs_brain_from_a_cwd_nested_below_the_project_root(self) -> None:
+        vault_root = self.make_vault("nestedproject/docs/brain")
+        project_root = vault_root.parent.parent
+        deep = project_root / "src" / "app" / "interfaces"
+        deep.mkdir(parents=True)
+        self.assertEqual(FileVault.discover(start=deep).root, vault_root)
+
+    def test_an_uninitialized_docs_brain_skeleton_is_not_mistaken_for_a_vault(
+        self,
+    ) -> None:
+        project_root = self.root / "skeleton-project"
+        (project_root / "docs" / "brain").mkdir(parents=True)
+        with self.assertRaises(NotFoundError):
+            FileVault.discover(start=project_root)
+
+    def test_finds_a_vault_nested_under_dot_brainskit_from_the_project_root(
+        self,
+    ) -> None:
+        """The guided wizard's own default location -- a vault created there
+        must be exactly as discoverable as one at `docs/brain`, or `bk web`
+        loops back to offering `bk init` forever on the location it just
+        created."""
+        vault_root = self.make_vault("wizardproject/.brainskit")
+        project_root = vault_root.parent
+        self.assertEqual(FileVault.discover(start=project_root).root, vault_root)
+
+    def test_finds_dot_brainskit_from_a_cwd_nested_below_the_project_root(self) -> None:
+        vault_root = self.make_vault("nestedwizard/.brainskit")
+        project_root = vault_root.parent
+        deep = project_root / "src" / "app" / "interfaces"
+        deep.mkdir(parents=True)
+        self.assertEqual(FileVault.discover(start=deep).root, vault_root)
+
+
 class RegistryFilePermissionsTest(RegistryFixture):
     def test_the_file_is_private_and_so_is_its_directory(self) -> None:
         root = self.make_vault("private")
         self.result(["vaults", "register", str(root)])
-        path = self.config_home / "brainkit" / "vaults.json"
+        path = self.config_home / "brainskit" / "vaults.json"
         self.assertTrue(path.is_file())
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
@@ -265,7 +317,7 @@ class RegistryFilePermissionsTest(RegistryFixture):
         first = self.make_vault("widen-one")
         second = self.make_vault("widen-two")
         self.result(["vaults", "register", str(first)])
-        directory = self.config_home / "brainkit"
+        directory = self.config_home / "brainskit"
         # Deliberately permissive: the widened directory is the precondition,
         # and the assertion below is that the next write closes it again.
         os.chmod(directory, 0o755)  # noqa: S103
@@ -276,7 +328,7 @@ class RegistryFilePermissionsTest(RegistryFixture):
         root = self.make_vault("no-secrets", enable="postgres")
         self.result(["vaults", "register", str(root)])
         raw = json.loads(
-            (self.config_home / "brainkit" / "vaults.json").read_text(encoding="utf-8")
+            (self.config_home / "brainskit" / "vaults.json").read_text(encoding="utf-8")
         )
         self.assertEqual(raw["version"], 1)
         for entry in raw["vaults"]:
@@ -284,17 +336,57 @@ class RegistryFilePermissionsTest(RegistryFixture):
 
 
 class RegistryLocationTest(unittest.TestCase):
+    """Where the machine-wide registry lives.
+
+    Every case here pins `XDG_CONFIG_HOME` to a temporary directory rather
+    than reading the real one. The path now depends on which files exist --
+    a pre-0.5 `brainkit/` registry is still honoured -- so a test that let
+    the developer's own `~/.config` answer would pass or fail according to
+    whose machine ran it.
+    """
+
+    def setUp(self) -> None:
+        self.config_home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.config_home, ignore_errors=True)
+        self.environment = {"XDG_CONFIG_HOME": str(self.config_home)}
+
+    def _write(self, name: str) -> Path:
+        path = self.config_home / name / "vaults.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"version": 1, "vaults": []}', encoding="utf-8")
+        return path
+
     def test_xdg_config_home_is_honoured_when_it_is_absolute(self) -> None:
         self.assertEqual(
             default_registry_path({"XDG_CONFIG_HOME": "/opt/cfg"}),
-            Path("/opt/cfg/brainkit/vaults.json"),
+            Path("/opt/cfg/brainskit/vaults.json"),
         )
 
     def test_an_unset_or_relative_value_falls_back_to_the_home_default(self) -> None:
-        expected = Path.home() / ".config" / "brainkit" / "vaults.json"
+        expected = Path.home() / ".config" / "brainskit" / "vaults.json"
         for environment in ({}, {"XDG_CONFIG_HOME": ""}, {"XDG_CONFIG_HOME": "cfg"}):
             with self.subTest(environment=environment):
-                self.assertEqual(default_registry_path(environment), expected)
+                with patch.object(Path, "exists", return_value=False):
+                    self.assertEqual(default_registry_path(environment), expected)
+
+    def test_a_fresh_machine_gets_the_current_name(self) -> None:
+        self.assertEqual(
+            default_registry_path(self.environment),
+            self.config_home / "brainskit" / "vaults.json",
+        )
+
+    def test_a_pre_rename_registry_is_still_read(self) -> None:
+        """The vaults a machine registered as brainkit exist there and
+        nowhere else, so an upgrade that ignored the old file would report an
+        empty registry and silently lose every vault on the machine."""
+
+        legacy = self._write("brainkit")
+        self.assertEqual(default_registry_path(self.environment), legacy)
+
+    def test_the_current_name_wins_once_it_exists(self) -> None:
+        self._write("brainkit")
+        current = self._write("brainskit")
+        self.assertEqual(default_registry_path(self.environment), current)
 
 
 class MissingVaultTest(RegistryFixture):
@@ -457,7 +549,7 @@ class MultiVaultSyncTest(RegistryFixture):
 
 class RegistryIntegrityTest(RegistryFixture):
     def test_a_corrupt_registry_is_reported_rather_than_silently_emptied(self) -> None:
-        path = self.config_home / "brainkit" / "vaults.json"
+        path = self.config_home / "brainskit" / "vaults.json"
         path.parent.mkdir(parents=True)
         path.write_text("{not json", encoding="utf-8")
         code, payload = self.run_cli(["vaults", "list"])
@@ -465,7 +557,7 @@ class RegistryIntegrityTest(RegistryFixture):
         self.assertIn("not valid JSON", payload["error"]["message"])
 
     def test_an_entry_without_a_path_is_refused(self) -> None:
-        path = self.config_home / "brainkit" / "vaults.json"
+        path = self.config_home / "brainskit" / "vaults.json"
         path.parent.mkdir(parents=True)
         path.write_text(
             json.dumps({"version": 1, "vaults": [{"label": "orphan"}]}),

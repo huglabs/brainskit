@@ -13,24 +13,24 @@ All capabilities are available through JSON CLI and the MCP tools
 ## Obsidian
 
 Obsidian sync is manifest-based. It copies the generated `wiki/`, `views/` and
-`graph/graph.json` into the selected vault and removes only files that brainkit
+`graph/graph.json` into the selected vault and removes only files that brainskit
 previously managed. Human-owned Obsidian content is never deleted. Raw evidence
 is excluded unless `--include-raw` is explicitly selected.
 
 ```bash
 bk --vault ./my-vault integration configure obsidian \
-  --enable --external --path "$HOME/Obsidian" --subdirectory brainkit
+  --enable --external --path "$HOME/Obsidian" --subdirectory brainskit
 bk --vault ./my-vault export --target obsidian
 bk --vault ./my-vault integration status obsidian
 ```
 
-Point `--path` at the brainkit vault itself for in-place Obsidian use. In that
-mode brainkit creates only the minimal `.obsidian/app.json` when absent and does
+Point `--path` at the brainskit vault itself for in-place Obsidian use. In that
+mode brainskit creates only the minimal `.obsidian/app.json` when absent and does
 not duplicate the knowledge files.
 
 ## Neo4j
 
-Neo4j uses the official Python driver and writes `BrainkitNode` nodes plus
+Neo4j uses the official Python driver and writes `BrainskitNode` nodes plus
 `SOURCED_FROM` and `LINKS_TO` relationships in one database transaction. This
 is a real Bolt push, not a Cypher-file export. Every node is namespaced with a
 stable vault ID, so a refresh replaces only that vault's subgraph and repeated
@@ -71,7 +71,7 @@ and read the natural key from JSONB:
 
 ```sql
 SELECT properties->>'id' AS id, label, path
-FROM brainkit.nodes WHERE vault_id = $1 AND kind = 'wiki';
+FROM brainskit.nodes WHERE vault_id = $1 AND kind = 'wiki';
 ```
 
 `graph_walk` needs no vault argument and takes none: since every id carries its
@@ -88,7 +88,7 @@ vault's last complete sync — and replaces them on the same run.
 export BRAINKIT_POSTGRES_PASSWORD='use-a-secret-manager-in-production'
 bk --vault ./my-vault integration configure postgres \
   --enable --managed --password-env BRAINKIT_POSTGRES_PASSWORD \
-  --user brainkit --database brainkit --schema brainkit --port 5432 \
+  --user brainskit --database brainskit --schema brainskit --port 5432 \
   --consumer local
 bk --vault ./my-vault integration up postgres
 bk --vault ./my-vault export --target postgres
@@ -101,7 +101,7 @@ For an existing service:
 export BRAINKIT_POSTGRES_DSN='postgresql://user:password@host/database'
 bk --vault ./my-vault integration configure postgres \
   --enable --external --dsn-env BRAINKIT_POSTGRES_DSN \
-  --schema brainkit --consumer cloud
+  --schema brainskit --consumer cloud
 bk --vault ./my-vault integration sync postgres
 ```
 
@@ -123,8 +123,8 @@ There is no discovery step, and that is deliberate: vaults live in unrelated
 projects, and a filesystem scan would be slow, would miss anything outside the
 trees it was pointed at, and would find checkouts, copies and backups that must
 never be synced into a shared store under their own identity. The list is
-declared once and lives at `$XDG_CONFIG_HOME/brainkit/vaults.json` (default
-`~/.config/brainkit/vaults.json`), file `0600` inside a `0700` directory. It
+declared once and lives at `$XDG_CONFIG_HOME/brainskit/vaults.json` (default
+`~/.config/brainskit/vaults.json`), file `0600` inside a `0700` directory. It
 holds paths and labels and nothing else — the same rule vault configuration
 follows, where only the *name* of an environment variable is ever stored.
 
@@ -145,7 +145,7 @@ vault alone:
 {"target": "postgres", "count": 4, "ok": 2, "skipped": 1, "failed": 1,
  "vaults": [{"label": "app-one", "vault_id": "2e2389340edfb82b1fe52ba9", "status": "ok", "result": {}},
             {"label": "app-optout", "status": "skipped", "reason": "postgres is not enabled in this vault's policy"},
-            {"label": "app-gone", "status": "failed", "code": "not_found", "reason": "Not a brainkit vault"}]}
+            {"label": "app-gone", "status": "failed", "code": "not_found", "reason": "Not a brainskit vault"}]}
 ```
 
 Exit is `1` when any vault failed and `0` when every vault succeeded or was

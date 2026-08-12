@@ -36,10 +36,10 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from brainkit.domain.model import INTEGRATION_NAMES, PrivacyMode
-from brainkit.interfaces import onboarding, prompt
-from brainkit.interfaces.onboarding import OllamaModel, OllamaProbe
-from brainkit.interfaces.prompt import Choice
+from brainskit.domain.model import INTEGRATION_NAMES, PrivacyMode
+from brainskit.interfaces import onboarding, prompt
+from brainskit.interfaces.onboarding import OllamaModel, OllamaProbe
+from brainskit.interfaces.prompt import Choice
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,7 +78,7 @@ class PolicyAssemblyTest(unittest.TestCase):
     def test_every_extras_combination_yields_a_config_the_domain_accepts(self) -> None:
         from itertools import chain, combinations
 
-        from brainkit.domain.model import VaultConfig
+        from brainskit.domain.model import VaultConfig
 
         options = ["agent", "obsidian", "web"]
         every = chain.from_iterable(
@@ -97,7 +97,7 @@ class PolicyAssemblyTest(unittest.TestCase):
 
         shipped = {
             entry.name[:-3]
-            for entry in (REPO_ROOT / "src" / "brainkit" / "jobs").iterdir()
+            for entry in (REPO_ROOT / "src" / "brainskit" / "jobs").iterdir()
             if entry.name.endswith(".md") and not entry.name.startswith("_")
         }
         self.assertEqual(set(onboarding.job_names()), shipped)
@@ -410,8 +410,8 @@ def _drive(
 _RAW_PRELUDE = """
 import sys, termios
 sys.path.insert(0, "src")
-from brainkit.interfaces import prompt
-from brainkit.interfaces.prompt import Choice
+from brainskit.interfaces import prompt
+from brainskit.interfaces.prompt import Choice
 """
 
 
@@ -494,7 +494,7 @@ class TopLevelHelpTest(unittest.TestCase):
     def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
         from contextlib import redirect_stderr, redirect_stdout
 
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         out, err = StringIO(), StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -570,7 +570,7 @@ class CommandBrowserTest(unittest.TestCase):
     CHILD = """
 import sys
 sys.path.insert(0, "src")
-from brainkit.interfaces import cli
+from brainskit.interfaces import cli
 raise SystemExit(cli.main([]))
 """
 
@@ -623,7 +623,7 @@ raise SystemExit(cli.main([]))
         commands to.
         """
 
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         self.assertIn("forget", cli._DESTRUCTIVE)
         for command in cli._DESTRUCTIVE:
@@ -638,7 +638,7 @@ class SubcommandHelpTest(unittest.TestCase):
     def test_it_delegates_to_argparse_rather_than_restating_flags(self) -> None:
         """One source of truth: what the browser shows is `bk <cmd> --help`."""
 
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         parser = cli.build_parser()
         rendered = cli._subcommand_help(parser, "hooks")
@@ -719,7 +719,7 @@ class RowFittingTest(unittest.TestCase):
     """
 
     def rows_for_every_group(self, width: int) -> list[str]:
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         parser = cli.build_parser()
         index = cli._command_help_index(parser)
@@ -732,7 +732,7 @@ class RowFittingTest(unittest.TestCase):
         return rendered
 
     def test_no_real_command_row_can_overflow_any_plausible_terminal(self) -> None:
-        from brainkit.interfaces import console
+        from brainskit.interfaces import console
 
         for width in (40, 60, 80, 100, 120):
             for row in self.rows_for_every_group(width):
@@ -745,13 +745,13 @@ class RowFittingTest(unittest.TestCase):
     def test_the_longest_help_string_is_the_one_that_used_to_break_it(self) -> None:
         """A guard on the premise, so this stays honest if the help text changes."""
 
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         index = cli._command_help_index(cli.build_parser())
         self.assertGreater(len(index["forget"]), 100)
 
     def test_truncation_keeps_colour_from_leaking_past_the_cut(self) -> None:
-        from brainkit.interfaces import console
+        from brainskit.interfaces import console
 
         coloured = console.style("x" * 50, console.ACCENT, stream=None)
         self.assertNotIn("\x1b", console.truncate(coloured, 10))
@@ -787,7 +787,7 @@ class ScreenIntegrityTest(unittest.TestCase):
         child = """
 import sys
 sys.path.insert(0, "src")
-from brainkit.interfaces import cli
+from brainskit.interfaces import cli
 raise SystemExit(cli.main([]))
 """
         # Enter the first group -- the one holding the 140-character `forget`
@@ -811,7 +811,7 @@ raise SystemExit(cli.main([]))
         alignment check alone can miss.
         """
 
-        from brainkit.interfaces import cli
+        from brainskit.interfaces import cli
 
         expected = len(cli.HELP_CATEGORIES[0][1])
         screen = self.screen_after_browsing(24, 80)

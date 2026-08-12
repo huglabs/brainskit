@@ -66,7 +66,7 @@ sys.path.insert(0, str(ROOT.parent / "src"))
 # nodes, so the first run of this benchmark measured 7.7% coverage on a fixture
 # whose every file parses correctly in isolation. Anything embedding the
 # extractor in-process needs this import at module scope for the same reason.
-import brainkit.infrastructure.codeanalysis  # noqa: E402,F401
+import brainskit.infrastructure.codeanalysis  # noqa: E402,F401
 
 #: Coverage must never fall. Time and memory are machine-dependent, so they
 #: only fail on a change large enough that no machine explains it.
@@ -156,10 +156,13 @@ def build_fixture(target: Path) -> None:
 def measure(name: str, repo: Path) -> Result:
     """Build a graph over `repo` in a throwaway vault and measure the result."""
 
-    from brainkit.application.codegraph import CodeGraph
-    from brainkit.domain.model import BrainkitError
-    from brainkit.infrastructure.extractor import GraphifyExtractor, _extension_grammars
-    from brainkit.infrastructure.vault import FileVault
+    from brainskit.application.codegraph import CodeGraph
+    from brainskit.domain.model import BrainskitError
+    from brainskit.infrastructure.extractor import (
+        GraphifyExtractor,
+        _extension_grammars,
+    )
+    from brainskit.infrastructure.vault import FileVault
 
     result = Result(name=name)
     with tempfile.TemporaryDirectory() as scratch:
@@ -170,7 +173,7 @@ def measure(name: str, repo: Path) -> Result:
             # repository it is measuring.
             relative = os.path.relpath(repo.resolve(), vault_root.resolve())
             vault = FileVault.initialize(vault_root, _policy(relative))
-        except BrainkitError as exc:
+        except BrainskitError as exc:
             result.error = str(exc)
             return result
 
@@ -205,7 +208,7 @@ def measure(name: str, repo: Path) -> Result:
         started = time.monotonic()
         try:
             built = graph.build()
-        except BrainkitError as exc:
+        except BrainskitError as exc:
             result.error = str(exc)
             return result
         result.seconds = round(time.monotonic() - started, 3)
@@ -245,7 +248,7 @@ def _deliberately_skipped(paths: list[Path]) -> list[Path]:
 
 
 def _policy(code_root: str) -> dict:
-    from brainkit.domain.model import DEFAULT_IGNORE_PATTERNS, INTEGRATION_NAMES
+    from brainskit.domain.model import DEFAULT_IGNORE_PATTERNS, INTEGRATION_NAMES
 
     jobs = ("digest", "file-proposal", "ingest", "lint-semantic", "query", "resurface")
     return {

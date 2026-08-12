@@ -22,10 +22,10 @@ with open("pyproject.toml", "rb") as handle:
 # `--wheel` build reads the working tree instead, so it can pass while the
 # shipped wheel is missing whatever the sdist dropped.
 echo "==> uv build (sdist, then wheel from sdist)"
-rm -f "dist/brainkit-$VERSION.tar.gz" "dist/brainkit-$VERSION-"*.whl
+rm -f "dist/brainskit-$VERSION.tar.gz" "dist/brainskit-$VERSION-"*.whl
 uv build --out-dir dist
-SDIST="dist/brainkit-$VERSION.tar.gz"
-WHEEL="$(echo "dist/brainkit-$VERSION-"*.whl)"
+SDIST="dist/brainskit-$VERSION.tar.gz"
+WHEEL="$(echo "dist/brainskit-$VERSION-"*.whl)"
 [ -f "$SDIST" ] || { echo "    missing sdist: $SDIST"; exit 1; }
 [ -f "$WHEEL" ] || { echo "    missing wheel: $WHEEL"; exit 1; }
 echo "    $SDIST"
@@ -49,10 +49,10 @@ expected = {
                              "lint-semantic.json", "query.json", "resurface.json"},
     "templates/default": {"schema.json"},
     "templates/agents": {"claude-skill.md", "instructions.md",
-                         "brainkit-gate.sh", "brainkit-status.sh"},
+                         "brainskit-gate.sh", "brainskit-status.sh"},
 }
 
-root = files("brainkit")
+root = files("brainskit")
 missing = []
 for subdir, names in expected.items():
     present = {entry.name for entry in (root / subdir).iterdir()}

@@ -27,13 +27,13 @@ from unittest.mock import patch
 
 from test_code_graph import _HAS_CODE_EXTRA
 
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import ValidationError
-from brainkit.infrastructure.extractor import GraphifyExtractor
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
-from brainkit.interfaces import cli
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import ValidationError
+from brainskit.infrastructure.extractor import GraphifyExtractor
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
+from brainskit.interfaces import cli
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -96,7 +96,7 @@ class VaultCase(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -144,7 +144,7 @@ class HookScriptTest(VaultCase):
 
     def test_both_hooks_are_written_and_executable(self) -> None:
         result = self.install()
-        for name in ("brainkit-gate", "brainkit-status"):
+        for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
                 self.assertEqual(result["claude_hook"]["scripts"][name]["state"], "created")
                 path = self.script(name)
@@ -153,7 +153,7 @@ class HookScriptTest(VaultCase):
 
     def test_the_vault_path_is_baked_in_shell_quoted(self) -> None:
         self.install()
-        for name in ("brainkit-gate", "brainkit-status"):
+        for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
                 content = self.script(name).read_text(encoding="utf-8")
                 self.assertNotIn("{{vault}}", content)
@@ -166,7 +166,7 @@ class HookScriptTest(VaultCase):
         # every write it exists to govern.
         awkward = self.root / "Protótipos e 'coisas'"
         awkward.mkdir()
-        rendered = cli._hook_script("brainkit-gate", awkward)
+        rendered = cli._hook_script("brainskit-gate", awkward)
         line = next(
             item for item in rendered.splitlines() if item.startswith("VAULT=")
         )
@@ -180,7 +180,7 @@ class HookScriptTest(VaultCase):
 
     def test_the_scripts_are_valid_posix_shell(self) -> None:
         self.install()
-        for name in ("brainkit-gate", "brainkit-status"):
+        for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
                 for shell in ("sh", "bash"):
                     checked = subprocess.run(
@@ -191,39 +191,39 @@ class HookScriptTest(VaultCase):
                     self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_an_unmanaged_script_is_never_clobbered(self) -> None:
-        target = self.script("brainkit-gate")
+        target = self.script("brainskit-gate")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
-        outcome = self.install()["claude_hook"]["scripts"]["brainkit-gate"]
+        outcome = self.install()["claude_hook"]["scripts"]["brainskit-gate"]
         self.assertEqual(outcome["state"], "skipped")
         self.assertIn("unmanaged", outcome["reason"])
         self.assertEqual(target.read_text(encoding="utf-8"), "#!/bin/sh\necho mine\n")
         # ...and it is not registered either, so settings never points at a
-        # script brainkit refused to manage.
+        # script brainskit refused to manage.
         self.assertEqual(self.commands("PreToolUse"), [])
 
     def test_force_replaces_an_unmanaged_script(self) -> None:
-        target = self.script("brainkit-gate")
+        target = self.script("brainskit-gate")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
-        outcome = self.install(force=True)["claude_hook"]["scripts"]["brainkit-gate"]
+        outcome = self.install(force=True)["claude_hook"]["scripts"]["brainskit-gate"]
         self.assertEqual(outcome["state"], "updated")
         self.assertIn(cli.HOOK_SENTINEL, target.read_text(encoding="utf-8"))
 
     def test_a_generated_script_is_repaired_in_place(self) -> None:
         self.install()
-        target = self.script("brainkit-gate")
+        target = self.script("brainskit-gate")
         target.write_text(f"{cli.HOOK_SENTINEL}\nrotted\n", encoding="utf-8")
         target.chmod(0o644)
-        outcome = self.install()["claude_hook"]["scripts"]["brainkit-gate"]
+        outcome = self.install()["claude_hook"]["scripts"]["brainskit-gate"]
         self.assertEqual(outcome["state"], "updated")
         self.assertTrue(os.stat(target).st_mode & stat.S_IXUSR)
 
     def test_a_lost_execute_bit_is_restored(self) -> None:
         self.install()
-        target = self.script("brainkit-status")
+        target = self.script("brainskit-status")
         target.chmod(0o644)
-        outcome = self.install()["claude_hook"]["scripts"]["brainkit-status"]
+        outcome = self.install()["claude_hook"]["scripts"]["brainskit-status"]
         self.assertEqual(outcome["state"], "current")
         self.assertTrue(os.stat(target).st_mode & stat.S_IXUSR)
 
@@ -240,10 +240,10 @@ class SettingsRegistrationTest(VaultCase):
         outcome = self.install()["claude_hook"]["settings"]
         self.assertEqual(outcome["state"], "created")
         self.assertEqual(
-            self.commands("PreToolUse"), [str(self.script("brainkit-gate"))]
+            self.commands("PreToolUse"), [str(self.script("brainskit-gate"))]
         )
         self.assertEqual(
-            self.commands("SessionStart"), [str(self.script("brainkit-status"))]
+            self.commands("SessionStart"), [str(self.script("brainskit-status"))]
         )
 
     def test_the_pre_tool_use_entry_matches_the_write_tools(self) -> None:
@@ -252,7 +252,7 @@ class SettingsRegistrationTest(VaultCase):
             item
             for item in self.settings()["hooks"]["PreToolUse"]
             if any(
-                hook["command"].endswith("brainkit-gate.sh") for hook in item["hooks"]
+                hook["command"].endswith("brainskit-gate.sh") for hook in item["hooks"]
             )
         )
         self.assertEqual(entry["matcher"], "Write|Edit|MultiEdit")
@@ -318,14 +318,14 @@ class SettingsRegistrationTest(VaultCase):
     def test_reinstalling_never_registers_a_second_entry(self) -> None:
         for _ in range(3):
             self.install()
-        gate = str(self.script("brainkit-gate"))
-        status = str(self.script("brainkit-status"))
+        gate = str(self.script("brainskit-gate"))
+        status = str(self.script("brainskit-status"))
         self.assertEqual(self.commands("PreToolUse").count(gate), 1)
         self.assertEqual(self.commands("SessionStart").count(status), 1)
 
     def test_an_entry_registered_by_hand_counts_as_present(self) -> None:
         # The idempotency key is the command path, not the shape of the entry
-        # brainkit would have written.
+        # brainskit would have written.
         self.install()
         self.settings_path().write_text(
             json.dumps(
@@ -337,7 +337,7 @@ class SettingsRegistrationTest(VaultCase):
                                 "hooks": [
                                     {
                                         "type": "command",
-                                        "command": str(self.script("brainkit-gate")),
+                                        "command": str(self.script("brainskit-gate")),
                                     }
                                 ],
                             }
@@ -347,7 +347,7 @@ class SettingsRegistrationTest(VaultCase):
                                 "hooks": [
                                     {
                                         "type": "command",
-                                        "command": str(self.script("brainkit-status")),
+                                        "command": str(self.script("brainskit-status")),
                                     }
                                 ]
                             }
@@ -397,14 +397,14 @@ class StaleHookReplacementTest(VaultCase):
 
     Reproduces onboarding `eigent`: a settings.json copied in from another
     project's `.claude/` (or written by an earlier install at a different
-    `--root`) registers `brainkit-gate.sh`/`brainkit-status.sh` at a path this
+    `--root`) registers `brainskit-gate.sh`/`brainskit-status.sh` at a path this
     install will never write to. The old idempotency key (the literal command
     string) never recognised that as the *same* hook, so both stayed
     registered forever.
     """
 
-    STALE_GATE = "/some/other/repo/.claude/hooks/brainkit-gate.sh"
-    STALE_STATUS = "/some/other/repo/.claude/hooks/brainkit-status.sh"
+    STALE_GATE = "/some/other/repo/.claude/hooks/brainskit-gate.sh"
+    STALE_STATUS = "/some/other/repo/.claude/hooks/brainskit-status.sh"
 
     def seed_stale_hooks(self, *, alongside_unrelated: bool = False) -> None:
         pre_tool_use = [
@@ -434,8 +434,8 @@ class StaleHookReplacementTest(VaultCase):
 
     def test_a_stale_path_is_replaced_not_duplicated(self) -> None:
         self.seed_stale_hooks()
-        gate = str(self.script("brainkit-gate"))
-        status = str(self.script("brainkit-status"))
+        gate = str(self.script("brainskit-gate"))
+        status = str(self.script("brainskit-status"))
         self.install()
         self.assertEqual(self.commands("PreToolUse"), [gate])
         self.assertEqual(self.commands("SessionStart"), [status])
@@ -531,7 +531,7 @@ class EnforcementReportTest(VaultCase):
         self.assertTrue(layers["instructions"]["advisory"])
 
     def test_a_skipped_script_makes_the_write_gate_inactive(self) -> None:
-        target = self.script("brainkit-gate")
+        target = self.script("brainskit-gate")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("#!/bin/sh\n", encoding="utf-8")
         result = self.install()
@@ -595,7 +595,7 @@ class CodeGraphBootstrapTest(VaultCase):
         self.assertIn("bk code build", warning)
 
     def test_an_unavailable_extractor_is_reported_not_raised(self) -> None:
-        service = BrainkitService(
+        service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -605,8 +605,8 @@ class CodeGraphBootstrapTest(VaultCase):
         with redirect_stderr(buffer):
             result = cli._install_hooks(service, "claude")
         self.assertEqual(result["code_graph"]["state"], "skipped")
-        self.assertIn("brainkit[code]", result["code_graph"]["hint"])
-        self.assertIn("brainkit[code]", buffer.getvalue())
+        self.assertIn("brainskit[code]", result["code_graph"]["hint"])
+        self.assertIn("brainskit[code]", buffer.getvalue())
 
 
 class _UnavailableExtractor:
@@ -638,7 +638,7 @@ class CodeGraphBootstrapBuildTest(unittest.TestCase):
             "def main():\n    return 1\n", encoding="utf-8"
         )
         self.vault = FileVault.initialize(self.repo / "docs" / "brain", policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -685,7 +685,7 @@ class GateCommandTest(VaultCase):
     def run_cli(self, argv: list[str], decision: dict[str, Any]) -> tuple[int, str, str]:
         out, err = StringIO(), StringIO()
         with patch.object(
-            BrainkitService,
+            BrainskitService,
             "gate_check_write",
             create=True,
             return_value=decision,
@@ -751,7 +751,7 @@ class GateCommandTest(VaultCase):
         # must not arrive at the hook wearing a denial's exit code by accident.
         out, err = StringIO(), StringIO()
         with patch.object(
-            BrainkitService, "gate_check_write", create=True, return_value={}
+            BrainskitService, "gate_check_write", create=True, return_value={}
         ):
             with redirect_stdout(out), redirect_stderr(err):
                 code = cli.main(
@@ -795,7 +795,7 @@ decide)
     ;;
 error_envelope)
     printf '%s\\n' '{"ok": false, "error": {"code": "not_found", \
-"message": "Not a brainkit vault"}}'
+"message": "Not a brainskit vault"}}'
     exit 2
     ;;
 usage_error)
@@ -859,7 +859,7 @@ class GateScriptTest(ShellHookCase):
 
     def test_a_write_under_wiki_is_refused_with_the_remediation(self) -> None:
         done = self.drive(
-            "brainkit-gate", self.hook_payload(f"{self.root}/wiki/concepts/foo.md")
+            "brainskit-gate", self.hook_payload(f"{self.root}/wiki/concepts/foo.md")
         )
         self.assertEqual(done.returncode, 2)
         self.assertIn("compiled from evidence", done.stderr)
@@ -868,7 +868,7 @@ class GateScriptTest(ShellHookCase):
 
     def test_a_write_elsewhere_passes_silently(self) -> None:
         done = self.drive(
-            "brainkit-gate", self.hook_payload(f"{self.root}/notes/scratch.md")
+            "brainskit-gate", self.hook_payload(f"{self.root}/notes/scratch.md")
         )
         self.assertEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
@@ -876,7 +876,7 @@ class GateScriptTest(ShellHookCase):
 
     def test_the_camel_case_field_name_is_understood(self) -> None:
         done = self.drive(
-            "brainkit-gate",
+            "brainskit-gate",
             self.hook_payload(f"{self.root}/wiki/concepts/foo.md", key="filePath"),
         )
         self.assertEqual(done.returncode, 2)
@@ -894,13 +894,13 @@ class GateScriptTest(ShellHookCase):
         ):
             with self.subTest(target=target):
                 done = self.drive(
-                    "brainkit-gate",
+                    "brainskit-gate",
                     self.hook_payload(target),
                     path=str(restricted),
                 )
                 self.assertEqual(done.returncode, expected)
         denied = self.drive(
-            "brainkit-gate",
+            "brainskit-gate",
             self.hook_payload(f"{self.root}/wiki/concepts/foo.md"),
             path=str(restricted),
         )
@@ -921,32 +921,32 @@ class GateScriptFailOpenTest(ShellHookCase):
         self, done: subprocess.CompletedProcess[str], expected: str
     ) -> None:
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("brainkit-gate:", done.stderr)
+        self.assertIn("brainskit-gate:", done.stderr)
         self.assertIn(expected, done.stderr)
 
     def test_empty_stdin(self) -> None:
-        self.assert_fails_open(self.drive("brainkit-gate", ""), "empty hook payload")
+        self.assert_fails_open(self.drive("brainskit-gate", ""), "empty hook payload")
 
     def test_malformed_stdin(self) -> None:
         self.assert_fails_open(
-            self.drive("brainkit-gate", "{not json at all"), "no file path"
+            self.drive("brainskit-gate", "{not json at all"), "no file path"
         )
 
     def test_stdin_without_a_tool_input(self) -> None:
         self.assert_fails_open(
-            self.drive("brainkit-gate", json.dumps({"tool_name": "Bash"})), "no file path"
+            self.drive("brainskit-gate", json.dumps({"tool_name": "Bash"})), "no file path"
         )
 
     def test_a_tool_input_that_is_not_an_object(self) -> None:
         self.assert_fails_open(
-            self.drive("brainkit-gate", json.dumps({"tool_input": "nope"})),
+            self.drive("brainskit-gate", json.dumps({"tool_input": "nope"})),
             "no file path",
         )
 
     def test_a_tool_without_a_file_path(self) -> None:
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate", json.dumps({"tool_input": {"command": "ls"}})
+                "brainskit-gate", json.dumps({"tool_input": {"command": "ls"}})
             ),
             "no file path",
         )
@@ -957,7 +957,7 @@ class GateScriptFailOpenTest(ShellHookCase):
         self.link(bare, "python3", "cat", "printf", "dirname", "sed")
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate",
+                "brainskit-gate",
                 self.hook_payload(self.DENY_TARGET),
                 path=str(bare),
             ),
@@ -971,7 +971,7 @@ class GateScriptFailOpenTest(ShellHookCase):
         self.link(bare, "cat", "printf", "sed")
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate",
+                "brainskit-gate",
                 self.hook_payload(self.DENY_TARGET),
                 path=str(bare),
             ),
@@ -979,7 +979,7 @@ class GateScriptFailOpenTest(ShellHookCase):
         )
 
     def test_a_vault_that_has_been_moved_away(self) -> None:
-        script = self.script("brainkit-gate")
+        script = self.script("brainskit-gate")
         stranded = Path(self.temporary.name).parent / f"{self.root.name}-stranded.sh"
         shutil.copyfile(script, stranded)
         stranded.chmod(0o755)
@@ -1004,7 +1004,7 @@ class GateScriptFailOpenTest(ShellHookCase):
         # unknown subcommand. The exit code alone is never proof of a denial.
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate",
+                "brainskit-gate",
                 self.hook_payload(self.DENY_TARGET),
                 env={"FAKE_BK_MODE": "error_envelope"},
             ),
@@ -1014,7 +1014,7 @@ class GateScriptFailOpenTest(ShellHookCase):
     def test_a_usage_error_carrying_exit_two_is_not_a_denial(self) -> None:
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate",
+                "brainskit-gate",
                 self.hook_payload(self.DENY_TARGET),
                 env={"FAKE_BK_MODE": "usage_error"},
             ),
@@ -1024,7 +1024,7 @@ class GateScriptFailOpenTest(ShellHookCase):
     def test_exit_two_with_no_output_is_not_a_denial(self) -> None:
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate",
+                "brainskit-gate",
                 self.hook_payload(self.DENY_TARGET),
                 env={"FAKE_BK_MODE": "silent_two"},
             ),
@@ -1034,12 +1034,96 @@ class GateScriptFailOpenTest(ShellHookCase):
     def test_an_unexpected_exit_code(self) -> None:
         self.assert_fails_open(
             self.drive(
-                "brainkit-gate",
+                "brainskit-gate",
                 self.hook_payload(self.DENY_TARGET),
                 env={"FAKE_BK_MODE": "crash"},
             ),
             "exited 137",
         )
+
+
+class DoctorGateProbeTest(ShellHookCase):
+    """`bk doctor` must run the gate, not confirm that its file exists.
+
+    Every other enforcement answer is "installed and registered". The hook
+    fails open by design in half a dozen ways, so those two claims come apart
+    silently: `bk status` keeps reporting the layer active while a write to
+    `wiki/` sails straight through. These pin the difference.
+    """
+
+    def doctor(self, *, path: str | None = None) -> dict[str, Any]:
+        environment = dict(os.environ)
+        environment["PATH"] = (
+            path if path is not None else f"{self.bin}{os.pathsep}{os.environ['PATH']}"
+        )
+        # Pin the grammars so `healthy` reflects the probe and nothing else.
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            cli, "grammar_inventory", return_value={"python": True}
+        ):
+            return cli._doctor(self.service)
+
+    def probe(self, **kwargs: Any) -> dict[str, Any]:
+        report = self.doctor(**kwargs)["enforcement"]["write_gate_probe"]
+        assert isinstance(report, dict)
+        return report
+
+    def test_a_working_gate_is_reported_as_enforcing(self) -> None:
+        report = self.probe()
+        self.assertEqual(report["state"], "enforcing")
+        self.assertTrue(report["denies_a_gated_write"])
+        self.assertTrue(report["allows_an_ordinary_write"])
+        self.assertTrue(self.doctor()["healthy"])
+
+    def test_a_gate_that_cannot_reach_bk_is_caught(self) -> None:
+        """The field failure: registered, active in `status`, guarding nothing."""
+        layers = {
+            layer["layer"]: layer
+            for layer in self.service.status()["enforcement"]["layers"]
+        }
+        self.assertTrue(layers["write_gate"]["active"], "status should still say active")
+
+        report = self.probe(path="/usr/bin:/bin")
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertFalse(report["denies_a_gated_write"])
+        self.assertIn("not guarding", report["detail"])
+
+    def test_the_failure_repeats_the_hook_s_own_explanation(self) -> None:
+        """The script names the missing piece better than an exit code can."""
+        self.assertIn("bk is not on PATH", self.probe(path="/usr/bin:/bin")["hook_said"])
+
+    def test_a_gate_that_cannot_reach_bk_makes_the_install_unhealthy(self) -> None:
+        self.assertFalse(self.doctor(path="/usr/bin:/bin")["healthy"])
+
+    def test_a_gate_that_denies_everything_is_reported_too(self) -> None:
+        """Broken in the direction that stops work is still broken."""
+        script = self.script("brainskit-gate")
+        script.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+        script.chmod(0o755)
+        report = self.probe()
+        self.assertEqual(report["state"], "over_blocking")
+        self.assertFalse(report["allows_an_ordinary_write"])
+        self.assertFalse(self.doctor()["healthy"])
+
+    def test_a_hook_that_cannot_be_executed_is_not_trusted(self) -> None:
+        """A lost executable bit disables a hook without changing a byte of it."""
+        self.script("brainskit-gate").chmod(0o644)
+        self.assertEqual(self.probe()["state"], "unknown")
+        self.assertFalse(self.doctor()["healthy"])
+
+    def test_no_installed_gate_is_reported_without_failing_the_install(self) -> None:
+        """A vault with no agent is a choice, not a fault."""
+        self.script("brainskit-gate").unlink()
+        self.assertEqual(self.probe()["state"], "absent")
+        self.assertTrue(self.doctor()["healthy"])
+
+    def test_the_probe_writes_nothing(self) -> None:
+        """Both probes are decisions. Neither may leave a file behind."""
+        self.doctor()
+        stray = [
+            str(path)
+            for path in self.root.parent.rglob("*brainskit-doctor-probe*")
+        ]
+        self.assertEqual(stray, [])
 
 
 class StatusScriptTest(ShellHookCase):
@@ -1051,15 +1135,15 @@ class StatusScriptTest(ShellHookCase):
         directory.mkdir()
         shim = directory / "bk"
         shim.write_text(
-            f'#!/bin/sh\nexec {sys.executable} -m brainkit "$@"\n', encoding="utf-8"
+            f'#!/bin/sh\nexec {sys.executable} -m brainskit "$@"\n', encoding="utf-8"
         )
         shim.chmod(0o755)
         return directory
 
     def test_it_emits_the_summary_itself_not_a_path_to_it(self) -> None:
-        done = self.drive("brainkit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}")
+        done = self.drive("brainskit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}")
         self.assertEqual(done.returncode, 0)
-        self.assertIn("brainkit vault", done.stdout)
+        self.assertIn("brainskit vault", done.stdout)
         for expected in ("sources", "wiki", "freshness", "proposals pending", "lint"):
             with self.subTest(row=expected):
                 self.assertIn(expected, done.stdout)
@@ -1067,7 +1151,7 @@ class StatusScriptTest(ShellHookCase):
         self.assertLess(len(done.stdout.splitlines()), 20)
 
     def test_it_names_the_enforcement_layers_that_are_off(self) -> None:
-        done = self.drive("brainkit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}")
+        done = self.drive("brainskit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}")
         self.assertIn("write gate active", done.stdout)
         self.assertIn("commit lint OFF", done.stdout)
         self.assertIn("not a git repository", done.stdout)
@@ -1075,7 +1159,7 @@ class StatusScriptTest(ShellHookCase):
     def test_a_vault_it_cannot_reach_is_announced_rather_than_ignored(self) -> None:
         # The failure this guards against: a hook that exits 0 in silence stays
         # dead for weeks because nothing ever reports that it did nothing.
-        script = self.script("brainkit-status")
+        script = self.script("brainskit-status")
         stranded = Path(self.temporary.name).parent / f"{self.root.name}-status.sh"
         shutil.copyfile(script, stranded)
         stranded.chmod(0o755)
@@ -1095,17 +1179,17 @@ class StatusScriptTest(ShellHookCase):
     def test_a_vault_bk_refuses_to_open_is_announced_with_the_reason(self) -> None:
         (self.root / ".brain" / "config.json").unlink()
         done = self.drive(
-            "brainkit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}"
+            "brainskit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}"
         )
         self.assertEqual(done.returncode, 0)
         self.assertIn("bk status exited", done.stderr)
-        self.assertIn("Not a brainkit vault", done.stderr)
+        self.assertIn("Not a brainskit vault", done.stderr)
 
     def test_a_missing_bk_is_announced(self) -> None:
         bare = self.root / "status-bare-bin"
         bare.mkdir()
         self.link(bare, "python3", "cat", "printf", "dirname", "sed")
-        done = self.drive("brainkit-status", path=str(bare))
+        done = self.drive("brainskit-status", path=str(bare))
         self.assertEqual(done.returncode, 0)
         self.assertIn("bk is not on PATH", done.stderr)
 
@@ -1114,7 +1198,7 @@ class StatusScriptTest(ShellHookCase):
         bare.mkdir()
         os.symlink(self.bin / "bk", bare / "bk")
         self.link(bare, "cat", "printf", "dirname", "sed")
-        done = self.drive("brainkit-status", path=str(bare))
+        done = self.drive("brainskit-status", path=str(bare))
         self.assertEqual(done.returncode, 0)
         self.assertIn("python3 is not available", done.stderr)
 
@@ -1123,7 +1207,7 @@ class PackagingTest(unittest.TestCase):
     """A template missing from package-data works from source and breaks in the wheel."""
 
     def test_the_hook_scripts_resolve_through_importlib_resources(self) -> None:
-        for name in ("brainkit-gate", "brainkit-status"):
+        for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
                 self.assertIn(cli.HOOK_SENTINEL, cli._hook_script(name, Path("/tmp")))
 
@@ -1132,10 +1216,10 @@ class PackagingTest(unittest.TestCase):
 
         with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
             declared = tomllib.load(handle)["tool"]["setuptools"]["package-data"]
-        self.assertIn("templates/agents/*.sh", declared["brainkit"])
+        self.assertIn("templates/agents/*.sh", declared["brainskit"])
 
     def test_every_shipped_hook_template_has_a_declaration(self) -> None:
-        templates = REPO_ROOT / "src" / "brainkit" / "templates" / "agents"
+        templates = REPO_ROOT / "src" / "brainskit" / "templates" / "agents"
         shipped = {path.name for path in templates.glob("*.sh")}
         expected = {f"{hook.template}.sh" for hook in cli.CLAUDE_HOOKS}
         self.assertEqual(shipped, expected)
@@ -1156,7 +1240,7 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
         self.project = Path(self.temporary.name).resolve()
         (self.project / ".claude").mkdir()
         self.vault = FileVault.initialize(self.project / "docs" / "brain", policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -1175,8 +1259,8 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
         self.assertEqual(result["workspace"], str(self.project))
         for path in (
             self.project / ".claude" / "settings.json",
-            self.project / ".claude" / "hooks" / "brainkit-gate.sh",
-            self.project / ".claude" / "skills" / "brainkit" / "SKILL.md",
+            self.project / ".claude" / "hooks" / "brainskit-gate.sh",
+            self.project / ".claude" / "skills" / "brainskit" / "SKILL.md",
             self.project / "CLAUDE.md",
         ):
             with self.subTest(path=path.name):
@@ -1193,7 +1277,7 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
     def test_the_hook_still_governs_the_vault_not_the_workspace(self) -> None:
         self.install(root=str(self.project))
         script = (
-            self.project / ".claude" / "hooks" / "brainkit-gate.sh"
+            self.project / ".claude" / "hooks" / "brainskit-gate.sh"
         ).read_text(encoding="utf-8")
         # Compare the whole assignment line: the vault path is *under* the
         # project path, so a substring check passes for the wrong value too.
@@ -1213,7 +1297,7 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
         """
         self.install(root=str(self.project))
         script = (
-            self.project / ".claude" / "hooks" / "brainkit-status.sh"
+            self.project / ".claude" / "hooks" / "brainskit-status.sh"
         ).read_text(encoding="utf-8")
         assigned = {
             line.split("=", 1)[0]: line.split("=", 1)[1]
@@ -1228,7 +1312,7 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
     def test_no_template_placeholder_survives_rendering(self) -> None:
         """An unsubstituted {{token}} is a silent hole in a shipped script."""
         self.install(root=str(self.project))
-        for name in ("brainkit-gate", "brainkit-status"):
+        for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
                 body = (
                     self.project / ".claude" / "hooks" / f"{name}.sh"
@@ -1276,6 +1360,86 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
         self.assertTrue(hook.is_file())
         # It must lint the vault, which is not the repository it lives in.
         self.assertIn(json.dumps(str(self.root)), hook.read_text(encoding="utf-8"))
+
+
+class RedirectedHooksPathInstallTest(VaultCase):
+    """A repository whose `core.hooksPath` moved must not be told a hook landed.
+
+    Husky sets `core.hooksPath` on every install, and git then never reads
+    `.git/hooks/pre-commit` again. Writing there would leave a file that looks
+    installed, reports active, and never runs -- the artefact-versus-execution
+    gap this installer's own enforcement summary exists to close.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True)
+
+    def redirect(self, relative: str = ".husky/_") -> None:
+        subprocess.run(
+            ["git", "config", "core.hooksPath", relative], cwd=self.root, check=True
+        )
+
+    def hook(self) -> Path:
+        return self.root / ".git" / "hooks" / "pre-commit"
+
+    def commit_layer(self, result: dict[str, Any]) -> dict[str, Any]:
+        for entry in result["enforcement"]["layers"]:
+            if entry["layer"] == "commit_lint":
+                return entry
+        raise AssertionError("no commit_lint layer reported")
+
+    def test_a_default_repository_still_installs_the_hook(self) -> None:
+        """The control: without the setting, this path is untouched."""
+        result = self.install()
+        self.assertEqual(result["pre_commit"]["state"], "created")
+        self.assertTrue(self.hook().is_file())
+        self.assertTrue(self.commit_layer(result)["active"])
+
+    def test_a_redirected_hooks_path_writes_no_hook_at_all(self) -> None:
+        self.redirect()
+        result = self.install()
+        self.assertEqual(result["pre_commit"]["state"], "skipped")
+        self.assertFalse(
+            self.hook().exists(),
+            "wrote a hook into a directory git does not read",
+        )
+
+    def test_the_refusal_names_the_directory_and_how_to_wire_it(self) -> None:
+        """"Skipped" alone leaves the operator with no way to restore the layer."""
+        self.redirect()
+        pre_commit = self.install()["pre_commit"]
+        self.assertIn("core.hooksPath", pre_commit["reason"])
+        self.assertIn(".husky/_", pre_commit["reason"])
+        self.assertIn(str(self.root / ".husky" / "_" / "pre-commit"), pre_commit["hint"])
+        self.assertIn("lint --changed", pre_commit["hint"])
+        self.assertEqual(pre_commit["enforcement"], "off")
+
+    def test_the_enforcement_summary_reports_the_layer_off(self) -> None:
+        self.redirect()
+        result = self.install()
+        entry = self.commit_layer(result)
+        self.assertFalse(entry["active"])
+        self.assertIn("core.hooksPath", entry["reason"])
+
+    def test_force_cannot_make_git_read_a_directory_it_does_not(self) -> None:
+        """`--force` decides whether to clobber a hook, not which directory runs."""
+        self.redirect()
+        result = self.install(force=True)
+        self.assertEqual(result["pre_commit"]["state"], "skipped")
+        self.assertFalse(self.hook().exists())
+
+    def test_the_other_layers_still_install(self) -> None:
+        """One dead layer must not take the write gate down with it."""
+        self.redirect()
+        result = self.install()
+        active = {
+            entry["layer"]
+            for entry in result["enforcement"]["layers"]
+            if entry["active"]
+        }
+        self.assertIn("write_gate", active)
+        self.assertIn("session_status", active)
 
 
 class StandaloneVaultWorkspaceTest(VaultCase):

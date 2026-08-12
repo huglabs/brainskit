@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import ClassVar
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CODEANALYSIS = REPO_ROOT / "src" / "brainkit" / "infrastructure" / "codeanalysis"
+CODEANALYSIS = REPO_ROOT / "src" / "brainskit" / "infrastructure" / "codeanalysis"
 
 #: `tree_sitter` itself is the runtime, not a grammar, and `tree_sitter_version`
 #: is a substring of the `_check_tree_sitter_version` helper rather than a
@@ -107,15 +107,15 @@ class GrammarCoverageTest(unittest.TestCase):
     def test_code_all_includes_code_rather_than_replacing_it(self) -> None:
         data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text("utf-8"))
         self.assertIn(
-            "brainkit[code]", data["project"]["optional-dependencies"]["code-all"]
+            "brainskit[code]", data["project"]["optional-dependencies"]["code-all"]
         )
 
 
 class InstallHintTest(unittest.TestCase):
-    """The hint has to name something a brainkit user can actually install.
+    """The hint has to name something a brainskit user can actually install.
 
     Upstream pointed every missing-grammar message at a `graphifyy` extra.
-    brainkit vendors this code and does not depend on graphifyy, so following
+    brainskit vendors this code and does not depend on graphifyy, so following
     that instruction installed an unrelated distribution and the file still
     contributed nothing.
     """
@@ -133,7 +133,7 @@ class InstallHintTest(unittest.TestCase):
 
         source = (CODEANALYSIS / "extract.py").read_text("utf-8")
         self.assertIn('_module.group(1).replace("_", "-")', source)
-        self.assertIn("brainkit[code-all]", source)
+        self.assertIn("brainskit[code-all]", source)
 
     def test_graphifyy_is_not_a_dependency_which_is_why_that_hint_was_wrong(
         self,
@@ -170,7 +170,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainkit.infrastructure.codeanalysis.extractors.json_config import (
+        from brainskit.infrastructure.codeanalysis.extractors.json_config import (
             extract_json,
         )
 
@@ -191,7 +191,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainkit.infrastructure.codeanalysis.extractors.json_config import (
+        from brainskit.infrastructure.codeanalysis.extractors.json_config import (
             extract_json,
         )
 
@@ -210,7 +210,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stderr
 
-        from brainkit.infrastructure.codeanalysis.extract import extract
+        from brainskit.infrastructure.codeanalysis.extract import extract
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -233,7 +233,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stderr
 
-        from brainkit.infrastructure.codeanalysis.extract import extract
+        from brainskit.infrastructure.codeanalysis.extract import extract
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -263,7 +263,7 @@ class SkipCachingTest(unittest.TestCase):
     """
 
     def build_twice(self, root: Path) -> tuple[dict, dict]:
-        from brainkit.infrastructure.codeanalysis.extract import extract
+        from brainskit.infrastructure.codeanalysis.extract import extract
 
         paths = [root / "data.json"]
         first = extract(paths, cache_root=root / "cache", root=root, parallel=False)
@@ -274,7 +274,7 @@ class SkipCachingTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainkit.infrastructure.codeanalysis.cache import load_cached
+        from brainskit.infrastructure.codeanalysis.cache import load_cached
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -294,7 +294,7 @@ class SkipCachingTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainkit.infrastructure.codeanalysis.extractors.json_config import (
+        from brainskit.infrastructure.codeanalysis.extractors.json_config import (
             extract_json,
         )
 
@@ -319,8 +319,8 @@ class SkipCachingTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainkit.infrastructure.codeanalysis.cache import load_cached
-        from brainkit.infrastructure.codeanalysis.extract import (
+        from brainskit.infrastructure.codeanalysis.cache import load_cached
+        from brainskit.infrastructure.codeanalysis.extract import (
             _PARALLEL_THRESHOLD,
             extract,
         )

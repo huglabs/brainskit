@@ -1,33 +1,72 @@
 <div align="center">
 
-# brainkit `bk`
+<img src="./docs/assets/brainskit-mark.svg" width="84" alt="" />
 
-**A local-first, LLM-agnostic second-brain engine —
-the compilation gate between raw evidence and knowledge an agent may act on.**
+# brainskit `bk`
 
-[![PyPI](https://img.shields.io/pypi/v/brainkit?style=flat-square)](https://pypi.org/project/brainkit/)
-[![Python](https://img.shields.io/pypi/pyversions/brainkit?style=flat-square)](https://pypi.org/project/brainkit/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](./LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/huglabs/brainskit/ci.yml?branch=main&style=flat-square)](https://github.com/huglabs/brainskit/actions/workflows/ci.yml)
+**The compilation gate between raw evidence and knowledge an agent may act on.**
+
+Local-first · LLM-agnostic · nothing reaches the wiki without provenance
+
+[![PyPI](https://img.shields.io/pypi/v/brainskit?style=flat-square&color=ee502c&labelColor=0c0c0c&logo=pypi&logoColor=white)](https://pypi.org/project/brainskit/)
+[![Python](https://img.shields.io/pypi/pyversions/brainskit?style=flat-square&color=ee502c&labelColor=0c0c0c&logo=python&logoColor=white)](https://pypi.org/project/brainskit/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-ee502c?style=flat-square&labelColor=0c0c0c)](./LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/huglabs/brainskit/ci.yml?branch=main&style=flat-square&color=ee502c&labelColor=0c0c0c&logo=githubactions&logoColor=white)](https://github.com/huglabs/brainskit/actions/workflows/ci.yml)
+[![by HugLabs](https://img.shields.io/badge/by-HugLabs-ee502c?style=flat-square&labelColor=0c0c0c)](https://huglabs.ai)
+
+[Getting started](./docs/getting-started.md) ·
+[Commands](./docs/commands.md) ·
+[Privacy](./docs/privacy.md) ·
+[Architecture](./docs/architecture.md) ·
+[All docs](./docs/README.md)
+
+<sub>An open-source project from <a href="https://huglabs.ai"><b>HugLabs</b></a> — the applied research laboratory for enterprise AI that ships.</sub>
 
 </div>
 
 ---
 
+```
+██████╗ ██████╗  █████╗ ██╗███╗   ██╗███████╗██╗  ██╗██╗████████╗
+██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║██╔════╝██║ ██╔╝██║╚══██╔══╝
+██████╔╝██████╔╝███████║██║██╔██╗ ██║███████╗█████╔╝ ██║   ██║
+██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║╚════██║██╔═██╗ ██║   ██║
+██████╔╝██║  ██║██║  ██║██║██║ ╚████║███████║██║  ██╗██║   ██║
+╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝   ╚═╝
+        by HugLabs • Enterprise AI that ships
+        www.huglabs.ai • open source, Apache-2.0
+```
+
 A knowledge base an agent writes to freely stops being evidence and becomes
 model output with a filename.
 
-brainkit takes the opposite position and enforces it mechanically. Markdown and
+brainskit takes the opposite position and enforces it mechanically. Markdown and
 JSON are the source of truth; SQLite FTS5 is a disposable search index. A model
 may *propose* what your knowledge base should say, but only the deterministic
-`bk apply` gate may *write* it — and only if every claim cites a source that
-resolves inside the vault.
+`bk apply` gate may *write* it — and the write is refused unless every citation
+in the page resolves to a source registered in this vault.
+
+That refusal is the product:
+
+```console
+$ bk apply proposal.json
+bk: Apply proposal rejected; no files were written
+  failures: path: wiki/concepts/context-rot.md, code: citation_mismatch,
+            missing_citations: (none),
+            undeclared_citations: 0000000000000000000000000000000000000000000000000000000000000000
+$ echo $?
+2
+```
+
+One unresolvable citation, and the whole batch is rejected — not partially
+written, not written with a warning. Exit code 2 tells the caller to fix the
+proposal and retry; nothing on disk moved.
 
 | Invariant | How it is enforced |
 |---|---|
 | **Raw evidence is immutable** | Captures are identified by SHA-256 of their bytes; `bk lint` compares current bytes against the registered hash, and `bk reconcile` heals a move without rewriting identity. |
 | **Only the gate writes the wiki** | `bk apply` validates schema, citations, links and novelty for the whole batch before a single page is replaced; direct wiki edits are reported by `lint`. |
-| **Every claim carries provenance** | A page body cites the source hashes it was derived from, and those sources must resolve inside the vault before the write is eligible. |
+| **Every page carries provenance** | A page declares the source hashes it was derived from, each must be cited in the body, and each must resolve inside the vault before the write is eligible. |
 | **Privacy is a declared boundary** | Machine callers must name a consumer (`local`, `cloud`, `human`); the filter runs after graph expansion, so an edge cannot reintroduce restricted evidence. |
 | **Mechanical stays LLM-free** | Capture, index, search, apply, export and the structural lint never call a model. Judgment flows are separate, schema-bound, and routed by the strictest policy in the evidence set. |
 | **A write is one unit of work** | Wiki pages, freshness, registry status, the raw-file move and the FTS5 update become visible together or are restored from the transaction journal. |
@@ -44,7 +83,7 @@ install it as an isolated tool. It lands on `PATH` for every vault without
 becoming a dependency of any project.
 
 ```bash
-uv tool install brainkit     # or: pipx install brainkit
+uv tool install brainskit     # or: pipx install brainskit
 bk --help
 ```
 
@@ -52,10 +91,10 @@ Four extras are optional, because the core keeps a single dependency and none of
 these capabilities is one every vault wants:
 
 ```bash
-uv tool install 'brainkit[integrations]'  # Neo4j and PostgreSQL drivers
-uv tool install 'brainkit[code]'          # bk code: tree-sitter grammars, ~70 MB
-uv tool install 'brainkit[code-all]'      # every language the extractors can drive
-uv tool install 'brainkit[convert]'       # capture .docx/.pdf/.pptx via markitdown
+uv tool install 'brainskit[integrations]'  # Neo4j and PostgreSQL drivers
+uv tool install 'brainskit[code]'          # bk code: tree-sitter grammars, ~70 MB
+uv tool install 'brainskit[code-all]'      # every language the extractors can drive
+uv tool install 'brainskit[convert]'       # capture .docx/.pdf/.pptx via markitdown
 ```
 
 `code` is the larger commitment: vendoring the analysis source did not vendor a
@@ -68,15 +107,15 @@ stored verbatim with a "no converter available" note rather than being refused.
 Install the working tree, a git ref, or a built wheel with the same command:
 
 ```bash
-uv tool install /path/to/brainkit
-uv tool install 'brainkit @ git+https://github.com/huglabs/brainskit@v0.4.0'
+uv tool install /path/to/brainskit
+uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.4.0'
 ```
 
 To pin `bk` to one project instead of the machine, declare it as a dependency
 and run it through the project environment:
 
 ```bash
-uv add brainkit
+uv add brainskit
 uv run bk --vault ./my-vault status
 ```
 
@@ -107,6 +146,34 @@ bk --vault ./my-vault status
 `context` returns the bounded evidence bundle an agent needs to build an apply
 proposal; `apply` validates the complete batch before any page is replaced. The
 full contract is in [Getting started](./docs/getting-started.md).
+
+`bk status` is the vault in one screen — counts, branches, freshness, whether
+the derived projections still match the pages they were built from, and whether
+the enforcement layers are actually running:
+
+```console
+$ bk --vault ./my-vault status
+✓ vault healthy
+
+vault       /home/you/my-vault
+sources     45
+pending     4
+wiki pages  36
+indexed     81 documents (updated 2026-08-11T04:06:07.222244+00:00)
+
+————————————————————————— wiki freshness —————————————————————————
+fresh    19
+review   17
+stale    0
+unknown  0
+
+—————————————————————————— enforcement ———————————————————————————
+layer           status
+write_gate      ✓ active
+session_status  ✓ active
+commit_lint     ✓ active
+instructions    ✓ active
+```
 
 ## Documentation
 
@@ -184,4 +251,31 @@ reporting a vulnerability privately.
 Apache-2.0. See [LICENSE](./LICENSE), and [NOTICE](./NOTICE) for the vendored
 code-analysis subset and its attribution.
 
-Built and maintained by [HugLabs](https://hugyourcustomer.ai).
+---
+
+<div align="center">
+
+<a href="https://huglabs.ai">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/huglabs-dark.png" />
+    <img src="./docs/assets/huglabs-light.png" width="168" alt="HugLabs" />
+  </picture>
+</a>
+
+### Built and maintained by HugLabs
+
+**The applied research laboratory for enterprise AI that ships.**
+
+A Brazilian AI research lab and venture studio that transforms cutting-edge
+science into real systems for critical business problems — six product
+families, eleven products in production, and an academic partnership with
+CEIA-UFG.
+
+brainskit is the memory layer underneath that work, released as open source
+because a provenance gate is only worth trusting if you can read it.
+
+[huglabs.ai](https://huglabs.ai) ·
+[github.com/huglabs](https://github.com/huglabs) ·
+*Academic rigor, startup deadlines.*
+
+</div>

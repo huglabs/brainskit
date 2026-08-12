@@ -1,0 +1,12 @@
+# >>> brainkit >>>
+graph/
+output/
+views/
+.brain/index.db
+.brain/index.db-shm
+.brain/index.db-wal
+.brain/*.lock
+.brain/services/
+.brain/code-cache/
+.brain/extracted/
+# <<< brainkit <<<

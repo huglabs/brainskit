@@ -6,12 +6,12 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import DEFAULT_IGNORE_PATTERNS, ValidationError
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.integrations import NativeIntegrations
-from brainkit.infrastructure.vault import FileVault
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import DEFAULT_IGNORE_PATTERNS, ValidationError
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.integrations import NativeIntegrations
+from brainskit.infrastructure.vault import FileVault
 
 FILE_EXPORT_TARGETS = ("json", "graphml", "cypher", "kuzu", "llms-txt")
 
@@ -63,7 +63,7 @@ class ServiceFixture(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -196,10 +196,10 @@ class ObsidianConsumerTest(ServiceFixture):
             "obsidian",
             enabled=True,
             managed=False,
-            options={"path": destination, "subdirectory": "brainkit", **options},
+            options={"path": destination, "subdirectory": "brainskit", **options},
         )
         self.service.integration_sync("obsidian")
-        return Path(destination) / "brainkit"
+        return Path(destination) / "brainskit"
 
     def test_unset_consumer_defaults_to_local_instead_of_human(self) -> None:
         self.assertEqual(self.service.projections._integration_consumer("obsidian"), "local")
@@ -662,16 +662,16 @@ class WatchIgnoreTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def service(self, name: str, **overrides: Any) -> BrainkitService:
+    def service(self, name: str, **overrides: Any) -> BrainskitService:
         raw = policy()
         raw["sources"] = [str(self.source)]
         raw.update(overrides)
         vault = FileVault.initialize(self.work / name, raw)
-        return BrainkitService(
+        return BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
 
-    def captured(self, service: BrainkitService) -> list[str]:
+    def captured(self, service: BrainskitService) -> list[str]:
         return sorted(
             record.original_name for record in service.vault.registry().values()
         )
@@ -719,7 +719,7 @@ class WatchIgnoreTest(unittest.TestCase):
         raw = policy()
         raw["sources"] = [str(self.source)]
         vault = FileVault.initialize(nested, raw)
-        service = BrainkitService(
+        service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         service.watch_once()
@@ -732,7 +732,7 @@ class WatchIgnoreTest(unittest.TestCase):
         raw = policy()
         raw["sources"] = [str(self.source / "README.md")]
         vault = FileVault.initialize(self.work / "vault-file", raw)
-        service = BrainkitService(
+        service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.assertEqual(service.watch_once()["created"], 1)
@@ -741,7 +741,7 @@ class WatchIgnoreTest(unittest.TestCase):
         raw = policy()
         raw["sources"] = [str(self.work / "gone"), str(self.source)]
         vault = FileVault.initialize(self.work / "vault-missing", raw)
-        service = BrainkitService(
+        service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.assertEqual(service.watch_once()["created"], 2)

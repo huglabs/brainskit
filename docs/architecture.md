@@ -14,7 +14,7 @@ The domain has no dependency on the CLI, filesystem, SQLite or an LLM vendor.
 
 ## The application modules
 
-Inside the application layer, `BrainkitService` is a facade that owns nothing:
+Inside the application layer, `BrainskitService` is a facade that owns nothing:
 it composes the collaborators below and delegates. Their imports form a DAG —
 each depends only on the ones above it — so any of them can be read, tested or
 replaced without loading the rest.

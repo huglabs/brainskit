@@ -19,7 +19,7 @@ So this file enforces what the notice states, rather than trusting it:
    modified — a fourth edit fails here until it is argued for in writing;
 2. the cache marker changes when the vendored source changes; and
 3. no user-facing string in that tree still points at `graphifyy`, which
-   brainkit does not depend on.
+   brainskit does not depend on.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import re
 import unittest
 from pathlib import Path
 
-from brainkit.infrastructure import extractor
+from brainskit.infrastructure import extractor
 
 VENDORED = Path(extractor.__file__).resolve().parent / "codeanalysis"
 NOTICE = VENDORED / "NOTICE"

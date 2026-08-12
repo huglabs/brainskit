@@ -36,7 +36,7 @@ BENCHMARKS = Path(__file__).resolve().parent.parent / "benchmarks"
 sys.path.insert(0, str(BENCHMARKS))
 
 # Registers the `graphify` alias in this process (side effect only).
-import brainkit.infrastructure.codeanalysis  # noqa: E402,F401
+import brainskit.infrastructure.codeanalysis  # noqa: E402,F401
 
 
 def _code_extra_installed() -> bool:
@@ -63,7 +63,7 @@ class PolyglotCoverageTest(unittest.TestCase):
         benchmark.build_fixture(self.fixture)
 
     def test_every_installed_grammar_actually_contributes(self) -> None:
-        from brainkit.infrastructure.extractor import _extension_grammars
+        from brainskit.infrastructure.extractor import _extension_grammars
 
         known = _extension_grammars()
         installed_extensions = {
@@ -127,7 +127,7 @@ class SpawnedWorkerTest(unittest.TestCase):
         # no inherited PYTHONPATH beyond what we pass.
         import subprocess
 
-        from brainkit.infrastructure.extractor import _enable_parallel_workers
+        from brainskit.infrastructure.extractor import _enable_parallel_workers
 
         self.assertTrue(_enable_parallel_workers(), "no import shim was installed")
         probe = (

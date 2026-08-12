@@ -8,28 +8,33 @@ import tempfile
 import unittest
 import urllib.error
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
 
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import (
+from brainskit.application.judgment import JudgmentRunner
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
     PAGE_DIRECTORIES,
     WIKI_DIRECTORIES,
+    ConflictError,
+    ModelResponseError,
+    NotConfiguredError,
     PageKind,
     PageOperation,
     PolicyError,
+    RefusalError,
     ValidationError,
     VaultConfig,
     _compiled_validator,
     validate_schema,
 )
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex, _iter_documents
-from brainkit.infrastructure.integrations import NativeIntegrations
-from brainkit.infrastructure.llm import (
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex, _iter_documents
+from brainskit.infrastructure.integrations import NativeIntegrations
+from brainskit.infrastructure.llm import (
     DEFAULT_ANTHROPIC_MAX_TOKENS,
     DEFAULT_OLLAMA_OPTIONS,
     AnthropicDriver,
@@ -40,7 +45,8 @@ from brainkit.infrastructure.llm import (
     _strictly_expressible,
     _structured_schema,
 )
-from brainkit.infrastructure.vault import FileVault
+from brainskit.infrastructure.vault import FileVault
+from brainskit.interfaces import cli
 
 
 def policy() -> dict:
@@ -230,7 +236,7 @@ class ApplyDirectoryTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             self.vault,
             SqliteFtsIndex(self.vault.index_path),
             graph=MarkdownGraph(),
@@ -337,8 +343,8 @@ class LegacyDirectoryMigrationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _service(self, vault: FileVault) -> BrainkitService:
-        return BrainkitService(
+    def _service(self, vault: FileVault) -> BrainskitService:
+        return BrainskitService(
             vault,
             SqliteFtsIndex(vault.index_path),
             graph=MarkdownGraph(),
@@ -933,7 +939,7 @@ class IndexStreamingTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
         self.index = SqliteFtsIndex(self.vault.index_path)
-        self.service = BrainkitService(self.vault, self.index, graph=MarkdownGraph())
+        self.service = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
         for number in range(4):
             record, _ = self.vault.capture_text(f"body {number}", f"note-{number}")
             self.vault.file_source(record.content_hash, "20-research")
@@ -969,6 +975,270 @@ class IndexStreamingTest(unittest.TestCase):
         second = self.index.rebuild(self.vault)
         self.assertEqual(first, second)
         self.assertEqual(self.index.stats()["documents"], second)
+
+
+class ErrorContractTest(unittest.TestCase):
+    """One code per distinct remedy, and no change to what anything catches.
+
+    `validation_error` used to answer for five unrelated situations, so a
+    caller had to read English to decide whether to retry, rephrase, or stop.
+    These narrow it. The invariants that make that safe -- still a
+    `ValidationError`, still exit 2 -- are asserted here rather than assumed,
+    because the whole design rests on them.
+    """
+
+    CODES: ClassVar[dict[type[ValidationError], str]] = {
+        ValidationError: "validation_error",
+        ConflictError: "conflict",
+        NotConfiguredError: "not_configured",
+        RefusalError: "refused",
+        ModelResponseError: "model_response_invalid",
+    }
+
+    def test_each_error_carries_its_own_stable_code(self) -> None:
+        for error, code in self.CODES.items():
+            with self.subTest(error=error.__name__):
+                self.assertEqual(error("x").code, code)
+
+    def test_no_two_errors_share_a_code(self) -> None:
+        """A duplicated code silently merges two remedies back into one.
+
+        Read off the classes, never off the table above: comparing the table
+        with itself is a tautology that passes even with every code collapsed.
+        """
+        codes = [error.code for error in self.CODES]
+        self.assertEqual(len(codes), len(set(codes)), codes)
+
+    def test_every_narrowed_error_is_still_a_validation_error(self) -> None:
+        """This is what keeps every existing `except ValidationError` correct."""
+        for error in self.CODES:
+            with self.subTest(error=error.__name__):
+                self.assertTrue(issubclass(error, ValidationError))
+                self.assertIsInstance(error("x"), ValidationError)
+
+    def test_they_are_not_policy_errors(self) -> None:
+        """`PolicyError` exits 3. Reclassifying into it would change exit codes."""
+        for error in self.CODES:
+            with self.subTest(error=error.__name__):
+                self.assertNotIsInstance(error("x"), PolicyError)
+
+    def test_details_survive_the_narrowing(self) -> None:
+        raised = ConflictError("stale", details={"path": "wiki/a.md"})
+        self.assertEqual(raised.details, {"path": "wiki/a.md"})
+
+
+class ErrorClassificationTest(unittest.TestCase):
+    """The codes as the paths that raise them actually report them.
+
+    Asserting the class table alone would pass with every raise site still
+    saying `ValidationError`, so these drive real calls.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.service = BrainskitService(
+            self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def assert_code(self, code: str, call: Callable[[], object]) -> ValidationError:
+        with self.assertRaises(ValidationError) as caught:
+            call()
+        self.assertEqual(caught.exception.code, code)
+        return caught.exception
+
+    def test_a_malformed_request_is_still_a_plain_validation_error(self) -> None:
+        """The control: input validation must not have moved."""
+        self.assert_code("validation_error", lambda: self.service.search(""))
+
+    def test_reinitialising_a_vault_is_a_conflict(self) -> None:
+        self.assert_code(
+            "conflict", lambda: FileVault.initialize(self.root, policy())
+        )
+
+    def test_applying_against_a_moved_page_is_a_conflict(self) -> None:
+        """The stale-context case: same intent, rebuilt, would succeed."""
+        captured = self.service.capture(None, text="Evidence", title="Evidence")
+        content_hash = captured["source"]["content_hash"]
+        operation = {
+            "action": "upsert",
+            "kind": "concept",
+            "slug": "thing",
+            "title": "Thing",
+            "aliases": [],
+            "source_hashes": [content_hash],
+            "body": f"A claim.[^source:{content_hash}]",
+            "links": [],
+        }
+        self.service.apply({"operations": [operation]})
+        error = self.assert_code(
+            "conflict",
+            lambda: self.service.apply(
+                {
+                    "proposal_id": "stale",
+                    "operations": [
+                        {
+                            **operation,
+                            "body": f"Revised.[^source:{content_hash}]",
+                            "base_hash": "f" * 64,
+                        }
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(
+            [failure["code"] for failure in error.details["failures"]], ["stale_page"]
+        )
+
+    def test_a_stale_page_mixed_with_a_content_failure_is_not_a_conflict(self) -> None:
+        """Re-reading fixes the version. It does not fix an uncited claim.
+
+        Calling that a conflict would send an agent into a retry loop that
+        cannot terminate.
+        """
+        captured = self.service.capture(None, text="Evidence", title="Evidence")
+        content_hash = captured["source"]["content_hash"]
+        operation = {
+            "action": "upsert",
+            "kind": "concept",
+            "slug": "mixed",
+            "title": "Mixed",
+            "aliases": [],
+            "source_hashes": [content_hash],
+            "body": f"A claim.[^source:{content_hash}]",
+            "links": [],
+        }
+        self.service.apply({"operations": [operation]})
+        error = self.assert_code(
+            "validation_error",
+            lambda: self.service.apply(
+                {
+                    "proposal_id": "mixed",
+                    "operations": [
+                        {
+                            **operation,
+                            "body": "Revised, citing nothing at all.",
+                            "base_hash": "f" * 64,
+                        }
+                    ],
+                }
+            ),
+        )
+        codes = {failure["code"] for failure in error.details["failures"]}
+        self.assertIn("stale_page", codes)
+        self.assertGreater(len(codes), 1)
+
+    def test_reusing_a_proposal_id_for_a_new_payload_is_a_conflict(self) -> None:
+        captured = self.service.capture(None, text="Evidence", title="Evidence")
+        content_hash = captured["source"]["content_hash"]
+        operation = {
+            "action": "upsert",
+            "kind": "concept",
+            "slug": "reused",
+            "title": "Reused",
+            "aliases": [],
+            "source_hashes": [content_hash],
+            "body": f"First.[^source:{content_hash}]",
+            "links": [],
+        }
+        self.service.apply({"proposal_id": "same-id", "operations": [operation]})
+        self.assert_code(
+            "conflict",
+            lambda: self.service.apply(
+                {
+                    "proposal_id": "same-id",
+                    "operations": [
+                        {**operation, "body": f"Second.[^source:{content_hash}]"}
+                    ],
+                }
+            ),
+        )
+
+    def test_a_missing_extractor_is_not_configured(self) -> None:
+        self.assert_code("not_configured", self.service.code_build)
+
+    def test_the_local_only_code_graph_is_a_refusal(self) -> None:
+        self.assert_code(
+            "refused", lambda: self.service.code_hubs(consumer="cloud")
+        )
+
+    def test_nesting_a_vault_is_a_refusal(self) -> None:
+        self.assert_code(
+            "refused",
+            lambda: FileVault.initialize(self.root / "wiki" / "inner", policy()),
+        )
+
+    def test_an_exhausted_repair_loop_blames_the_model(self) -> None:
+        """The remedy is retry or reroute, never "fix your request"."""
+
+        class NeverValid:
+            def run(self, **_: object) -> str:
+                return "not json at all"
+
+        class Specs:
+            def schema(self, job: str) -> dict[str, object]:
+                return {"type": "object", "required": ["answer"]}
+
+            def render(self, job: str, variables: dict[str, object]) -> str:
+                return job
+
+        runner = JudgmentRunner(Specs(), NeverValid())  # type: ignore[arg-type]
+        error = self.assert_code(
+            "model_response_invalid",
+            lambda: runner.run(job="ask", branches=[], variables={}),
+        )
+        self.assertEqual(error.details["attempts"], 3)
+
+    def test_an_unconfigured_judgment_layer_says_so(self) -> None:
+        runner = JudgmentRunner(None, None)
+        self.assert_code(
+            "not_configured",
+            lambda: runner.run(job="ask", branches=[], variables={}),
+        )
+
+
+class ErrorExitCodeTest(unittest.TestCase):
+    """Narrowing the code must not move any command's exit status."""
+
+    def test_every_narrowed_error_still_exits_two(self) -> None:
+        for error in (
+            ValidationError,
+            ConflictError,
+            NotConfiguredError,
+            RefusalError,
+            ModelResponseError,
+        ):
+            with self.subTest(error=error.__name__):
+                buffer = io.StringIO()
+                with mock.patch.object(
+                    cli, "_dispatch", side_effect=error("boom")
+                ), redirect_stderr(buffer):
+                    status = cli.main(["status"])
+                self.assertEqual(status, 2)
+
+    def test_a_policy_error_still_exits_three(self) -> None:
+        """The one code that does carry a different status keeps it."""
+        buffer = io.StringIO()
+        with mock.patch.object(
+            cli, "_dispatch", side_effect=PolicyError("nope")
+        ), redirect_stderr(buffer):
+            self.assertEqual(cli.main(["status"]), 3)
+
+    def test_the_code_reaches_the_json_envelope(self) -> None:
+        """What an agent actually reads is the serialised envelope."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            cli, "_dispatch", side_effect=ConflictError("stale", details={"a": 1})
+        ), redirect_stdout(out), redirect_stderr(err):
+            cli.main(["--json", "status"])
+        payload = json.loads(out.getvalue() or err.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "conflict")
+        self.assertEqual(payload["error"]["details"], {"a": 1})
 
 
 if __name__ == "__main__":

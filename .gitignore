@@ -45,7 +45,7 @@ graphify-out/
 
 # macOS
 .DS_Store
-
+.env
 # Benchmark corpora: real repositories cloned at pinned commits, plus the
 # LOCOMO release. Declared at the *root* rather than only in benchmarks/,
 # because the extractor reads the ignore file at its scan root and never
@@ -57,3 +57,13 @@ benchmarks/memory/locomo10.json
 # Derived from locomo10.json by run_locomo_graphify.py -- ~7,000 markdown turns
 # regenerated on every run, and the same scan-root reasoning applies.
 benchmarks/memory/graphify-corpora/
+.claude-collective/
+.claude/*
+.claude/scripts/
+.claude/agents/
+.claude/skills/
+.claude/settings.json
+.mcp.json
+.mcp.json.new
+CLAUDE.md
+CLAUDE.md.new

@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Real repositories, pinned by commit so a run is reproducible and a",
-    "regression is attributable to brainkit rather than to upstream moving.",
+    "regression is attributable to brainskit rather than to upstream moving.",
     "Chosen to span the languages the shipped extractors claim, at two",
     "sizes, and to stay small enough that a full run is minutes rather than",
     "hours -- the question is coverage and cost per language, not throughput.",
@@ -10,7 +10,7 @@
     "change will be indistinguishable from an upstream change.",
     "Fetched shallow into benchmarks/.cache (gitignored). A repository that",
     "cannot be fetched is skipped rather than fatal: this tier is opt-in and",
-    "a network problem must not read as a brainkit regression."
+    "a network problem must not read as a brainskit regression."
   ],
   "pinned_at": "2026-08-08",
   "repositories": [

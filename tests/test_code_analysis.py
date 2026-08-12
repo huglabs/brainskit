@@ -1,18 +1,18 @@
 """Community detection, import cycles and structural diff over the code graph.
 
-`bk code communities`/`cycles`/`diff` are the three questions brainkit's own
+`bk code communities`/`cycles`/`diff` are the three questions brainskit's own
 plain traversal (`affected`/`path`/`hubs`) has no way to answer — none of
 them are about one symbol's neighbourhood, they are about the shape of the
 whole graph — so they are delegated whole to the vendored
 `graphify.cluster`/`graphify.analyze` rather than approximated with a second,
-simpler implementation brainkit would then have to keep matching.
+simpler implementation brainskit would then have to keep matching.
 
 What this module has to prove is narrower than Graphify's own test suite:
 not that Leiden/Louvain or cycle-detection are correct — that is upstream's
-job — but that brainkit's boundary holds around them: the same privacy check
-every other reader in `CodeGraph` uses, a clear brainkit error (never a bare
+job — but that brainskit's boundary holds around them: the same privacy check
+every other reader in `CodeGraph` uses, a clear brainskit error (never a bare
 `ImportError` traceback) when the optional `networkx` dependency is absent,
-and a faithful translation between brainkit's stored node/edge shape and the
+and a faithful translation between brainskit's stored node/edge shape and the
 attribute names the vendored analysis was written to read.
 """
 
@@ -29,12 +29,12 @@ from typing import Any
 
 from test_projections import policy
 
-from brainkit.application.codegraph import CODE_PROJECTION
-from brainkit.application.services import BrainkitService
-from brainkit.domain.model import ValidationError
-from brainkit.infrastructure.graph import MarkdownGraph
-from brainkit.infrastructure.index import SqliteFtsIndex
-from brainkit.infrastructure.vault import FileVault
+from brainskit.application.codegraph import CODE_PROJECTION
+from brainskit.application.services import BrainskitService
+from brainskit.domain.model import ValidationError
+from brainskit.infrastructure.graph import MarkdownGraph
+from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.vault import FileVault
 
 
 def _networkx_installed() -> bool:
@@ -133,7 +133,7 @@ class AnalysisFixture(unittest.TestCase):
 
         vault = FileVault.initialize(self.repo / "docs" / "brain", policy())
         self.vault = vault
-        self.service = BrainkitService(
+        self.service = BrainskitService(
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.service.reindex()
@@ -156,7 +156,7 @@ class CommunitiesTest(AnalysisFixture):
     def test_members_are_grouped_by_file(self) -> None:
         # The two clusters are exactly the two files; a member list mixing
         # paths would mean the partitioner (or the translation into it) is
-        # not seeing the graph brainkit thinks it built.
+        # not seeing the graph brainskit thinks it built.
         self.service.code_import(clustered_payload())
         result = self.service.code_communities()
         for community in result["communities"]:
@@ -189,7 +189,7 @@ class CommunitiesTest(AnalysisFixture):
             self.service.code_communities(consumer="cloud")
 
     def test_querying_without_a_graph_says_how_to_build_one(self) -> None:
-        from brainkit.domain.model import NotFoundError
+        from brainskit.domain.model import NotFoundError
 
         with self.assertRaises(NotFoundError) as caught:
             self.service.code_communities()
@@ -282,7 +282,7 @@ class DiffTest(AnalysisFixture):
 
 
 class MissingNetworkxTest(AnalysisFixture):
-    """`networkx` gates all three commands; each must fail with a brainkit
+    """`networkx` gates all three commands; each must fail with a brainskit
     error naming the fix, not a bare `ImportError` — the same property
     `test_code_graph.py`'s `MissingDependencyTest` establishes for
     tree-sitter and `build()`.
@@ -298,7 +298,7 @@ class MissingNetworkxTest(AnalysisFixture):
         return mock.patch.dict(sys.modules, {"networkx": None})
 
     def _reset_analysis_cache(self) -> None:
-        import brainkit.application.codegraph as codegraph_module
+        import brainskit.application.codegraph as codegraph_module
 
         codegraph_module._ANALYSIS_MODULES = None
 
@@ -308,7 +308,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_communities()
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["needs"])
+        self.assertIn("brainskit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
     def test_cycles_without_networkx_is_a_clear_error(self) -> None:
@@ -317,7 +317,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_cycles()
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["needs"])
+        self.assertIn("brainskit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
     def test_diff_without_networkx_is_a_clear_error(self) -> None:
@@ -326,7 +326,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_diff(clustered_payload())
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["needs"])
+        self.assertIn("brainskit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
     def test_the_refusal_is_checked_before_the_privacy_boundary(self) -> None:
@@ -338,7 +338,7 @@ class MissingNetworkxTest(AnalysisFixture):
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_communities(consumer="cloud")
         self._reset_analysis_cache()
-        self.assertIn("brainkit[code]", caught.exception.details["needs"])
+        self.assertIn("brainskit[code]", caught.exception.details["needs"])
 
 
 class VendoredAnalysisImportTest(unittest.TestCase):
@@ -359,7 +359,7 @@ class VendoredAnalysisImportTest(unittest.TestCase):
         script = (
             "import sys\n"
             "sys.modules['tree_sitter'] = None\n"
-            "from brainkit.infrastructure import codeanalysis\n"
+            "from brainskit.infrastructure import codeanalysis\n"
             "import graphify.cluster\n"
             "import graphify.analyze\n"
             "print('ok')\n"
@@ -371,14 +371,14 @@ class VendoredAnalysisImportTest(unittest.TestCase):
         self.assertIn("ok", completed.stdout)
 
     def test_codegraph_module_imports_without_networkx(self) -> None:
-        # `application/codegraph.py` is on brainkit's normal startup path
+        # `application/codegraph.py` is on brainskit's normal startup path
         # (`services.py` imports it unconditionally); it must not cost every
         # caller an import of networkx just because three of its methods
         # eventually need one.
         script = (
             "import sys\n"
             "sys.modules['networkx'] = None\n"
-            "import brainkit.application.codegraph\n"
+            "import brainskit.application.codegraph\n"
             "print('ok')\n"
         )
         completed = subprocess.run(

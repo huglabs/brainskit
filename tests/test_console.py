@@ -13,7 +13,7 @@ import re
 import unittest
 from unittest.mock import patch
 
-from brainkit.interfaces import console
+from brainskit.interfaces import console
 
 
 class FakeStream:
@@ -26,6 +26,17 @@ class FakeStream:
 
 TTY = FakeStream(tty=True)
 PIPE = FakeStream(tty=False)
+
+
+def strip(text: str) -> str:
+    """`text` as it lands on screen, without the escapes that decorate it.
+
+    Deliberately the module's own pattern rather than a copy: it has to cover
+    every escape shape `console` emits, and a duplicate here would keep
+    passing on the day a new one is added.
+    """
+
+    return console._ANSI_RE.sub("", text)
 
 
 class SupportsColorTests(unittest.TestCase):
@@ -77,11 +88,92 @@ class StatusLineTests(unittest.TestCase):
         )
 
 
+class LinkTests(unittest.TestCase):
+    def test_off_a_terminal_the_text_is_returned_untouched(self) -> None:
+        self.assertEqual("HugLabs", console.link("HugLabs", "https://x", stream=PIPE))
+
+    def test_on_a_terminal_the_text_is_wrapped_in_an_osc_8_hyperlink(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            result = console.link("HugLabs", "https://x", stream=TTY)
+        self.assertEqual("\x1b]8;;https://x\x1b\\HugLabs\x1b]8;;\x1b\\", result)
+
+    def test_a_link_costs_no_columns(self) -> None:
+        """The URL is metadata, not text. If `_visible_len` counted it, a
+        linked table cell would measure as its URL plus its label and
+        `truncate()` would cut a row that already fits on screen."""
+
+        with patch.dict("os.environ", {}, clear=True):
+            linked = console.link("HugLabs", "https://example.com/a/b", stream=TTY)
+        self.assertEqual(len("HugLabs"), console._visible_len(linked))
+        self.assertEqual(linked, console.truncate(linked, len("HugLabs")))
+
+
 class BannerAndHeadersTests(unittest.TestCase):
     def test_banner_names_the_product_and_the_company(self) -> None:
         text = console.banner(stream=PIPE)
-        self.assertIn("brainkit", text)
+        self.assertIn("brainskit", text)
         self.assertIn("HugLabs", text)
+
+    def test_banner_off_a_terminal_stays_one_greppable_line(self) -> None:
+        self.assertEqual(1, len(console.banner(stream=PIPE).splitlines()))
+
+    def test_banner_on_a_wide_terminal_draws_the_wordmark(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(console, "_terminal_width", return_value=100):
+                text = console.banner(stream=TTY)
+        lines = strip(text).splitlines()
+        self.assertEqual(list(console._WORDMARK), lines[: len(console._WORDMARK)])
+        self.assertIn("by HugLabs", lines[len(console._WORDMARK)])
+        self.assertIn("www.huglabs.ai", text)
+
+    def test_the_masthead_draws_exactly_the_credit_it_was_sized_from(self) -> None:
+        """`_CREDIT` sizes the masthead and `banner()` renders it in styled,
+        linked pieces. Those are two representations of one string, so they
+        are pinned together -- otherwise the credit could grow past the width
+        the threshold was computed from without anything noticing."""
+
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(console, "_terminal_width", return_value=100):
+                text = console.banner(stream=TTY)
+        lines = strip(text).splitlines()
+        start = len(console._WORDMARK)
+        self.assertEqual(list(console._CREDIT), lines[start : start + 2])
+
+    def test_both_banner_forms_carry_the_company_and_the_license(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(console, "_terminal_width", return_value=100):
+                wide = console.banner(stream=TTY)
+            with patch.object(console, "_terminal_width", return_value=40):
+                narrow = console.banner(stream=TTY)
+        for text in (wide, narrow):
+            self.assertIn("HugLabs", strip(text))
+            self.assertIn(console._LICENSE, strip(text))
+            self.assertIn(f"\x1b]8;;{console._SITE}\x1b\\", text)
+            self.assertIn(f"\x1b]8;;{console._LICENSE_URL}\x1b\\", text)
+
+    def test_the_credit_never_decides_whether_the_masthead_fits(self) -> None:
+        """The wordmark is the widest thing here, and it has to stay that way:
+        a longer credit line would raise the threshold and cost narrow
+        terminals the whole banner just to carry a tagline and a URL."""
+
+        self.assertEqual(
+            console._WORDMARK_WIDTH, max(len(line) for line in console._WORDMARK)
+        )
+
+    def test_banner_falls_back_when_the_terminal_cannot_hold_the_wordmark(
+        self,
+    ) -> None:
+        """A wordmark wider than the terminal wraps, and wrapped figlet art is
+        unreadable -- every line is one row of the same glyphs, so there is no
+        truncation that leaves a legible word."""
+
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(
+                console, "_terminal_width", return_value=console._WORDMARK_WIDTH - 1
+            ):
+                text = console.banner(stream=TTY)
+        self.assertEqual(1, len(text.splitlines()))
+        self.assertIn("brainskit", strip(text))
 
     def test_step_header_reports_position_and_title(self) -> None:
         text = console.step_header(2, 4, "Privacy & filing policy", stream=PIPE)
