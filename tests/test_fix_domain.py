@@ -75,11 +75,11 @@ def policy() -> dict:
             "ollama": {"base_url": "http://127.0.0.1:11434"},
             "anthropic": {
                 "base_url": "https://api.anthropic.com/v1",
-                "api_key_env": "BRAINKIT_TEST_ANTHROPIC_KEY",
+                "api_key_env": "BRAINSKIT_TEST_ANTHROPIC_KEY",
             },
             "openai": {
                 "base_url": "https://api.openai.com/v1",
-                "api_key_env": "BRAINKIT_TEST_OPENAI_KEY",
+                "api_key_env": "BRAINSKIT_TEST_OPENAI_KEY",
             },
         },
         "job_models": {
@@ -596,8 +596,8 @@ class OllamaContextOptionTest(unittest.TestCase):
         raw = policy()
         raw["providers"]["ollama"]["options"] = {"num_ctx": 8192}
         for provider, key in (
-            ("anthropic", "BRAINKIT_TEST_ANTHROPIC_KEY"),
-            ("openai", "BRAINKIT_TEST_OPENAI_KEY"),
+            ("anthropic", "BRAINSKIT_TEST_ANTHROPIC_KEY"),
+            ("openai", "BRAINSKIT_TEST_OPENAI_KEY"),
         ):
             with self.subTest(provider=provider):
                 with mock.patch.dict("os.environ", {key: "test-key"}):
@@ -734,12 +734,12 @@ class AnthropicRequestShapeTest(unittest.TestCase):
                 self.driver().complete("prompt", model="m", output_schema=None)
 
     def test_the_token_budget_is_configurable_per_vault(self) -> None:
-        with mock.patch.dict("os.environ", {"BRAINKIT_TEST_ANTHROPIC_KEY": "k"}):
+        with mock.patch.dict("os.environ", {"BRAINSKIT_TEST_ANTHROPIC_KEY": "k"}):
             driver = _create_driver(
                 "anthropic",
                 {
                     "base_url": "https://api.example/v1",
-                    "api_key_env": "BRAINKIT_TEST_ANTHROPIC_KEY",
+                    "api_key_env": "BRAINSKIT_TEST_ANTHROPIC_KEY",
                     "max_tokens": 32000,
                 },
             )
@@ -750,14 +750,14 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         for value in ("32000", 0, -1, True):
             with self.subTest(value=value):
                 with mock.patch.dict(
-                    "os.environ", {"BRAINKIT_TEST_ANTHROPIC_KEY": "k"}
+                    "os.environ", {"BRAINSKIT_TEST_ANTHROPIC_KEY": "k"}
                 ):
                     with self.assertRaises(ValidationError):
                         _create_driver(
                             "anthropic",
                             {
                                 "base_url": "https://api.example/v1",
-                                "api_key_env": "BRAINKIT_TEST_ANTHROPIC_KEY",
+                                "api_key_env": "BRAINSKIT_TEST_ANTHROPIC_KEY",
                                 "max_tokens": value,
                             },
                         )

@@ -96,10 +96,10 @@ class RegistryFixture(unittest.TestCase):
                 enabled=True,
                 managed=False,
                 options={
-                    "dsn_env": "BRAINKIT_TEST_PG_DSN",
+                    "dsn_env": "BRAINSKIT_TEST_PG_DSN",
                     "uri": "bolt://127.0.0.1:7687",
                     "user": "neo4j",
-                    "password_env": "BRAINKIT_TEST_NEO4J_PASSWORD",
+                    "password_env": "BRAINSKIT_TEST_NEO4J_PASSWORD",
                     "path": str(self.root / "obsidian"),
                     "consumer": "local",
                 },

@@ -4,7 +4,7 @@
 
 # brainskit `bk`
 
-**The compilation gate between raw evidence and knowledge an agent may act on.**
+**Your agent's memory, with receipts.**
 
 Local-first · LLM-agnostic · nothing reaches the wiki without provenance
 
@@ -37,16 +37,24 @@ Local-first · LLM-agnostic · nothing reaches the wiki without provenance
         www.huglabs.ai • open source, Apache-2.0
 ```
 
-A knowledge base an agent writes to freely stops being evidence and becomes
-model output with a filename.
+## Your agent has been writing your knowledge base for six months
 
-brainskit takes the opposite position and enforces it mechanically. Markdown and
-JSON are the source of truth; SQLite FTS5 is a disposable search index. A model
-may *propose* what your knowledge base should say, but only the deterministic
-`bk apply` gate may *write* it — and the write is refused unless every citation
-in the page resolves to a source registered in this vault.
+Now open any page in it and answer one question: **where did this come from?**
 
-That refusal is the product:
+If the answer is "the model said so", you don't have a knowledge base. You have
+model output with a filename — confident, well-formatted, and unfalsifiable.
+Every retrieval on top of it inherits that. Every decision downstream of it
+inherits that too.
+
+A knowledge base an agent can write to freely stops being evidence.
+
+## So brainskit doesn't let it
+
+Markdown and JSON are the source of truth. SQLite FTS5 is a disposable index.
+A model may *propose* what your knowledge base should say — and only the
+deterministic `bk apply` gate may write it.
+
+**The refusal is the product:**
 
 ```console
 $ bk apply proposal.json
@@ -58,9 +66,16 @@ $ echo $?
 2
 ```
 
-One unresolvable citation, and the whole batch is rejected — not partially
-written, not written with a warning. Exit code 2 tells the caller to fix the
-proposal and retry; nothing on disk moved.
+One citation that doesn't resolve, and the **whole batch** is rejected. Not
+partially written. Not written with a warning. Exit code 2 tells the caller to
+fix the proposal and try again — and nothing on disk moved.
+
+That is the entire pitch. Everything below is how it holds.
+
+## Six invariants, enforced mechanically
+
+Not conventions. Not linting advice. Not a style guide someone will stop
+following in March.
 
 | Invariant | How it is enforced |
 |---|---|
@@ -71,10 +86,14 @@ proposal and retry; nothing on disk moved.
 | **Mechanical stays LLM-free** | Capture, index, search, apply, export and the structural lint never call a model. Judgment flows are separate, schema-bound, and routed by the strictest policy in the evidence set. |
 | **A write is one unit of work** | Wiki pages, freshness, registry status, the raw-file move and the FTS5 update become visible together or are restored from the transaction journal. |
 
-It runs on a workstation, owns no account system, holds no credentials, and
-needs no network to do its mechanical work. Anthropic, OpenAI, OpenRouter and
-Ollama are interchangeable drivers behind one job contract, and `local-only`
-evidence is routed to Ollama or not at all.
+## It runs on your laptop and asks for nothing
+
+No account system. No credentials. No network for any of the mechanical work.
+One dependency in the core.
+
+Anthropic, OpenAI, OpenRouter and Ollama are interchangeable drivers behind one
+job contract — and evidence you marked `local-only` goes to Ollama or it goes
+nowhere.
 
 ## Install
 
@@ -108,7 +127,7 @@ Install the working tree, a git ref, or a built wheel with the same command:
 
 ```bash
 uv tool install /path/to/brainskit
-uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.4.0'
+uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.5.0'
 ```
 
 To pin `bk` to one project instead of the machine, declare it as a dependency
@@ -175,6 +194,20 @@ commit_lint     ✓ active
 instructions    ✓ active
 ```
 
+## Your agent can't route around it either
+
+`bk hooks install` wires the gate into your coding agent as a PreToolUse hook,
+so a write under `wiki/` or `raw/` is refused at the moment it is attempted —
+not reviewed later, not caught in a lint run someone skips.
+
+And `bk doctor` doesn't take the hook's word for it. It *runs* the thing: one
+path the gate must refuse, one it must allow. A hook that fails open because
+`bk` fell off `PATH` reports as `not_enforcing` and repeats the hook's own
+explanation, instead of a green check that guards nothing.
+
+A status check that verifies a file exists is not the same as one that verifies
+a file runs.
+
 ## Documentation
 
 | | |
@@ -238,7 +271,8 @@ still needs the external delivery layer:
 | Native Kuzu adapter, seed-corpus importers | Later roadmap |
 
 Nothing on the unimplemented side is simulated by this repository: a command
-that would need a missing connector fails instead of pretending.
+that would need a missing connector fails instead of pretending. If it isn't
+built, it says so and exits non-zero.
 
 ## Contributing
 
@@ -271,8 +305,9 @@ science into real systems for critical business problems — six product
 families, eleven products in production, and an academic partnership with
 CEIA-UFG.
 
-brainskit is the memory layer underneath that work, released as open source
-because a provenance gate is only worth trusting if you can read it.
+We don't sell capabilities. We sell delivery. brainskit is the memory layer
+underneath that work, released as open source because a provenance gate is only
+worth trusting if you can read it.
 
 [huglabs.ai](https://huglabs.ai) ·
 [github.com/huglabs](https://github.com/huglabs) ·

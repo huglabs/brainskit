@@ -303,6 +303,21 @@ class VaultFixture(unittest.TestCase):
         self.integrations = NativeIntegrations(self.vault)
 
     def tearDown(self) -> None:
+        # A bind-mounted service directory comes back owned by the uid the
+        # container ran as -- postgres `initdb` leaves its data dir 0700 under
+        # uid 999. On Linux that is genuinely unreadable to the user running
+        # the tests, so removing it needs the same privilege that created it.
+        # Docker Desktop hides this by virtualising ownership, which is why it
+        # only ever failed on CI.
+        services = self.root / ".brain" / "services"
+        if services.exists() and any(services.iterdir()):
+            subprocess.run(
+                ["docker", "run", "--rm", "-v", f"{services}:/services",
+                 "alpine:3", "sh", "-c", "rm -rf /services/*"],
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
         self.temporary.cleanup()
 
     def payload(self, error: BrainskitError) -> str:
@@ -322,7 +337,7 @@ class VendorErrorContractTest(VaultFixture):
             options={
                 "uri": "bolt://127.0.0.1:7691",
                 "user": "neo4j",
-                "password_env": "BRAINKIT_TEST_NEO4J_PASSWORD",
+                "password_env": "BRAINSKIT_TEST_NEO4J_PASSWORD",
                 "database": "neo4j",
                 "consumer": "local",
             },
@@ -333,21 +348,21 @@ class VendorErrorContractTest(VaultFixture):
         if managed:
             options.update(
                 {
-                    "password_env": "BRAINKIT_TEST_PG_PASSWORD",
+                    "password_env": "BRAINSKIT_TEST_PG_PASSWORD",
                     "user": "brainskit",
                     "database": "brainskit",
                     "port": 5461,
                 }
             )
         else:
-            options["dsn_env"] = "BRAINKIT_TEST_PG_DSN"
+            options["dsn_env"] = "BRAINSKIT_TEST_PG_DSN"
         self.integrations.configure(
             "postgres", enabled=True, managed=managed, options=options
         )
 
     def sync_neo4j(self, modules: dict[str, types.ModuleType]) -> BrainskitError:
         self.configure_neo4j()
-        with patch.dict(os.environ, {"BRAINKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
+        with patch.dict(os.environ, {"BRAINSKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
             with patch.dict(sys.modules, modules):
                 with self.assertRaises(BrainskitError) as caught:
                     self.integrations.sync("neo4j", graph())
@@ -364,8 +379,8 @@ class VendorErrorContractTest(VaultFixture):
     ) -> BrainskitError:
         self.configure_postgres(managed=managed)
         environment = {
-            "BRAINKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD,
-            "BRAINKIT_TEST_PG_DSN": (
+            "BRAINSKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD,
+            "BRAINSKIT_TEST_PG_DSN": (
                 f"postgresql://brainskit:{EMBEDDED_PASSWORD}@127.0.0.1:5999/brainskit"
             ),
         }
@@ -415,7 +430,7 @@ class VendorErrorContractTest(VaultFixture):
 
     def test_neo4j_missing_driver_keeps_its_install_hint(self) -> None:
         self.configure_neo4j()
-        with patch.dict(os.environ, {"BRAINKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
+        with patch.dict(os.environ, {"BRAINSKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
             with patch.dict(sys.modules, {"neo4j": None}):
                 with self.assertRaises(ValidationError) as caught:
                     self.integrations.sync("neo4j", graph())
@@ -467,7 +482,7 @@ class VendorErrorContractTest(VaultFixture):
 
     def test_postgres_missing_driver_keeps_its_install_hint(self) -> None:
         self.configure_postgres()
-        with patch.dict(os.environ, {"BRAINKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD}):
+        with patch.dict(os.environ, {"BRAINSKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD}):
             with patch.dict(sys.modules, {"psycopg": None}):
                 with self.assertRaises(ValidationError) as caught:
                     self.integrations.sync("postgres", graph())
@@ -578,7 +593,7 @@ class PostgresVaultScopeTest(unittest.TestCase):
             options={
                 "consumer": "local",
                 "schema": "brainskit",
-                "dsn_env": "BRAINKIT_TEST_PG_DSN",
+                "dsn_env": "BRAINSKIT_TEST_PG_DSN",
             },
         )
         return integrations
@@ -587,7 +602,7 @@ class PostgresVaultScopeTest(unittest.TestCase):
         self, integrations: NativeIntegrations, module: types.ModuleType
     ) -> dict:
         environment = {
-            "BRAINKIT_TEST_PG_DSN": "postgresql://brainskit@127.0.0.1:5999/brainskit"
+            "BRAINSKIT_TEST_PG_DSN": "postgresql://brainskit@127.0.0.1:5999/brainskit"
         }
         with patch.dict(os.environ, environment):
             with patch.dict(sys.modules, {"psycopg": module}):
@@ -744,7 +759,7 @@ class ManagedContainerReconciliationTest(VaultFixture):
             enabled=True,
             managed=True,
             options={
-                "password_env": "BRAINKIT_TEST_PG_PASSWORD",
+                "password_env": "BRAINSKIT_TEST_PG_PASSWORD",
                 "user": "brainskit",
                 "database": "brainskit",
                 "schema": "brainskit",
@@ -801,7 +816,7 @@ class ManagedContainerReconciliationTest(VaultFixture):
             options={
                 "uri": "bolt://127.0.0.1:7691",
                 "user": "neo4j",
-                "password_env": "BRAINKIT_TEST_NEO4J_PASSWORD",
+                "password_env": "BRAINSKIT_TEST_NEO4J_PASSWORD",
                 "http_port": 7481,
                 "bolt_port": 7691,
                 "consumer": "local",
@@ -829,11 +844,15 @@ class ManagedContainerReconciliationTest(VaultFixture):
         policy_value = self.postgres_policy()
         data = self.vault.root / ".brain" / "services" / "postgres" / "data"
         self.addCleanup(self.remove_container, container)
-        with patch.dict(os.environ, {"BRAINKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD}):
+        with patch.dict(os.environ, {"BRAINSKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD}):
             first = self.integrations.up("postgres")
             self.assertEqual(first["state"], "ready")
-            sentinel = data / "agent-a-sentinel.txt"
-            sentinel.write_text("durable", encoding="utf-8")
+            # Written through the container, not from the host: postgres owns
+            # this directory 0700 as its own uid, so a host-side write is a
+            # permission error anywhere bind mounts carry real ownership. The
+            # container is also the honest vantage point -- durability of the
+            # volume is a claim about what postgres will find when it restarts.
+            self.write_in_container(container, "agent-a-sentinel.txt", "durable")
             self.remove_container(container)
             self.create_stale_container(container, data)
             self.assertEqual(self.container_status(container), "created")
@@ -842,11 +861,37 @@ class ManagedContainerReconciliationTest(VaultFixture):
         self.assertTrue(second["recreated"])
         self.assertTrue(any("5462" in reason for reason in second["reconciled"]))
         self.assertEqual(self.container_status(container), "running")
-        self.assertEqual(sentinel.read_text(encoding="utf-8"), "durable")
+        self.assertEqual(
+            self.read_in_container(container, "agent-a-sentinel.txt"), "durable"
+        )
         self.assertEqual(
             _published_ports(self.docker_json(container)),
             {"5432/tcp": [str(policy_value.options["port"])]},
         )
+
+    _DATA_DIR = "/var/lib/postgresql/data"
+
+    @classmethod
+    def write_in_container(cls, container: str, name: str, body: str) -> None:
+        subprocess.run(
+            ["docker", "exec", container, "sh", "-c",
+             f"printf %s '{body}' > {cls._DATA_DIR}/{name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    @classmethod
+    def read_in_container(cls, container: str, name: str) -> str:
+        completed = subprocess.run(
+            ["docker", "exec", container, "cat", f"{cls._DATA_DIR}/{name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return completed.stdout
 
     @staticmethod
     def create_stale_container(container: str, data: Path) -> None:
