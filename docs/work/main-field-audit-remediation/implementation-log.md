@@ -142,7 +142,7 @@ should unregister, or `initialize` should take a `register=False` for throwaways
 
 ---
 
-## Phase 3 — 2 of 8, then stopped deliberately
+## Phase 3 — 4 of 8
 
 Suite 977 → **996**. `ruff check` clean.
 
@@ -163,23 +163,46 @@ asserted `status()["healthy"]`, using it as a stand-in for "lint is clean".
 a real vault, not of a bare temp directory. Repointed at `lint_errors == 0`,
 which is what the test is actually about.
 
-### Why 3.2 (F2) was stopped rather than finished
+Also landed: **3.2** (jsonschema out of `domain/` -- 98 lines to
+`application/schema.py`; `domain/model.py` now imports nothing outside the
+stdlib, asserted by a new layering test), **3.4** (both layering-test gaps), and
+**3.6** (slug uniqueness at apply plus a `wiki.duplicate_slug` lint code).
 
-Moving the jsonschema engine out of `domain/` is a mechanical extraction of
-~87 lines across four functions, plus three application callers and two test
-modules. Halfway through delimiting the block it became clear the boundary was
-ambiguous -- a path-formatting helper immediately after `_deny_remote_schema`
-may or may not be part of the engine -- and there was not enough context budget
-left to verify the move properly.
+3.4's `ALLOWED` narrowing is worth reading before extending it. Infrastructure
+may now import `{infrastructure, domain}` plus `application.ports` only; the two
+adapters that reach further are named in `DOCUMENTED_EXCEPTIONS` with reasons,
+and one of those entries says plainly that it is debt rather than a design.
 
-`domain/model.py` is untouched. An unverified move in the domain layer is worse
-than an undone one, so it stays open.
+### Two attempted, reverted, and why
+
+**The `integrations.py` privacy import (part of 3.4).** The architecturally
+correct fix is for the application layer to compute the copy predicate and hand
+it to the adapter, instead of the adapter importing `application.privacy`.
+Attempted: threading a callable through the graph dict broke five tests, because
+that same dict also feeds the Neo4j and Postgres adapters and gets serialised.
+Reverted. Recorded in `DOCUMENTED_EXCEPTIONS` as debt, which at least makes it
+visible -- it was invisible before.
+
+**3.7 (scoped-build pruning).** Implemented `still_on_disk(path)` in
+`_merge_scoped` using `vault.code_hash(path)`, with a test. The *control* --
+"a file that is out of scope but still exists must be kept" -- failed: the node
+kept getting pruned. `code_hash` resolves against `code_root`, which is not
+necessarily the base the stored node paths were recorded against, so the prune
+would silently delete valid nodes whenever those two differ.
+
+Reverted, because a false prune destroys graph data while the bug it fixes only
+produces stale answers -- and 2.4 now discloses staleness on every traversal,
+which is what the spec said makes this non-urgent. Whoever picks it up needs to
+resolve the path-base question first: prune on a path the graph itself can
+confirm, not on a hash lookup with a different root.
+
+This is the second time a control caught a change that all its sibling
+assertions were happy with.
 
 ### Remaining in Phase 3
 
-3.1 (native cycles/diff, drop the networkx pin) · 3.2 (jsonschema out of domain)
-3.4 (layering-test gaps) · 3.6 (slug uniqueness) · 3.7 (scoped-build pruning)
-3.8 (BrainskitNode rename + migration)
+3.1 (native cycles/diff, drop the networkx pin) · 3.7 (scoped-build pruning,
+with the path-base question resolved) · 3.8 (BrainskitNode rename + migration)
 
 ---
 
