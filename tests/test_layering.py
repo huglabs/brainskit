@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src" / "brainskit"
 
@@ -147,3 +148,51 @@ class LayeringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConstantsHaveOneOwnerTest(unittest.TestCase):
+    """A shared constant must be imported, never copied across the boundary.
+
+    The layering rule -- application must not import interfaces -- is right, and
+    the response to it was to copy the managed-block sentinel and the gate's
+    deny prefixes into both sides. Writer (`bk hooks install`) and readers
+    (`bk status`, `bk doctor`) could then disagree in silence about what
+    "installed" means, and per this repository's history that divergence has
+    already shipped twice.
+    """
+
+    LITERALS: ClassVar[dict[str, str]] = {
+        "<!-- brainskit:start -->": "INSTRUCTION_START",
+        "<!-- brainskit:end -->": "INSTRUCTION_END",
+        "# brainskit:generated": "HOOK_SENTINEL",
+    }
+
+    def sources(self) -> dict[Path, str]:
+        root = Path(__file__).resolve().parents[1] / "src" / "brainskit"
+        return {
+            path: path.read_text(encoding="utf-8")
+            for path in root.rglob("*.py")
+            if "codeanalysis" not in path.parts
+        }
+
+    def test_each_sentinel_is_written_once(self) -> None:
+        for literal, name in self.LITERALS.items():
+            with self.subTest(constant=name):
+                owners = [
+                    path.name
+                    for path, text in self.sources().items()
+                    if f'"{literal}"' in text
+                ]
+                self.assertEqual(
+                    owners,
+                    ["gate.py"],
+                    msg=f"{name} is spelled out in {owners}; import it instead",
+                )
+
+    def test_the_deny_prefixes_are_defined_once(self) -> None:
+        owners = [
+            path.name
+            for path, text in self.sources().items()
+            if '("wiki/", "raw/")' in text
+        ]
+        self.assertEqual(owners, ["gate.py"], msg=f"copied into {owners}")

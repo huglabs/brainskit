@@ -30,6 +30,7 @@ from brainskit.application.freshness import (
     _orphaned_freshness,
     _projection_source_hash,
 )
+from brainskit.application.gate import INSTRUCTION_START
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
@@ -154,6 +155,7 @@ class Health:
         # Read after lint: `_mechanical_lint` refreshes page staleness in place,
         # so reading first would report the state that lint just superseded.
         freshness = self.vault.read_state("freshness")
+        enforcement = self._enforcement_state()
         return {
             "vault": str(self.vault.root),
             "sources": len(records),
@@ -169,8 +171,23 @@ class Health:
                 # describes has moved on.
                 CODE_PROJECTION: CodeGraph(self.vault).staleness(),
             },
-            "enforcement": self._enforcement_state(),
-            "healthy": lint_result["ok"],
+            "enforcement": enforcement,
+            # `healthy` used to be `lint_result["ok"]` alone, so `bk status`
+            # printed a green headline directly above three red enforcement
+            # rows. A vault whose write gate is not running is not healthy just
+            # because the pages it already has happen to lint; the headline sits
+            # above those rows and has to mean them too.
+            #
+            # Advisory layers (the CLAUDE.md block) are excluded deliberately:
+            # they inform, they do not enforce, and failing the headline on one
+            # would make it fire for something no mechanism was ever going to
+            # stop.
+            "healthy": lint_result["ok"]
+            and all(
+                layer.get("active")
+                for layer in enforcement.get("layers", [])
+                if not layer.get("advisory")
+            ),
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in lint_result["findings"]
             ),
@@ -691,7 +708,7 @@ class Health:
         try:
             advisory_active = (
                 instructions.is_file()
-                and "<!-- brainskit:start -->" in instructions.read_text(
+                and INSTRUCTION_START in instructions.read_text(
                     encoding="utf-8"
                 )
             )

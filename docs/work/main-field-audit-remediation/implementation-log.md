@@ -142,6 +142,47 @@ should unregister, or `initialize` should take a `register=False` for throwaways
 
 ---
 
+## Phase 3 — 2 of 8, then stopped deliberately
+
+Suite 977 → **996**. `ruff check` clean.
+
+| Task | Requirement | Negative control |
+|---|---|---|
+| 3.5 (B3) | `bk status` headline means enforcement too | 2 fail → restored green |
+| 3.3 (F3) | installer constants have one owner | 1 fail → restored green |
+
+`INSTRUCTION_START`, `INSTRUCTION_END`, `HOOK_SENTINEL` and the gate's deny
+prefixes now live in `application/gate.py`; `cli.py` (the writer) and
+`health.py` (a reader) both import them. `test_layering.py` asserts each literal
+is spelled out in exactly one file, so a future copy fails a test rather than
+drifting in silence.
+
+**One consequential test change.** `test_a_stale_projection_is_a_warning_not_an_error`
+asserted `status()["healthy"]`, using it as a stand-in for "lint is clean".
+`healthy` now also means every non-advisory enforcement layer is live -- true of
+a real vault, not of a bare temp directory. Repointed at `lint_errors == 0`,
+which is what the test is actually about.
+
+### Why 3.2 (F2) was stopped rather than finished
+
+Moving the jsonschema engine out of `domain/` is a mechanical extraction of
+~87 lines across four functions, plus three application callers and two test
+modules. Halfway through delimiting the block it became clear the boundary was
+ambiguous -- a path-formatting helper immediately after `_deny_remote_schema`
+may or may not be part of the engine -- and there was not enough context budget
+left to verify the move properly.
+
+`domain/model.py` is untouched. An unverified move in the domain layer is worse
+than an undone one, so it stays open.
+
+### Remaining in Phase 3
+
+3.1 (native cycles/diff, drop the networkx pin) · 3.2 (jsonschema out of domain)
+3.4 (layering-test gaps) · 3.6 (slug uniqueness) · 3.7 (scoped-build pruning)
+3.8 (BrainskitNode rename + migration)
+
+---
+
 ## Pre-flight (§0.4, §0.5)
 
 - Branched off `main`.

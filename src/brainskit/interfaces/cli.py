@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import IO, Any, NamedTuple
 
 from brainskit import __version__
+from brainskit.application.gate import (
+    DEFAULT_DENY_PREFIXES,
+    HOOK_SENTINEL,
+    INSTRUCTION_END,
+    INSTRUCTION_START,
+)
 from brainskit.application.health import redirected_git_hooks_path
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
@@ -1612,8 +1618,6 @@ INSTRUCTION_FILES = {
     "gemini": "GEMINI.md",
     "opencode": "AGENTS.md",
 }
-INSTRUCTION_START = "<!-- brainskit:start -->"
-INSTRUCTION_END = "<!-- brainskit:end -->"
 _MANAGED_BLOCK_RE = re.compile(
     rf"{re.escape(INSTRUCTION_START)}.*?{re.escape(INSTRUCTION_END)}\n?",
     re.DOTALL,
@@ -1636,9 +1640,7 @@ CLAUDE_HOOKS: tuple[ClaudeHook, ...] = (
     # session-scoped hooks in a real settings file are written.
     ClaudeHook("brainskit-status", "SessionStart", None, 15),
 )
-HOOK_SENTINEL = "# brainskit:generated"
 
-GATE_DENY_PREFIXES: tuple[str, ...] = ("wiki/", "raw/")
 GATE_REMEDIATION: dict[str, str] = {
     "wiki/": "Wiki pages are written only by the apply gate. Use: bk apply",
     "raw/": "Sources are immutable and hash-identified. Use: bk capture",
@@ -1662,7 +1664,7 @@ def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
         "version": 2,
         "workspace": str(workspace),
         "gate": {
-            "deny_prefixes": list(GATE_DENY_PREFIXES),
+            "deny_prefixes": list(DEFAULT_DENY_PREFIXES),
             "remediation": dict(GATE_REMEDIATION),
         },
         "rules": [
