@@ -153,7 +153,7 @@ def _cypher_export(graph: dict[str, Any]) -> str:
             + "}"
         )
         lines.append(
-            "MERGE (n:BrainkitNode {id: "
+            "MERGE (n:BrainskitNode {id: "
             + _cypher_string(node["id"])
             + "}) SET n += "
             + properties
@@ -164,8 +164,8 @@ def _cypher_export(graph: dict[str, Any]) -> str:
             "SOURCED_FROM" if edge["type"] == "sourced_from" else "LINKS_TO"
         )
         lines.append(
-            f"MATCH (a:BrainkitNode {{id: {_cypher_string(edge['source'])}}}), "
-            f"(b:BrainkitNode {{id: {_cypher_string(edge['target'])}}}) "
+            f"MATCH (a:BrainskitNode {{id: {_cypher_string(edge['source'])}}}), "
+            f"(b:BrainskitNode {{id: {_cypher_string(edge['target'])}}}) "
             f"MERGE (a)-[:{relationship}]->(b);"
         )
     return "\n".join(lines) + "\n"

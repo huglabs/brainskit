@@ -235,6 +235,13 @@ class FakePostgresConnection:
     def __init__(self, error: BaseException | None, store: FakePostgresStore):
         self.error = error
         self.store = store
+        #: What the next `fetchone` returns. `None` models a server with no
+        #: pre-rename `brainkit` schema, which is every fixture here except the
+        #: migration test.
+        self.next_row: tuple | None = None
+
+    def fetchone(self) -> tuple | None:
+        return self.next_row
 
     def __enter__(self) -> FakePostgresConnection:
         return self

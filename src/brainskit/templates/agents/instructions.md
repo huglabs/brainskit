@@ -118,7 +118,7 @@ Persistent integrations carry their own configured consumer, and passing
 - **Obsidian** — manifest-based sync of `wiki/`, `views/` and the graph. It
   deletes only paths it previously wrote, so human-owned notes survive. Consumer
   is optional and defaults to `local`.
-- **Neo4j** — a real Bolt transaction writing `BrainkitNode` nodes with
+- **Neo4j** — a real Bolt transaction writing `BrainskitNode` nodes with
   `SOURCED_FROM` and `LINKS_TO` relationships. Every identity is namespaced with
   a per-vault id, so a refresh replaces only this vault's subgraph. Consumer is
   mandatory.

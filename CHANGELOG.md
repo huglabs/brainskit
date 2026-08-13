@@ -61,10 +61,20 @@ artifact was built from is the durable record of what shipped.
   registry and strand every vault on the machine.
 - A vault at `<repo>/.brainkit` is still discovered alongside `<repo>/.brainskit`
   and `docs/brain`.
-- PostgreSQL and Neo4j keep their `brainkit` role, database, schema, index and
-  constraint names: those name objects that already exist on a user's server,
-  and renaming them would create a second set beside the originals rather than
-  move anything. Set them explicitly in the integration policy to change them.
+- PostgreSQL and Neo4j now write `BrainskitNode` nodes into a `brainskit`
+  schema, matching the documentation. The reasoning that previously kept the old
+  names still holds -- creating the new objects beside the originals would
+  duplicate rather than move them -- so a store that still holds the pre-rename
+  objects is **refused** on sync, with the statement that moves them:
+
+      Neo4j       MATCH (n:BrainkitNode) SET n:BrainskitNode REMOVE n:BrainkitNode
+      PostgreSQL  ALTER SCHEMA "brainkit" RENAME TO "brainskit"
+
+  Run it on the server, then sync again. The PostgreSQL **role, database and
+  container** names are deliberately unchanged: those identify objects a server
+  provisioned rather than objects brainskit writes into one, and renaming them
+  would strand a running deployment. Set any of these explicitly in the
+  integration policy to override.
 - Agent hooks are named `brainskit-gate` and `brainskit-status` and the skill
   installs to `.claude/skills/brainskit/`. Re-run `bk hooks install --force` in
   each project that has the old ones.

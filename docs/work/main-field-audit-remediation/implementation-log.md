@@ -142,7 +142,7 @@ should unregister, or `initialize` should take a `register=False` for throwaways
 
 ---
 
-## Phase 3 — 5 of 8
+## Phase 3 — 6 of 8, plus 4.5
 
 Suite 977 → **996**. `ruff check` clean.
 
@@ -227,10 +227,43 @@ refused. Two tests asserting they must refuse were inverted to assert they work.
 
 Unblocks 4.5 (removing the dead vendored regions), which was waiting on this.
 
+### 3.8 — the graph object rename, with the migration that makes it safe
+
+Neo4j writes `BrainskitNode`; the PostgreSQL schema defaults to `brainskit`.
+The changelog entry that kept the old names was not wrong -- creating the new
+objects beside the originals duplicates rather than moves -- so the rename ships
+with the detection that reasoning demanded. A store still holding the pre-rename
+objects is **refused on sync**, with the statement that moves them:
+
+    Neo4j       MATCH (n:BrainkitNode) SET n:BrainskitNode REMOVE n:BrainkitNode
+    PostgreSQL  ALTER SCHEMA "brainkit" RENAME TO "brainskit"
+
+Deliberately **not** renamed: the PostgreSQL role, database and container names.
+Those identify objects a server provisioned rather than objects brainskit writes
+into one, and renaming them strands a running deployment for a consistency no
+user ever sees. A control test pins that they stayed.
+
+One test double had to grow: `FakePostgresConnection` had no `fetchone`, so the
+schema probe hit an `AttributeError`. The fake now models the interface it
+stands in for.
+
+### 4.5 — the dead vendored regions, measured before deleting
+
+**2,496 lines deleted.** `analyze.py` (749), `build.py` (1,643) and
+`validate.py` (95) are gone; `NOTICE` declares the removal under a new REMOVED
+heading and `test_vendoring.py` pins it, so an undeclared restore fails a test
+exactly as an undeclared edit already did.
+
+**A third audit premise was wrong.** The finding listed `detect.py` +
+`google_workspace.py` (634) and `security.py` (211) as unreachable too. They are
+not: `extract.py` imports all three, `symbol_resolution.py` and `paths.py` import
+`security`, and `detect.py` imports `google_workspace`. Only the analyze/build/
+validate chain was genuinely dead -- and only because 3.1 made it so. Deleting
+on the audit's list as written would have broken extraction.
+
 ### Remaining in Phase 3
 
-3.7 (scoped-build pruning, with the path-base question resolved) ·
-3.8 (BrainskitNode rename + migration)
+3.7 only (scoped-build pruning, with the path-base question resolved).
 
 ---
 

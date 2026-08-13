@@ -40,6 +40,12 @@ DECLARED_MODIFICATIONS = frozenset(
     {"extract.py", "detect.py", "google_workspace.py"}
 )
 
+#: Files removed from the vendored tree rather than edited. Declared for the
+#: same reason and pinned the same way: a removal is a departure from
+#: byte-identity too, and an undeclared one would let the tree drift from
+#: upstream silently in the direction nobody checks.
+DECLARED_REMOVALS = frozenset({"analyze.py", "build.py", "validate.py"})
+
 
 class VendoredModificationTest(unittest.TestCase):
     def test_notice_declares_exactly_the_modified_files(self) -> None:
@@ -174,3 +180,41 @@ class VendoredAnalysisIsUnreachableTest(unittest.TestCase):
             if "from graphify import cluster" in text
         ]
         self.assertEqual(importers, ["application/codegraph.py"])
+
+
+class VendoredRemovalTest(unittest.TestCase):
+    """A removal is a departure from upstream and has to be declared too."""
+
+    def tree(self) -> Path:
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "brainskit" / "infrastructure" / "codeanalysis"
+        )
+
+    def test_the_declared_removals_are_actually_gone(self) -> None:
+        for name in sorted(DECLARED_REMOVALS):
+            with self.subTest(file=name):
+                self.assertFalse((self.tree() / name).exists())
+
+    def test_notice_declares_every_removal(self) -> None:
+        text = (self.tree() / "NOTICE").read_text(encoding="utf-8")
+        _, _, section = text.partition("REMOVED")
+        self.assertTrue(section, "NOTICE lost its REMOVED section")
+        for name in sorted(DECLARED_REMOVALS):
+            with self.subTest(file=name):
+                self.assertIn(name, section)
+
+    def test_nothing_in_the_tree_imports_a_removed_module(self) -> None:
+        """Control: a removal that broke the tree would fail here, not at runtime."""
+
+        stems = {name.removesuffix(".py") for name in DECLARED_REMOVALS}
+        offenders = []
+        for path in self.tree().rglob("*.py"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped.startswith(("import ", "from ")):
+                    continue
+                for stem in stems:
+                    if f"graphify.{stem}" in stripped:
+                        offenders.append(f"{path.name}: {stripped}")
+        self.assertEqual(offenders, [])
