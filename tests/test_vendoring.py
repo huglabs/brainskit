@@ -54,7 +54,11 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import tomllib
 import unittest
 from collections.abc import Callable
@@ -560,6 +564,161 @@ class ReleaseGateIsolationTest(unittest.TestCase):
             if "/bin/bk" in text and "export XDG_CONFIG_HOME=" not in text:
                 offenders.append(path.name)
         self.assertEqual(offenders, [], f"scripts touch the real registry: {offenders}")
+
+
+class SdistListingIsReadOnceTest(unittest.TestCase):
+    """The gate must not refuse a release over a file the sdist carries.
+
+    `verify-wheel.sh` asserted the vendored licence files reached the sdist with
+    `tar tzf "$SDIST" | grep -q "/$path$"`, which is a false negative under
+    `set -o pipefail`. `grep -q` exits at its first match -- entry 37 of the 166
+    in this project's sdist -- closing the pipe while tar is still writing. GNU
+    tar dies of EPIPE, `pipefail` adopts that status for the pipeline, and the
+    leading `!` reads it as "missing". macOS ships bsdtar, which finishes first
+    and exits 0, so the gate passed on the maintainer's machine and failed on
+    every CI run: 0.6.1 was blocked from publishing over `LICENSE-MIT` and
+    `NOTICE`, seconds after the wheel built from that same sdist was proved to
+    contain them.
+
+    That makes it a *release-blocking* defect in a release gate, and the worst
+    shape a gate can fail in -- a red that says the artifact is broken when the
+    artifact is fine -- so it is worth a test that reproduces the condition
+    rather than one that reads the file.
+
+    The reproduction runs the gate's own sdist block, lifted from the script
+    text, against a stub `tar` that reports a write error the moment its reader
+    goes away. That is GNU tar's behaviour, confirmed against GNU tar 1.35 on the
+    real 0.6.1 sdist before this was written: the piped spelling reported
+    "missing" on 5 runs of 5, the current spelling reported ok on 5 of 5, and
+    `tar tzf` alone exited 0. The stub is here so the assertion holds on a macOS
+    checkout too, where the platform tar cannot show the failure.
+    """
+
+    SCRIPT = ROOT / "scripts" / "verify-wheel.sh"
+
+    #: Early-exiting readers. A pipeline that ends in one takes the exit status
+    #: of a producer that was still writing, which under `pipefail` is a verdict
+    #: about the plumbing wearing the costume of a verdict about the artifact.
+    EARLY_EXITING_READER = re.compile(r"\|\s*(head\b|grep\b[^|]*\s-[A-Za-z]*q\b)")
+
+    STUB_TAR = textwrap.dedent(
+        '''\
+        #!/usr/bin/env python3
+        """Stand in for GNU tar: report a write error when the reader leaves."""
+
+        import os
+        import sys
+        import time
+
+        names = ["brainskit-0.0.0/filler/%04d.py" % index for index in range(200)]
+        names[36] = "brainskit-0.0.0/src/brainskit/infrastructure/codeanalysis/LICENSE-MIT"
+        names[37] = "brainskit-0.0.0/src/brainskit/infrastructure/codeanalysis/NOTICE"
+
+        try:
+            for position, name in enumerate(names):
+                sys.stdout.write(name + "\\n")
+                sys.stdout.flush()
+                if position in (36, 37):
+                    # Let a `grep -q` that just matched actually exit, so the
+                    # next write meets a closed pipe instead of racing it. The
+                    # real failure needs no help -- 129 entries follow -- but a
+                    # test that depends on a race is a test that flakes.
+                    time.sleep(0.15)
+        except BrokenPipeError:
+            sys.stderr.write("tar: stdout: write error\\n")
+            os._exit(2)
+        '''
+    )
+
+    def sdist_check(self) -> str:
+        """The gate's sdist block, as it is actually written today.
+
+        Bounded by the heredoc terminator that closes the attribution check and
+        by the block's own success line, so it survives a rewrite of the check
+        and fails loudly rather than silently if either boundary moves.
+        """
+
+        lines = self.SCRIPT.read_text(encoding="utf-8").splitlines()
+        ends = [n for n, line in enumerate(lines) if "ok: the sdist carries" in line]
+        self.assertEqual(len(ends), 1, "cannot locate the sdist block's success line")
+        starts = [n for n, line in enumerate(lines[: ends[0]]) if line == "PY"]
+        self.assertTrue(starts, "cannot locate the heredoc the sdist block follows")
+        block = "\n".join(lines[starts[-1] + 1 : ends[0] + 1])
+        self.assertIn("$SDIST", block, f"the extracted block reads no sdist:\n{block}")
+        return block
+
+    def run_block(self, block: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as work:
+            stub = Path(work) / "tar"
+            stub.write_text(self.STUB_TAR, encoding="utf-8")
+            stub.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = f"{work}{os.pathsep}{environment['PATH']}"
+            environment["SDIST"] = "the-stub-does-not-read-this.tar.gz"
+            return subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + block],
+                capture_output=True,
+                text=True,
+                env=environment,
+                cwd=work,
+                timeout=120,
+            )
+
+    def test_the_check_passes_against_a_producer_that_dies_of_epipe(self) -> None:
+        result = self.run_block(self.sdist_check())
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"the gate refuses a sound sdist\nout: {result.stdout}\nerr: {result.stderr}",
+        )
+        self.assertIn("ok: the sdist carries", result.stdout)
+
+    def test_the_stub_does_reproduce_the_false_negative(self) -> None:
+        """Control: without it, the test above could pass on a stub that is inert.
+
+        Puts the piped spelling back and asserts the block then refuses an sdist
+        holding both files -- which is exactly what CI reported for 0.6.1.
+        """
+
+        block = self.sdist_check()
+        piped, substitutions = re.subn(
+            r"if ! .*; then",
+            lambda _: 'if ! tar tzf "$SDIST" | grep -q "/$path\\$"; then',
+            block,
+        )
+        self.assertEqual(substitutions, 1, f"the control rewrote nothing:\n{block}")
+        result = self.run_block(piped)
+        self.assertEqual(
+            result.returncode, 1, msg=f"out: {result.stdout}\nerr: {result.stderr}"
+        )
+        self.assertIn("sdist is missing", result.stdout)
+
+    def test_the_check_still_fails_on_a_path_that_is_genuinely_absent(self) -> None:
+        """Control: a green gate that cannot go red guards nothing."""
+
+        block = self.sdist_check().replace("codeanalysis/NOTICE", "codeanalysis/ABSENT")
+        result = self.run_block(block)
+        self.assertEqual(
+            result.returncode, 1, msg=f"out: {result.stdout}\nerr: {result.stderr}"
+        )
+        self.assertIn("sdist is missing", result.stdout)
+
+    def test_no_gate_pipeline_ends_in_an_early_exiting_reader(self) -> None:
+        """The general form, for the next `| grep -q` someone reaches for.
+
+        Text, not behaviour, because the point is to catch the spelling before it
+        reaches a release. The reproduction above is what establishes that this
+        spelling is worth catching.
+        """
+
+        offenders = []
+        for path in sorted((ROOT / "scripts").glob("*.sh")):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                if self.EARLY_EXITING_READER.search(line):
+                    offenders.append(f"{path.name}:{number}: {line.strip()}")
+        self.assertEqual(offenders, [], f"a producer can be cut off mid-write: {offenders}")
 
 
 if __name__ == "__main__":

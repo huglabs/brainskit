@@ -59,6 +59,23 @@ byte; the two criticals below were introduced by the release it verified.
   asserted by `verify-wheel.sh`, and `NOTICE` gives the repository and installed
   path for every vendored file — including three.js, a second vendored third
   party the web viewer serves and the file did not mention.
+- **The assertion that proves it no longer refuses a sound sdist.** It was
+  spelled `tar tzf "$SDIST" | grep -q`, which is a false negative under
+  `set -o pipefail`: `grep -q` exits at its first match — entry 37 of 166 — and
+  closes the pipe while tar is still writing the other 129. GNU tar dies of
+  EPIPE, `pipefail` adopts that status for the whole pipeline, and the leading
+  `!` inverts it into "missing". macOS ships bsdtar, which finishes writing
+  before grep can leave and exits 0, so this passed on the maintainer's machine
+  and failed on every run of CI's GNU tar — the worst shape a gate can fail in,
+  a red asserting the artifact is broken while the artifact is fine. It blocked
+  this release over the two files the entry above had just made ship, seconds
+  after the wheel built from that same sdist was found to contain them. The
+  listing is now read once into a variable and matched with a here-string:
+  `printf … | grep -q` is measurably the same defect, surviving only while the
+  listing fits the 64 KiB pipe buffer and returning 141 on one that does not.
+  The condition is reproduced in the suite against a stub producer that reports
+  a write error the moment its reader goes away, because the platform tar on a
+  macOS checkout cannot show it.
 - `verify-wheel.sh` isolates `XDG_CONFIG_HOME`, so verifying a wheel no longer
   writes to the machine-wide vault registry. The isolation is applied after the
   `uv` steps, because `uv` reads its own configuration from the same variable.

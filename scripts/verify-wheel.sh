@@ -162,10 +162,27 @@ if problems:
 print("    ok: vendored LICENSE-MIT + NOTICE, dist-info/licenses/{LICENSE,NOTICE}")
 PY
 
+# Listed once into a variable, and matched without a pipeline. `tar tzf "$SDIST"
+# | grep -q` is the obvious spelling and it is a false negative under `pipefail`:
+# `grep -q` exits at its first match -- entry 37 of 166 here -- which closes the
+# pipe while tar is still writing the other 129. GNU tar dies of EPIPE, `pipefail`
+# adopts that status for the whole pipeline, and the leading `!` inverts it into
+# "missing". macOS ships bsdtar, which finishes writing before grep can leave and
+# exits 0, so this passed on the maintainer's machine and failed every run on
+# CI's GNU tar -- it refused the 0.6.1 release over two files the sdist
+# demonstrably carried, seconds after the wheel built from that same sdist was
+# found to contain them.
+#
+# So no early-exiting reader may sit downstream of a producer here. Note that
+# `printf '%s\n' "$SDIST_ENTRIES" | grep -q` is the *same* bug and not a fix:
+# measured, it survives only while the listing fits the 64 KiB pipe buffer, and
+# returns 141 on a listing that does not. A here-string has no exposure at any
+# size, because bash writes the whole string before `grep` is ever exec'd.
+SDIST_ENTRIES="$(tar tzf "$SDIST")"
 for path in \
     "src/brainskit/infrastructure/codeanalysis/LICENSE-MIT" \
     "src/brainskit/infrastructure/codeanalysis/NOTICE"; do
-    if ! tar tzf "$SDIST" | grep -q "/$path\$"; then
+    if ! grep -q "/$path\$" <<<"$SDIST_ENTRIES"; then
         echo "    sdist is missing $path"
         exit 1
     fi
