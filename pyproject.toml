@@ -2,7 +2,7 @@
 # understood from setuptools 77. An older backend would silently drop the
 # NOTICE the Apache licence requires the distribution to carry.
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
