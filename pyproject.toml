@@ -40,7 +40,7 @@ classifiers = [
   "Topic :: Text Processing :: Indexing",
   "Topic :: Utilities",
 ]
-dependencies = ["jsonschema[format]>=4.20,<5"]
+dependencies = ["jsonschema[format]>=4.26.0,<5"]
 
 [project.urls]
 Homepage = "https://github.com/huglabs/brainskit"
