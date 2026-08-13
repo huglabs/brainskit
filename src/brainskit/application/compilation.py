@@ -207,6 +207,13 @@ class ApplyGate:
                         "path": operation.relative_path,
                         "code": "missing_base_hash",
                         "observed": observed_version,
+                        # `observed` *is* the value to send back, and the
+                        # refusal never said so -- leaving a caller holding the
+                        # answer without knowing it was the answer.
+                        "hint": (
+                            "Set base_hash to the observed value above and "
+                            "retry; it is this page's current version"
+                        ),
                     }
                 )
             elif operation.base_hash != observed_version:
@@ -216,6 +223,11 @@ class ApplyGate:
                         "code": "stale_page",
                         "expected": operation.base_hash,
                         "observed": observed_version,
+                        "hint": (
+                            "The page moved on since base_hash was read. "
+                            "Re-read it with bk context, then retry with the "
+                            "observed value"
+                        ),
                     }
                 )
             expected_versions[operation.relative_path] = operation.base_hash

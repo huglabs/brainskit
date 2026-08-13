@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Initialize a policy-complete vault")
-    init.add_argument("path", nargs="?", default=".")
+    init.add_argument("path", nargs="?", default=".", help="Directory to create the vault in (default: current directory)")
     init.add_argument(
         "--config", help="Complete policy JSON path, or - for standard input"
     )
@@ -97,9 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     capture = commands.add_parser("capture", help="Capture a file, URL, or text")
-    capture.add_argument("source", nargs="?")
+    capture.add_argument("source", nargs="?", help="File path, URL, or - to read text from standard input")
     capture.add_argument("--text", help="Capture literal text")
-    capture.add_argument("--title")
+    capture.add_argument("--title", help="Title for captured text or a URL, when the source has none")
 
     commands.add_parser("status", help="Show vault health and counts")
     commands.add_parser(
@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     file_command = commands.add_parser("file", help="Move a raw source to a branch")
     file_command.add_argument("item", help="Full/prefix hash or raw path")
-    file_command.add_argument("--to", required=True, dest="branch")
+    file_command.add_argument("--to", required=True, dest="branch", help="Destination branch, e.g. 20-knowledge")
 
     forget_command = commands.add_parser(
         "forget",
@@ -128,19 +128,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     lint = commands.add_parser("lint", help="Validate registry and wiki contracts")
-    lint.add_argument("--changed", action="store_true")
-    lint.add_argument("--semantic", action="store_true")
+    lint.add_argument("--changed", action="store_true", help="Only files staged in git, for a pre-commit hook")
+    lint.add_argument("--semantic", action="store_true", help="Also run the model-judged consistency pass")
 
     search = commands.add_parser("search", help="Search with FTS5 BM25")
-    search.add_argument("query")
-    search.add_argument("--limit", type=int, default=10)
-    search.add_argument("--consumer", choices=["human", "local", "cloud"])
+    search.add_argument("query", help="Full-text query")
+    search.add_argument("--limit", type=int, default=10, help="Maximum hits to return (default: 10)")
+    search.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
 
     context = commands.add_parser("context", help="Build a bounded evidence bundle")
-    context.add_argument("query")
-    context.add_argument("--limit", type=int, default=8)
-    context.add_argument("--max-chars", type=int, default=24_000)
-    context.add_argument("--consumer", choices=["human", "local", "cloud"])
+    context.add_argument("query", help="Topic to gather evidence for")
+    context.add_argument("--limit", type=int, default=8, help="Maximum evidence items to bundle (default: 8)")
+    context.add_argument("--max-chars", type=int, default=24_000, help="Truncate the bundle to roughly this many characters")
+    context.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
 
     apply_command = commands.add_parser(
         "apply", help="Validate and atomically stage wiki writes"
@@ -179,13 +179,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enrich_apply.add_argument("proposal", help="Proposal JSON path, or - for stdin")
     enrich_list = enrich_sub.add_parser("list", help="Stored edges, privacy-filtered")
-    enrich_list.add_argument("--consumer", choices=["human", "local", "cloud"])
+    enrich_list.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
     enrich_forget = enrich_sub.add_parser("forget", help="Drop one stored edge")
     enrich_forget.add_argument("id", metavar="ID", help="Full or prefix edge id")
 
     commands.add_parser("views", help="Regenerate Obsidian views")
     graph = commands.add_parser("graph", help="Regenerate the knowledge graph")
-    graph.add_argument("--html", action="store_true")
+    graph.add_argument("--html", action="store_true", help="Also write a standalone graph/graph.html viewer")
     # A file target, so it defaults to `local` like every other one: the written
     # artifact used to carry never-ingest hashes, filenames and branch names
     # with nothing on it saying which boundary it was built under.
@@ -239,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     code_import = code_commands.add_parser(
         "import", help="Import an extractor's graph as graph/code.json"
     )
-    code_import.add_argument("graph", metavar="GRAPH_JSON")
+    code_import.add_argument("graph", metavar="GRAPH_JSON", help="Extractor output as JSON, or - for standard input")
 
     code_commands.add_parser(
         "status", help="Whether the graph still describes the repository"
@@ -248,17 +248,17 @@ def build_parser() -> argparse.ArgumentParser:
     code_affected = code_commands.add_parser(
         "affected", help="What breaks if this symbol changes"
     )
-    code_affected.add_argument("symbol")
-    code_affected.add_argument("--depth", type=int, default=2)
+    code_affected.add_argument("symbol", help="Symbol id or label to traverse backwards from")
+    code_affected.add_argument("--depth", type=int, default=2, help="How many edges to follow backwards (default: 2)")
 
     code_path = code_commands.add_parser(
         "path", help="Shortest chain of edges between two symbols"
     )
-    code_path.add_argument("source")
-    code_path.add_argument("target")
+    code_path.add_argument("source", help="Symbol to start from")
+    code_path.add_argument("target", help="Symbol to reach")
 
     code_hubs = code_commands.add_parser("hubs", help="The most connected symbols")
-    code_hubs.add_argument("--top", type=int, default=10)
+    code_hubs.add_argument("--top", type=int, default=10, help="How many of the most connected symbols to return (default: 10)")
 
     code_communities = code_commands.add_parser(
         "communities", help="Group the graph into structurally cohesive clusters"
@@ -275,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-length", type=int, default=5, dest="max_length",
         help="Longest cycle (in files) worth reporting",
     )
-    code_cycles.add_argument("--top", type=int, default=20)
+    code_cycles.add_argument("--top", type=int, default=20, help="How many cycles to return, shortest first (default: 20)")
 
     code_diff = code_commands.add_parser(
         "diff", help="What changed structurally since the stored graph"
@@ -315,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
             "kuzu",
             "llms-txt",
         ],
-    )
+        help="Export format: json, graphml, cypher, kuzu, llms-txt, or an integration")
     export.add_argument(
         "--consumer",
         choices=["human", "local", "cloud"],
@@ -332,47 +332,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     ingest = commands.add_parser("ingest", help="Run the configured ingest judgment")
-    ingest.add_argument("item", nargs="?")
-    ingest.add_argument("--all", action="store_true", dest="all_pending")
-    ingest.add_argument("--to", dest="target_branch")
+    ingest.add_argument("item", nargs="?", help="Source hash or path to ingest")
+    ingest.add_argument("--all", action="store_true", dest="all_pending", help="Ingest every pending source instead of one")
+    ingest.add_argument("--to", dest="target_branch", help="File into this branch instead of asking the model to choose")
 
     proposals = commands.add_parser(
         "proposals", help="List filing and wiki proposals"
     )
     proposals.add_argument(
-        "--status", choices=["pending", "applied", "rejected", "failed"]
-    )
+        "--status", choices=["pending", "applied", "rejected", "failed"],
+        help="Only proposals in this state, e.g. pending")
 
     approve = commands.add_parser("approve", help="Approve a pending proposal")
-    approve.add_argument("proposal_id")
+    approve.add_argument("proposal_id", help="Proposal to approve")
 
     reject = commands.add_parser("reject", help="Reject a pending proposal")
-    reject.add_argument("proposal_id")
-    reject.add_argument("--reason", default="")
+    reject.add_argument("proposal_id", help="Proposal to reject")
+    reject.add_argument("--reason", default="", help="Why it was rejected, recorded with the proposal")
 
     ask = commands.add_parser("ask", help="Answer from compiled vault evidence")
-    ask.add_argument("question")
-    ask.add_argument("--save", action="store_true")
+    ask.add_argument("question", help="Question to answer from the vault")
+    ask.add_argument("--save", action="store_true", help="Write the answer into output/answers/ as well as printing it")
 
     digest = commands.add_parser("digest", help="Generate the configured digest")
-    digest.add_argument("--since", default="7d")
+    digest.add_argument("--since", default="7d", help="Only sources captured on or after this ISO date")
     commands.add_parser("resurface", help="Resurface one durable insight")
 
     serve = commands.add_parser("serve", help="Serve robot interfaces")
-    serve.add_argument("--mcp", action="store_true", required=True)
+    serve.add_argument("--mcp", action="store_true", required=True, help="Serve MCP instead of the web viewer")
     serve.add_argument(
-        "--transport", choices=["stdio", "http"], default="stdio"
-    )
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8766)
-    serve.add_argument("--token-env")
-    serve.add_argument("--allowed-origin", action="append", default=[])
-    serve.add_argument("--tls-cert")
-    serve.add_argument("--tls-key")
+        "--transport", choices=["stdio", "http"], default="stdio",
+        help="MCP transport: stdio (default) or http")
+    serve.add_argument("--host", default="127.0.0.1", help="Interface to bind; non-loopback requires --token-env")
+    serve.add_argument("--port", type=int, default=8766, help="Port to bind")
+    serve.add_argument("--token-env", help="Environment variable holding the bearer token")
+    serve.add_argument("--allowed-origin", action="append", default=[], help="Extra allowed Origin header; repeatable")
+    serve.add_argument("--tls-cert", help="PEM certificate, to serve over HTTPS")
+    serve.add_argument("--tls-key", help="PEM private key matching --tls-cert")
 
     watch = commands.add_parser("watch", help="Watch configured source folders")
-    watch.add_argument("--once", action="store_true")
-    watch.add_argument("--interval", type=float, default=5.0)
+    watch.add_argument("--once", action="store_true", help="Scan the inbox a single time and exit")
+    watch.add_argument("--interval", type=float, default=5.0, help="Seconds between scans when running continuously")
 
     hooks = commands.add_parser("hooks", help="Install agent-facing vault hooks")
     hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
@@ -381,7 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent",
         required=True,
         choices=["claude", "codex", "gemini", "opencode"],
-    )
+        help="Which agent's configuration to write")
     hooks_install.add_argument(
         "--root",
         help=(
@@ -418,43 +418,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     integration_configure = integration_sub.add_parser("configure")
     integration_configure.add_argument(
-        "name", choices=["obsidian", "neo4j", "postgres", "web"]
-    )
+        "name", choices=["obsidian", "neo4j", "postgres", "web"],
+        help="Integration to configure")
     enabled_group = integration_configure.add_mutually_exclusive_group()
-    enabled_group.add_argument("--enable", action="store_true", default=None)
-    enabled_group.add_argument("--disable", action="store_true", default=None)
+    enabled_group.add_argument(
+        "--enable", action="store_true", default=None,
+        help="Turn the integration on")
+    enabled_group.add_argument(
+        "--disable", action="store_true", default=None,
+        help="Turn the integration off, leaving its settings")
     managed_group = integration_configure.add_mutually_exclusive_group()
-    managed_group.add_argument("--managed", action="store_true", default=None)
-    managed_group.add_argument("--external", action="store_true", default=None)
-    integration_configure.add_argument("--path")
-    integration_configure.add_argument("--subdirectory")
+    managed_group.add_argument(
+        "--managed", action="store_true", default=None,
+        help="Let brainskit run the container for this service")
+    managed_group.add_argument(
+        "--external", action="store_true", default=None,
+        help="The operator runs the service; brainskit only connects")
+    integration_configure.add_argument("--path", help="Destination directory (Obsidian)")
+    integration_configure.add_argument("--subdirectory", help="Folder inside the destination to own (Obsidian)")
     integration_configure.add_argument(
-        "--include-raw", action="store_true", default=None
-    )
-    integration_configure.add_argument("--uri")
-    integration_configure.add_argument("--user")
-    integration_configure.add_argument("--password-env")
-    integration_configure.add_argument("--database")
-    integration_configure.add_argument("--dsn-env")
-    integration_configure.add_argument("--schema")
-    integration_configure.add_argument("--image")
-    integration_configure.add_argument("--container-name")
-    integration_configure.add_argument("--host")
-    integration_configure.add_argument("--port", type=int)
-    integration_configure.add_argument("--http-port", type=int)
-    integration_configure.add_argument("--bolt-port", type=int)
-    integration_configure.add_argument("--token-env")
+        "--include-raw", action="store_true", default=None,
+        help="Also copy raw/ evidence the consumer may see (Obsidian)")
+    integration_configure.add_argument("--uri", help="Bolt URI, e.g. bolt://127.0.0.1:7687 (Neo4j)")
+    integration_configure.add_argument("--user", help="Database or graph user")
+    integration_configure.add_argument("--password-env", help="Environment variable holding the password")
+    integration_configure.add_argument("--database", help="Database name to write into")
+    integration_configure.add_argument("--dsn-env", help="Environment variable holding a full DSN (PostgreSQL)")
+    integration_configure.add_argument("--schema", help="Schema to own (PostgreSQL, default: brainskit)")
+    integration_configure.add_argument("--image", help="Container image to run when managed")
+    integration_configure.add_argument("--container-name", help="Name for the managed container")
+    integration_configure.add_argument("--host", help="Interface to bind")
+    integration_configure.add_argument("--port", type=int, help="Port to bind or connect to")
+    integration_configure.add_argument("--http-port", type=int, help="HTTP port (Neo4j browser)")
+    integration_configure.add_argument("--bolt-port", type=int, help="Bolt port (Neo4j)")
+    integration_configure.add_argument("--token-env", help="Environment variable holding the bearer token")
     integration_configure.add_argument(
-        "--consumer", choices=["human", "local", "cloud"]
-    )
+        "--consumer", choices=["human", "local", "cloud"],
+        help="Privacy boundary this integration receives")
     integration_status = integration_sub.add_parser("status")
     integration_status.add_argument(
-        "name", nargs="?", choices=["obsidian", "neo4j", "postgres", "web"]
-    )
+        "name", nargs="?", choices=["obsidian", "neo4j", "postgres", "web"],
+        help="Integration to report on; omit for all")
     for operation in ("up", "down", "sync"):
         command = integration_sub.add_parser(operation)
         command.add_argument(
-            "name", choices=["obsidian", "neo4j", "postgres", "web"]
+            "name",
+            choices=["obsidian", "neo4j", "postgres", "web"],
+            help=f"Integration to {operation}",
         )
 
     vaults = commands.add_parser(
@@ -519,10 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     web = commands.add_parser("web", help="Run the complete local web viewer")
-    web.add_argument("--host")
-    web.add_argument("--port", type=int)
-    web.add_argument("--consumer", choices=["human", "local", "cloud"])
-    web.add_argument("--token-env")
+    web.add_argument("--host", help="Interface to bind; non-loopback requires --token-env")
+    web.add_argument("--port", type=int, help="Port to bind")
+    web.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary the viewer reads under; writes need human")
+    web.add_argument("--token-env", help="Environment variable holding the bearer token")
     web.add_argument(
         "--allowed-origin",
         action="append",
@@ -542,10 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web_sub = web.add_subparsers(dest="web_command")
     web_serve = web_sub.add_parser("serve", help="Compatibility alias for `bk web`")
-    web_serve.add_argument("--host")
-    web_serve.add_argument("--port", type=int)
-    web_serve.add_argument("--consumer", choices=["human", "local", "cloud"])
-    web_serve.add_argument("--token-env")
+    web_serve.add_argument(
+        "--host", help="Interface to bind; non-loopback requires --token-env"
+    )
+    web_serve.add_argument("--port", type=int, help="Port to bind")
+    web_serve.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary the viewer reads under; writes need human")
+    web_serve.add_argument(
+        "--token-env", help="Environment variable holding the bearer token"
+    )
     web_serve.add_argument(
         "--allowed-origin",
         action="append",
@@ -554,7 +568,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web_serve.add_argument("--instance-id", help=argparse.SUPPRESS)
     web_serve.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
+    _document_global_options(parser)
     return parser
+
+
+#: `--vault` and `--json` are extracted from argv before the subparsers ever
+#: see them, so they appear in `bk --help` and in no subcommand's help at all.
+#: An agent reading `bk search --help` -- which is the only contract it has --
+#: had no way to learn either exists.
+GLOBAL_OPTIONS_EPILOG = (
+    "global options (accepted anywhere in the command):\n"
+    "  --vault PATH  vault root, otherwise discovered from the current directory\n"
+    "  --json        machine-readable output on stdout"
+)
+
+
+def _document_global_options(parser: argparse.ArgumentParser) -> None:
+    """Name the global options in every leaf command's help.
+
+    Applied by walking the finished tree rather than at each `add_parser` call,
+    so a subcommand added later is covered without anyone remembering to.
+    """
+
+    children = [
+        sub
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+        for sub in action.choices.values()
+    ]
+    if not children:
+        if parser.epilog is None:
+            parser.epilog = GLOBAL_OPTIONS_EPILOG
+            parser.formatter_class = argparse.RawDescriptionHelpFormatter
+        return
+    for child in children:
+        _document_global_options(child)
 
 
 #: Every top-level command, grouped for `bk --help`. A command absent from
@@ -2906,6 +2954,28 @@ def _render_forget(value: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_capture(value: dict[str, Any]) -> str:
+    """`capture` is the second command in every quickstart and had no renderer.
+
+    It fell through to the raw-JSON dump, so the first thing a new user saw
+    after `bk init` was a payload -- and the one field they need next, the
+    content hash, was buried in it unlabelled.
+    """
+
+    source = value.get("source") or {}
+    content_hash = str(source.get("content_hash", ""))
+    created = bool(value.get("created", True))
+    verb = "captured" if created else "already captured"
+    lines = [
+        console.status_line(True, f"{verb} {source.get('original_name', '?')}"),
+        f"  hash  {content_hash}",
+        f"  path  {source.get('path', '?')}",
+    ]
+    if str(source.get("status", "")) == "pending":
+        lines.append(f"  next  bk file {content_hash[:16]} --to <branch>")
+    return "\n".join(lines)
+
+
 def _render_file(value: dict[str, Any]) -> str:
     source = value.get("source") or {}
     return console.status_line(
@@ -3244,6 +3314,7 @@ def _render_code_build(value: dict[str, Any]) -> str:
 
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "init": _render_init,
+    "capture": _render_capture,
     "status": _render_status,
     "doctor": _render_doctor,
     "search": _render_search,

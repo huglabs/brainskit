@@ -142,7 +142,7 @@ should unregister, or `initialize` should take a `register=False` for throwaways
 
 ---
 
-## Phase 3 — 6 of 8, plus 4.5
+## Phase 3 — 7 of 8 · Phase 4 — 5 of 6
 
 Suite 977 → **996**. `ruff check` clean.
 
@@ -380,3 +380,63 @@ Recorded because the same trap is waiting in every remaining phase:
 - Updated: 2026-08-12 14:49
 - Updated: 2026-08-12 15:05
 - Updated: 2026-08-12 15:13
+
+
+---
+
+## Phase 4 — 4.1 through 4.5
+
+Suite 1017 → **1038**. `ruff check` clean.
+
+| Task | Requirement | Negative control |
+|---|---|---|
+| 4.1 | serving docs match the routes | 1 fail → 6 pass |
+| 4.2 | every flag and positional documents itself | 1 fail → 4 pass |
+| 4.3 | `--force`'s guard — **already implemented**, now pinned | n/a, see below |
+| 4.4 | `capture` renderer + refusals that name the next step | 1 fail → 11 pass |
+| 4.5 | dead vendored regions removed | 2 fail → 12 pass |
+
+**4.1.** The web API is documented as what it is: eleven read endpoints
+(`/api/code-graph` was missing) and four that write, guarded by
+`--consumer human` rather than by method. The optional bearer token is now
+documented as a deliberate trade rather than an omission. A docs-truth test
+compares the documented list against the paths `do_GET`/`do_POST` actually
+compare, so the list cannot drift.
+
+**4.2.** 61 options and 17 positionals gained help text. The bigger fix is
+structural: `--vault` and `--json` are stripped from argv before any subparser
+sees them, so they appeared in no subcommand's help at all. A walker now adds
+an epilog naming them to every leaf command, which covers subcommands added
+later without anyone remembering.
+
+**4.4.** `bk capture` — the second command in every quickstart — rendered as a
+raw JSON dump. It now prints the hash, the path and the next command.
+`missing_base_hash` and `stale_page` refusals now say what to do with the value
+they hand back.
+
+### A fourth audit premise was wrong
+
+**4.3 needed no code change.** The finding said `--force`'s help "promises a
+guard against initializing over other projects that isn't implemented".
+`FileVault._refuse_bad_site` implements exactly that: two or more git
+repositories directly inside the target refuses with `RefusalError`, naming
+them, and `--force` overrides it. Verified live, not read:
+
+```
+$ bk init <workspace-with-2-repos>
+bk: Refusing to create a vault in a directory that holds projects
+  → Create it inside one of them, e.g. proj-a/.brainskit — or pass --force
+  repositories: proj-a, proj-b
+$ bk init <same> --force
+✓ vault initialized
+```
+
+The help was accurate. Four tests now pin the behaviour, including a control
+that a directory holding *one* repository is not refused — so the guard fires on
+a workspace rather than on every directory.
+
+### Remaining
+
+- **3.7** — scoped-build pruning, blocked on the `code_hash` path-base question.
+- **4.6** — publish `0.6.0`. Blocked on a PyPI *pending* Trusted Publisher, which
+  is an account action rather than a code change.

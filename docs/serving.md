@@ -20,10 +20,30 @@ bk --vault ./my-vault integration down web
 ```
 
 The local URL is `http://127.0.0.1:8765`. Binding beyond loopback is rejected
-unless `--token-env` names a populated bearer-token environment variable. The
-read-only API exposes `/api/health`, `/api/status`, `/api/graph`, `/api/search`,
-`/api/proposals`, `/api/resource`, `/api/sources`, `/api/pages`, `/api/timeline`
-and `/api/integrations`.
+unless `--token-env` names a populated bearer-token environment variable.
+
+Eleven endpoints read: `/api/health`, `/api/status`, `/api/graph`,
+`/api/code-graph`, `/api/search`, `/api/proposals`, `/api/resource`,
+`/api/sources`, `/api/pages`, `/api/timeline` and `/api/integrations`.
+
+**Four endpoints write**, so the viewer is not a read-only surface:
+
+| Endpoint | What it writes |
+|---|---|
+| `POST /api/capture` | a source into `raw/`, plus the index |
+| `POST /api/ask` | an answer into `output/answers/` |
+| `POST /api/proposals/approve` | routes through the apply gate, so `wiki/` |
+| `POST /api/proposals/reject` | the proposal's state |
+
+What protects them is the consumer, not the method: every write is refused with
+`writes_refused` unless the server was started at `--consumer human`. A viewer
+run at `local` or `cloud` reads and nothing more.
+
+The bearer token is **optional**, deliberately. Without `--token-env` the server
+binds loopback only and is guarded by Host and Origin checks alone, which is the
+right trade for a single-user local viewer and the wrong one for anything else.
+Naming a token is what makes a non-loopback bind possible at all, so the two
+decisions are the same decision.
 
 ## MCP over the network
 
