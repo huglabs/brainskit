@@ -1,5 +1,7 @@
 # brainskit documentation
 
+*[Português](./pt-BR/README.md)*
+
 The [project README](../README.md) covers what brainskit is, how to install it
 and the first ten minutes. Everything below is the detail that would drown it.
 
@@ -33,3 +35,7 @@ and the first ten minutes. Everything below is the detail that would drown it.
 Engineering conventions and the defect classes this codebase has already paid
 for are recorded in [`AGENTS.md`](../AGENTS.md). Read it before changing the
 apply gate, the privacy filter or an integration lifecycle.
+
+---
+<!-- doc-tracking -->
+- Created: 2026-08-13 09:34

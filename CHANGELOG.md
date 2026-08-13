@@ -9,6 +9,64 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-08-13
+
+A four-track review of the published 0.6.0 — a fresh install from PyPI, an
+enforcement harness that broke each layer deliberately, a code and test-quality
+pass, and a wheel-against-tag supply-chain check. The wheel verified byte for
+byte; the two criticals below were introduced by the release it verified.
+
+### Changed
+
+- **Reusing a `proposal_id` with a different payload reports
+  `validation_error`, not `conflict`.** This changes an error code agents branch
+  on, deliberately. `conflict` names the remedy "re-read, rebuild, retry with the
+  same id" — which, for this refusal, never clears: measured against unmodified
+  code, all five retry cycles were refused, while a new id or no id succeeded on
+  the first. An id is not a version, so re-reading cannot make a reused one
+  valid. The refusal now says so and names the remedy, and the same message is
+  raised from both sites that can produce it. The generated CLAUDE.md block and
+  the agent skill said "retries carry a stable `proposal_id`", which is what
+  steered agents into the loop; both now say otherwise.
+
+### Fixed
+
+- **A scoped `bk code build` no longer destroys nodes it cannot account for.**
+  Pruning compared each stored node against `code_hash`, which resolves through
+  `code_root()` — re-evaluated on every call, against an artifact that recorded
+  no root to compare it with. When the two disagreed, every node read as deleted:
+  on this repository's own graph, `2364 → 1559`, **805 nodes destroyed** by a
+  build of one directory. Keeping is now the default and pruning requires
+  positive evidence, so the same build reports `2364 → 2441`. Where the base
+  cannot be established the graph is disclosed as `stale` rather than answered as
+  `fresh`. `bk code build .` also scoped to nothing, and edges carrying an empty
+  path were pruned while both of their endpoints were alive.
+- **A stored code graph with malformed edges is refused rather than traversed.**
+  Eight JSON-valid shapes reached the traversals; the fault is checked once at
+  the read boundary, so all seven of them refuse together, and `bk code build`
+  never merges, so the remedy — rebuild — is always reachable. The edges are
+  **not** repaired: an edge missing its `type` renders in `bk code affected` as
+  `via: <type>`, so normalising one would invent a relation that nothing
+  extracted.
+- **`bk code status` reports `malformed`.** It blessed a graph every other
+  command refuses. It says `malformed` exactly when a read would refuse and
+  `missing` exactly when a read would find nothing, and keeps exit 0 — like
+  `stale` and `missing` — because scripts run it to decide whether to rebuild.
+- **The wheel and the sdist carry the licence of the code they contain.** 43
+  vendored files are MIT-covered, and neither `LICENSE-MIT` nor the vendored
+  `NOTICE` was packaged; the root `NOTICE` that did ship pointed at a `src/` path
+  that exists in the repository and not in an installation. Both files ship now,
+  asserted by `verify-wheel.sh`, and `NOTICE` gives the repository and installed
+  path for every vendored file — including three.js, a second vendored third
+  party the web viewer serves and the file did not mention.
+- `verify-wheel.sh` isolates `XDG_CONFIG_HOME`, so verifying a wheel no longer
+  writes to the machine-wide vault registry. The isolation is applied after the
+  `uv` steps, because `uv` reads its own configuration from the same variable.
+  The test suite gained the same isolation, at `tests/conftest.py`.
+- The filing prompt explains what `seed` means. `taxonomy_seed` gained a reader
+  in 0.6.0 and no sentence telling the model what the flag was for, which made it
+  inert data on the wire.
+
 ## [0.6.0] — 2026-08-13
 
 Remediation of a five-agent field audit of 0.5.0. The defects clustered in one
@@ -193,6 +251,8 @@ First tagged release: the M0–M3 local walking skeleton.
 - Delivery gated on the shipped wheel — built from the sdist, installed in a
   throwaway environment and driven through the real CLI contract.
 
-[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/huglabs/brainskit/releases/tag/v0.6.1
+[0.6.0]: https://github.com/huglabs/brainskit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/huglabs/brainskit/releases/tag/v0.5.0
 [0.4.0]: https://github.com/huglabs/brainskit/releases/tag/v0.4.0

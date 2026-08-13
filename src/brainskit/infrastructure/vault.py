@@ -28,6 +28,7 @@ from brainskit.domain.model import (
     ValidationError,
     VaultConfig,
     normalize_branch,
+    proposal_id_reuse_error,
     utc_now,
 )
 from brainskit.infrastructure.converters import extract_document, guess_media_type
@@ -661,9 +662,13 @@ class FileVault:
                 prior = applied.get("proposals", {}).get(proposal_id)
                 if isinstance(prior, dict):
                     if prior.get("request_hash") != request_hash:
-                        raise ConflictError(
-                            "proposal_id was already used for a different payload",
-                            details={"proposal_id": proposal_id},
+                        # The gate checked this before taking the lock; this is
+                        # the authoritative answer, and it has to be the *same*
+                        # answer, so both raise through one constructor.
+                        raise proposal_id_reuse_error(
+                            proposal_id,
+                            applied_request_hash=prior.get("request_hash"),
+                            request_hash=request_hash,
                         )
                     return {**prior, "idempotent": True}
                 for relative, expected in expected_versions.items():

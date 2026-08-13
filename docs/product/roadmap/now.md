@@ -1,39 +1,66 @@
 # Now
 
-Everything here is Phase 1 and Phase 2 of the field-audit remediation.
-Full context: [`docs/work/main-field-audit-remediation/01-prd.md`](../../work/main-field-audit-remediation/01-prd.md)
-Evidence: [brainskit Field Audit](https://claude.ai/code/artifact/6d5de80a-c222-4c63-ac52-6244f1e56b4b) (`0.5.0` @ `8216766`)
+The field-audit remediation is **complete and closed** — see
+[`04-review.md`](../../work/main-field-audit-remediation/04-review.md) for the
+four-track review that closed it, and
+[`01-prd.md`](../../work/main-field-audit-remediation/01-prd.md) for the
+programme it reviewed.
 
-## Phase 1 — stop the leak, stop the lying
+Everything below is what that review left open, ordered by how much it costs a
+user who is running the published release today.
+
+`RV*` are findings the close-out review raised that carry no identifier from the
+original audit. Every other identifier is the one used in `04-review.md`.
+
+## Ship the fixes
+
+**`0.6.0` as published still contains every defect fixed on 13 Aug.** The two
+criticals below were introduced *by* that release. Closing the work folder
+recorded the work; a release is what reaches users.
 
 | ID | Intent | Where |
 |----|--------|-------|
-| A1 | Unresolvable provenance must resolve to `never-ingest`, not `cloud` | `application/privacy.py:94–121` |
-| A2 | Obsidian sync must filter `wiki/` and `raw/`, not only the graph object | `infrastructure/integrations.py:256–270` |
-| B1 | SessionStart hook must read `enforcement.layers[]` it already holds | `templates/agents/brainskit-status.sh:83–96` |
-| B2 | `bk gate check-write` must not answer "allowed" for a gated page | `application/gate.py:172–173` |
-| C1 | One source of version truth, asserted in CI | `__init__.py:3` · `pyproject.toml:10` · `release.yml:41` |
+| C5 | Cut **`0.6.1`**: the scoped-build prune, the `proposal_id` contract change, the licence files, the malformed-graph refusal and `verify-wheel.sh`'s isolation | `CHANGELOG.md` `[Unreleased]` · `.github/workflows/release.yml` |
 
-## Phase 2 — honest answers and the way in
+The Trusted Publisher is registered and `v0.6.0` published cleanly, so this is a
+tag push rather than a spike. Fold R4 in first if it is cheap — the visibility
+guard is what would catch a partial upload.
+
+## Surfaces that still report what they have not checked
+
+The same root cause the whole programme was about. Each of these is live in the
+published release.
 
 | ID | Intent | Where |
 |----|--------|-------|
-| A3 | `bk graph` stamps a consumer and filters, like every sibling path | `projections.py:143–161` |
-| A4 | One answer for an unknown `sourced_from` hash, not two | `graph.py:45` vs `health.py:310` |
-| A5 | Make `strictest_privacy`'s asserted invariant enforced | `application/privacy.py` |
-| B4 | Every `bk code` traversal carries a staleness signal | `application/codegraph.py:874–894` |
-| D1 | `bk init --print-config` — unblock CI, containers, agents | `interfaces/onboarding.py:464–522` |
-| D2 | Implement `taxonomy_seed` (5 write sites, 0 readers) | `domain/model.py:746–860` |
-| D3 | Delete the here-doc promise that does not exist | `docs/getting-started.md:29` |
-| E1 | `branches[branch]` → `.get()` + `PolicyError` (bare `KeyError` escapes 4 read paths) | `application/privacy.py:77` |
-| E2 | `search(limit=N)` returns N, not N+1, for N < 4 | `retrieval.py:88–90` |
-| E3 | Provider outages are `NotConfiguredError`, not `validation_error` | `llm.py:601,617` · `integrations.py` |
-| C2 | Diagnose the release workflow reporting Success while publishing nothing | `.github/workflows/release.yml` |
+| RV1 | `graph/graph.json` freshness must read the file, not stat it — it reports `fresh` for a file that is not JSON at all, verified by overwriting one with `{{{ not json at all`. Direct twin of the `code.json` state just fixed | `application/health.py:563-587` |
+| D1 | The `bk status` headline must mean what `healthy` means — a fresh vault created by the documented quickstart prints `✗ 0 lint error(s)`, permanently, because `bk init` outside a git repo can never make `commit_lint` active | `health.py:185` · `cli.py:2785` |
+| P2 | `bk lint` must cover `wiki/index.md` and `wiki/log.md`. They have no `freshness.json` entries (7 entries, 9 pages), so `wiki.outside_apply` cannot fire for them — and the gate hook's header comment cites lint as the backstop *justifying* failing open | `application/health.py` · `templates/agents/brainskit-gate.sh` |
+| D3 | `bk watch` must resolve its source folder against the vault, not the current directory. A relative path captures nothing, exits 0 and reports `created 0`; neither `status` nor `lint` mentions it, and `bk schedule` emits cron lines that run from `$HOME` | `application/services.py:155` |
 
-**Gate before Phase 3:** suite green · `ruff` clean · `bk lint` clean · every
-negative control demonstrated failing-then-passing.
+## The upgrade path
+
+| ID | Intent | Where |
+|----|--------|-------|
+| P1 | `bk hooks install --force` must migrate the pre-rename `brainkit-*` hooks. `_prune_stale_hook_entries` keys on the current template name, so the old entries are invisible to it: the old gate stays registered beside the new one and the project ends with **two** managed CLAUDE.md blocks. Every user upgrading from a pre-rename install lands here | `interfaces/cli.py` `_prune_stale_hook_entries` |
+
+## The error taxonomy, finished
+
+0.5.0's additive-subclass strategy was correct and is not in question. These are
+the two places it was not carried through.
+
+| ID | Intent | Where |
+|----|--------|-------|
+| S2-5 | Stop re-raising `ValidationError` plain — it downgrades the `NotConfiguredError` that `_docker` raises, so the same Docker outage is `not_configured` directly and `validation_error` through `bk integration up postgres`, which is the path a user takes. **A regression the subclass strategy introduced** | `infrastructure/integrations.py:648` · `:1305` |
+| S2-4 | Code `HTTPError` by status — 401, 404, 429 and 5xx are all `validation_error` today, twenty lines above a comment making exactly the opposing argument for `URLError`. `tests/test_provider_outage_codes.py` contains no HTTP-status case at all | `infrastructure/llm.py` · `tests/test_provider_outage_codes.py` |
+
+**Gate before moving on:** suite green · `ruff check` clean · `mypy --strict`
+clean · `bk lint` clean on `docs/brain` · every negative control demonstrated
+failing-then-passing, with `brainskit.__file__` asserted before the result is
+trusted.
 
 ---
 <!-- doc-tracking -->
 - Created: 2026-08-12
 - Updated: 2026-08-12 10:07
+- Updated: 2026-08-13 13:15

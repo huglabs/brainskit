@@ -51,6 +51,42 @@ bk code cycles                    # import cycles among files
 bk code diff                      # what changed structurally since the stored graph
 ```
 
+## What `bk code status` reports
+
+Five states, and only three of them are about freshness:
+
+| state | meaning | remedy |
+|---|---|---|
+| `fresh` | the recorded file digests all still match | — |
+| `stale` | a file the graph indexed changed or was removed | `bk code import <graph.json>` |
+| `missing` | there is no graph on disk, or what is there is not a JSON object | `bk code import <graph.json>` |
+| `partial` | fresh, but a grammar was absent so a whole language went unindexed | install the named grammar, then rebuild |
+| `malformed` | the graph parses but cannot be traversed | `bk code build` |
+
+`partial` and `malformed` are the two that are not freshness verdicts at all.
+Both exist for the same reason: a graph can match every file it recorded and
+still answer nothing useful — `partial` because it never recorded the files it
+could not parse, `malformed` because it cannot be traversed whatever it
+recorded.
+
+`status` answers freshness from the `files` fingerprint alone and never indexes
+a node or an edge — which is why it cannot traceback, and equally why it used to
+report `fresh` on a graph an edge missing `type` made unreadable,
+while every other `bk code` command refused that same graph. The states are now
+tied to the readers by construction: `status` says `malformed` exactly when a
+reader would refuse it, and `missing` exactly when a reader would say there is
+no graph, from the same two functions.
+
+It is a report, not a failure. `bk code status` exits 0 and its `--json`
+envelope is `{"ok": true, ...}` in every state, the same as `stale` and
+`missing` — `ok` says the command answered, and the answer is in `state`. Only
+`bk lint` and `bk vaults sync` turn a finding into a non-zero exit.
+
+The remedy for `malformed` is a **full** `bk code build`, never a scoped one: a
+scoped build merges into the stored graph and would carry the fault forward,
+which is why it refuses a malformed graph rather than laundering it back out. A
+full build never merges, so it recovers from any stored state.
+
 ## Where it scans
 
 `code_root` is read from `.brain/config.json`, is relative to the vault, and is
@@ -63,7 +99,37 @@ they arrive as the most connected nodes in it.
 
 Given explicit `PATH`s, `build` merges that subset into the stored graph
 instead of replacing it, so a scoped re-extraction does not shrink the graph to
-the paths it was given.
+the paths it was given. Scoping to the code root itself — `bk code build .`, or
+the root's absolute path — is the whole repository, and behaves exactly like a
+bare `bk code build`.
+
+## What a scoped build prunes
+
+A scoped build replaces its own scope and keeps the rest. "The rest" would
+otherwise accumulate phantoms — symbols at line numbers in files deleted months
+ago — so a stored node whose file is gone is dropped even though it lies outside
+the scope.
+
+Deleting a node is not recoverable, so pruning takes evidence rather than
+inference, and keeping is the default. Every graph records the `code_root` its
+node paths are relative to, beside them in `graph/code.json`, and a stored node
+is pruned only when **both** of these hold:
+
+- the graph was written under the same root that is resolving paths now, and
+- the graph's own `files` map holds a real digest for that path — the artefact
+  saying that path once resolved to a readable file under that root.
+
+What is left after both is a path that provably resolved and provably does not
+now, which is a deletion. Anything else is kept and reported as stale.
+
+That matters because `code_root` is re-resolved on every command, from a config
+key you may edit and an upward walk for `.git`. Change it, or import a graph an
+external extractor emitted relative to its own working directory, and the stored
+paths stop resolving — through no fault of the files they name. Pruning then
+stands down, `bk code build` says so in `prune_skipped`, and `bk code status`
+reports every unresolvable path as `removed` until a whole-root rebuild restates
+the graph. A graph written before this field existed records no root at all, and
+is treated the same way: nothing is pruned until some build restates it.
 
 ## One importer, two sources
 
@@ -77,3 +143,9 @@ brainskit's own traversal, which needs no dependency and already answers under a
 The vendored analysis subset, its upstream revision and the changes made to it
 are recorded in [`NOTICE`](../NOTICE) and in that directory's own `NOTICE`.
 Coverage numbers are in [Benchmarks](./benchmarks.md).
+
+---
+<!-- doc-tracking -->
+- Created: 2026-08-13 11:32
+- Updated: 2026-08-13 13:04
+- Updated: 2026-08-13 13:05

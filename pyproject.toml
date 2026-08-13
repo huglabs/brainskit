@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brainskit"
-version = "0.6.0"
+version = "0.6.1"
 description = "Local-first, LLM-agnostic second-brain engine: the compilation gate between raw evidence and knowledge an agent may act on"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -138,6 +138,19 @@ brainskit = [
   "templates/agents/*.sh",
   "templates/web/*.js",
 ]
+# The vendored tree's attribution files are payload, not repository furniture.
+# 43 source files ship inside every wheel and sdist; MIT requires its permission
+# notice to accompany all copies of them, and Apache-2.0 §4(c)/(d) requires the
+# NOTICE content to be conveyed with any derivative distribution. Through 0.6.0
+# neither file was globbed here and there is no `MANIFEST.in`, so the shipped
+# artifact carried the code without its licence.
+#
+# `NOTICE` is also read at runtime: `infrastructure/extractor.py` hashes it into
+# the AST cache namespace, and without it in the wheel that namespace collapsed
+# to the constant "unversioned" in every installed copy.
+#
+# `scripts/verify-wheel.sh` asserts both arrive, so this cannot regress silently.
+"brainskit.infrastructure.codeanalysis" = ["LICENSE-MIT", "NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

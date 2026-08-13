@@ -33,6 +33,7 @@ from brainskit.domain.model import (
     ConflictError,
     PageOperation,
     ValidationError,
+    proposal_id_reuse_error,
     utc_now,
 )
 
@@ -60,9 +61,13 @@ class ApplyGate:
         prior = self.vault.read_state("applied").get("proposals", {}).get(proposal_id)
         if isinstance(prior, dict):
             if prior.get("request_hash") != request_hash:
-                raise ConflictError(
-                    "proposal_id was already used for a different payload",
-                    details={"proposal_id": proposal_id},
+                # Not a conflict: the binding below is durable, so re-reading
+                # the vault returns this same refusal forever. See
+                # `proposal_id_reuse_error`.
+                raise proposal_id_reuse_error(
+                    proposal_id,
+                    applied_request_hash=prior.get("request_hash"),
+                    request_hash=request_hash,
                 )
             return {
                 "applied": len(prior.get("paths", [])),

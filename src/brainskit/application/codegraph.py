@@ -36,6 +36,7 @@ import hashlib
 import importlib.util
 import json
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -80,6 +81,74 @@ CODE_NODE_KINDS = frozenset({"code"})
 CODE_PRIVACY = PrivacyMode.LOCAL_ONLY
 
 SCHEMA_VERSION = 1
+
+CODE_REBUILD_COMMAND = "bk code build"
+
+#: What a reader says when it refuses a malformed artefact, and what `status`
+#: says when it reports one. Shared rather than written twice because the two
+#: are answers to the same question asked from opposite directions -- "why did
+#: this command refuse" and "what is wrong with the graph" -- and a diagnostic
+#: that names a different remedy than the refusal it explains is worse than no
+#: diagnostic at all. `bk code build` and not `bk code import`: a full build
+#: never merges, so it recovers from any stored state, whereas a scoped build
+#: would inherit the very fault being reported.
+CODE_MALFORMED_HINT = (
+    "The code graph is a disposable projection; "
+    f"rebuild it with {CODE_REBUILD_COMMAND}"
+)
+
+#: The fields every reader indexes with `[...]` rather than `.get(...)`, and so
+#: the ones a stored graph has to carry for traversal to be possible at all.
+#: Deliberately not the whole schema: `label`, `path` and `line` are read
+#: defensively everywhere, and refusing a graph for missing a `line` would turn
+#: a cosmetic gap into an outage.
+CODE_GRAPH_SHAPE: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("nodes", ("id",)),
+    ("edges", ("source", "target", "type")),
+)
+
+
+def _malformation(graph: dict[str, Any]) -> dict[str, Any] | None:
+    """The first structural fault in a stored code graph, or None if it is sound.
+
+    `graph/code.json` is a disposable projection, so anything on disk may have
+    been truncated, merged by hand, or written by an external extractor that
+    disagreed about the schema. Parsing as JSON says nothing about whether it
+    can be traversed: an edge missing `type`, a node missing `id`, an `edges`
+    value that is an object rather than a list all parse perfectly and then
+    fail at the first subscript, several frames deep inside a traversal.
+
+    Checked once at the boundary rather than per reader, because the fault is
+    not one field. Stripping `type` breaks `affected` and `path`; stripping
+    `source` breaks `hubs`; replacing `nodes` with a string breaks both. Those
+    are five ways to express the same missing precondition, and patching them
+    one subscript at a time leaves the next reader to rediscover it.
+    """
+
+    for collection, required in CODE_GRAPH_SHAPE:
+        entries = graph.get(collection)
+        if not isinstance(entries, list):
+            return {
+                "collection": collection,
+                "problem": (
+                    "absent" if collection not in graph else "not a list of objects"
+                ),
+            }
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                return {
+                    "collection": collection,
+                    "index": index,
+                    "problem": f"not an object, but {type(entry).__name__}",
+                }
+            missing = [field for field in required if field not in entry]
+            if missing:
+                return {
+                    "collection": collection,
+                    "index": index,
+                    "missing": missing,
+                }
+    return None
 
 
 class CodeGraph:
@@ -127,8 +196,9 @@ class CodeGraph:
         )
         nodes, dropped = self._nodes(payload)
         edges = self._edges(payload, known=set(nodes))
+        notes: dict[str, Any] = {}
         if paths is not None:
-            nodes, edges = self._merge_scoped(nodes, edges, paths)
+            nodes, edges, notes = self._merge_scoped(nodes, edges, paths)
         if not nodes:
             raise ValidationError(
                 "No code nodes in the imported graph",
@@ -137,9 +207,10 @@ class CodeGraph:
                     "hint": "Extract with --code-only; prose belongs in the wiki",
                 },
             )
-        return self._write(
+        result = self._write(
             nodes, edges, dropped, survey=survey, scoped=paths is not None
         )
+        return {**result, **notes}
 
     def survey(self, paths: list[Path] | None = None) -> ScanSurvey | None:
         """What a build would cover, or None when the extractor cannot say.
@@ -258,7 +329,7 @@ class CodeGraph:
         nodes: dict[str, dict[str, Any]],
         edges: list[dict[str, Any]],
         paths: list[Path],
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         """Fold a scoped extraction into the stored graph, not over it.
 
         Everything the stored graph knows about files outside `paths` is kept
@@ -268,44 +339,45 @@ class CodeGraph:
         unmentioned). Nothing to merge into (no stored graph, or `paths`
         resolved to nothing recognisable) is not an error — it is the first
         build, scoped or not, and the fresh result stands on its own.
+
+        The third return value is what the caller should disclose about the
+        merge — presently, whether pruning was possible at all.
         """
 
         stored = self._maybe_read()
         if stored is None:
-            return nodes, edges
+            return nodes, edges, {}
+        self._refuse_malformed(
+            stored,
+            hint=(
+                "A scoped build merges into the stored graph and would carry the "
+                f"fault forward; rebuild the whole graph with {CODE_REBUILD_COMMAND}"
+            ),
+        )
         scope_roots = self._scope_roots(paths)
         if not scope_roots:
-            return nodes, edges
+            return nodes, edges, {}
 
         def in_scope(path: str) -> bool:
+            # A scope root of `""` is the code root itself (`bk code build .`),
+            # which contains every path there is. Spelling it as the empty
+            # string rather than `"."` is what makes that true: `.` is not a
+            # prefix of `src/a.py`, so the root scope used to match nothing and
+            # a whole-root rebuild spelled with a path kept every stale node a
+            # bare `bk code build` would have replaced.
             return any(
-                path == root or path.startswith(f"{root}/") for root in scope_roots
+                root == "" or path == root or path.startswith(f"{root}/")
+                for root in scope_roots
             )
 
-        def still_on_disk(path: str) -> bool:
-            """A deleted file keeps no nodes, in scope or out.
-
-            `_merge_scoped` kept every stored node whose path fell outside the
-            current scope, so a deleted file's nodes survived indefinitely
-            unless someone ran a whole-root build. The failure read: rebuild one
-            file, `status` truthfully says stale, and every query answers with
-            phantoms -- symbols at line numbers in files that are gone.
-
-            "Gone" is decided exactly as `staleness()` decides it: `code_hash`
-            returning `None`. That is not a second opinion -- `_write` builds
-            the recorded `files` map with the same call over these same node
-            paths, so the path base is shared by construction rather than by
-            two places agreeing.
-            """
-
-            return bool(path) and self.vault.code_hash(path) is not None
+        confirmed_deleted = self._deletion_test(stored)
 
         merged_nodes = {
             str(node["id"]): node
             for node in stored.get("nodes", [])
             if isinstance(node, dict)
             and not in_scope(str(node.get("path", "")))
-            and still_on_disk(str(node.get("path", "")))
+            and not confirmed_deleted(str(node.get("path", "")))
         }
         merged_nodes.update(nodes)
 
@@ -316,7 +388,7 @@ class CodeGraph:
                 for edge in stored.get("edges", [])
                 if isinstance(edge, dict)
                 and not in_scope(str(edge.get("path", "")))
-                and still_on_disk(str(edge.get("path", "")))
+                and not confirmed_deleted(str(edge.get("path", "")))
             ),
         ]
         seen: set[tuple[str, str, str]] = set()
@@ -330,20 +402,130 @@ class CodeGraph:
                 continue
             seen.add(key)
             merged_edges.append(edge)
-        merged_edges.sort(key=lambda item: (item["source"], item["target"], item["type"]))
-        return merged_nodes, merged_edges
+        # `.get` rather than `[...]` even though `_refuse_malformed` above has
+        # already guaranteed all three fields on every stored edge: this list
+        # also holds *this run's* freshly extracted edges, and a defensive sort
+        # key costs nothing while keeping the guarantee in one place instead of
+        # implied by two.
+        merged_edges.sort(
+            key=lambda item: (
+                str(item.get("source", "")),
+                str(item.get("target", "")),
+                str(item.get("type", "")),
+            )
+        )
+        return merged_nodes, merged_edges, self._prune_notes(stored)
+
+    def _deletion_test(self, stored: dict[str, Any]) -> Callable[[str], bool]:
+        """Whether a stored path may be pruned as deleted — evidence first.
+
+        A scoped build replaces its own scope and keeps the rest, and pruning
+        exists so that "the rest" does not accumulate phantoms: rebuild one
+        file, and symbols at line numbers in files that were deleted months ago
+        still answer every query.
+
+        The first implementation asked `vault.code_hash(path) is not None` and
+        pruned whatever came back `None`, on the reasoning that `_write` builds
+        the recorded `files` map with that same call, so the path base is shared
+        by construction. **That holds within one build and fails across
+        builds.** `code_root()` re-resolves every time it is called — the
+        configured value if `.brain/config.json` names one, otherwise an upward
+        walk for `.git` — so the base a graph's node paths were recorded against
+        and the base that resolves them now are two different questions. Change
+        `code_root`, or import a graph an external extractor emitted relative to
+        its own working directory, and every stored path resolves to a missing
+        file. The merge then read a whole out-of-scope graph as deleted and
+        destroyed it, and because `_write` recomputes `files` from the surviving
+        nodes the truncated graph fingerprinted as consistent and reported
+        `fresh`. A stale answer is recoverable; a deleted node is not.
+
+        So the polarity is inverted: **keeping is the default and pruning needs
+        positive evidence**, of two kinds, both read out of the artefact rather
+        than assumed about it.
+
+        1. The graph records the code root it was written under, and that root
+           is the one resolving paths now. A graph that names no root at all —
+           every artefact written before this field existed — is a base nobody
+           can confirm, so nothing is pruned until some build restates it.
+        2. The graph's own `files` map holds a real digest for the path. That
+           digest is the artefact saying "this path resolved to a readable file
+           under that root", which is the only thing that makes its absence now
+           mean *deleted* rather than *never resolvable here*. It is what
+           protects a graph imported from a foreign base, whose paths `_write`
+           recorded as `""` precisely because they did not resolve.
+
+        What is left after both is a path that provably resolved under this same
+        root and provably does not now. That is a deletion, and nothing else
+        reaches this far.
+        """
+
+        if str(stored.get("code_root", "")) != self._code_root_key():
+            return lambda _path: False
+        recorded = stored.get("files")
+        files = recorded if isinstance(recorded, dict) else {}
+
+        def confirmed_deleted(path: str) -> bool:
+            if not path or not files.get(path):
+                return False
+            return self.vault.code_hash(path) is None
+
+        return confirmed_deleted
+
+    def _prune_notes(self, stored: dict[str, Any]) -> dict[str, Any]:
+        """Say, in the build's result, when pruning could not be attempted.
+
+        Silence would leave the operator with a graph that keeps nodes for files
+        they deleted and no way to tell that from a graph with nothing to prune.
+        `bk code status` still reports every unresolvable path as `removed`, so
+        the stale-but-intact state stays visible either way; this names the
+        reason rather than leaving it to be inferred.
+        """
+
+        stored_root = stored.get("code_root")
+        current = self._code_root_key()
+        if str(stored_root or "") == current or not stored.get("nodes"):
+            return {}
+        return {
+            "prune_skipped": (
+                "the stored graph was written under a different code root, so a "
+                "missing file cannot be told apart from a path this root never "
+                "resolved; nothing was pruned"
+                if stored_root
+                else "the stored graph records no code root, so its paths cannot "
+                "be confirmed against this one; nothing was pruned"
+            ),
+            "stored_code_root": str(stored_root) if stored_root else None,
+            "code_root": current,
+        }
+
+    def _code_root_key(self) -> str:
+        """The code root as the artefact records it, for comparing two builds.
+
+        Absolute, because the artefact is machine-local and gitignored, so a
+        literal directory identity costs nothing in portability and cannot
+        collide with a different tree that happens to sit at the same offset
+        from its vault. `coverage.root` already records the root this way.
+        """
+
+        return self.vault.code_root().resolve().as_posix()
 
     def _scope_roots(self, paths: list[Path]) -> list[str]:
-        """`paths`, as code-root-relative posix strings a node path can match."""
+        """`paths`, as code-root-relative posix strings a node path can match.
+
+        The code root itself is `""`, not `"."`: node paths are relative to the
+        root and none of them begins `./`, so `"."` matched nothing and made
+        `bk code build .` a build that merged into itself instead of replacing.
+        """
 
         root = self.vault.code_root().resolve()
         roots = []
         for target in paths:
             candidate = (target if target.is_absolute() else root / target).resolve()
             try:
-                roots.append(candidate.relative_to(root).as_posix())
+                relative = candidate.relative_to(root).as_posix()
             except ValueError:
                 continue  # Outside code_root; the extractor already ignored it.
+            roots.append("" if relative == "." else relative)
         return roots
 
     def import_graph(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -382,6 +564,12 @@ class CodeGraph:
             "version": SCHEMA_VERSION,
             "built_at": utc_now(),
             "privacy": CODE_PRIVACY.value,
+            # The base these paths are relative to, recorded beside them. Without
+            # it a later build has no way to know whether the root resolving
+            # them is the root they were written under -- and `code_root()`
+            # re-resolves on every call, from a config key an operator may edit
+            # and an upward walk for `.git`. `_deletion_test` is what reads it.
+            "code_root": self._code_root_key(),
             "nodes": sorted(nodes.values(), key=lambda item: str(item["id"])),
             "edges": edges,
             "files": files,
@@ -574,15 +762,34 @@ class CodeGraph:
     def staleness(self) -> dict[str, Any]:
         """Whether the graph still describes the repository it was built from.
 
-        Reported in the same three states and the same fields as every other
-        projection — `state`, `stale`, `generated_at` — because a caller walking
-        the block should not have to know which artefact it is looking at. What
-        differs is only the input set: the vault's own projections fingerprint
-        pages and the registry, this one fingerprints the files it indexed.
+        Reported in the same fields as every other projection — `state`,
+        `stale`, `generated_at` — because a caller walking the block should not
+        have to know which artefact it is looking at, and it answers the same
+        three freshness states they do. What differs is the input set (the
+        vault's own projections fingerprint pages and the registry, this one
+        fingerprints the files it indexed) and one extra state, below.
 
         Every one of those files is re-read. That is the cost of an honest
         answer: an mtime rule would call a graph stale after any `git checkout`,
         and a stored git revision would miss uncommitted edits entirely.
+
+        Freshness is only one of the two ways this artefact can be worthless,
+        which is why `malformed` sits alongside the three freshness states. The
+        `files` fingerprint is answerable on a graph whose `edges` cannot be
+        traversed at all -- so this command reported `fresh` on precisely the
+        artefact every other `bk code` command refuses, which is the same shape
+        as a hook reported active from the existence of its file. The rule that
+        keeps the two honest is stated rather than coincidental: `status` says
+        `malformed` exactly when `_read` would refuse as malformed, and
+        `missing` exactly when `_read` would raise not-found. Both answers come
+        from the same `_malformation` and the same `_maybe_read`, so neither
+        can drift from what a reader will actually do.
+
+        Reported, never raised. `status` is the command you reach for when
+        things are already broken, so every fault it can find has to arrive as
+        a state -- including a file that is not a dict and a file that is not
+        JSON, which `_maybe_read` folds into `missing` for the same reason
+        `_read` raises not-found on them.
         """
 
         graph = self._maybe_read()
@@ -595,6 +802,27 @@ class CodeGraph:
             }
 
         generated_at = graph.get("built_at")
+        fault = _malformation(graph)
+        if fault is not None:
+            # `stale: True` rather than an honest "unknown", and deliberately:
+            # the boolean is what `_answer` attaches to every traversal and what
+            # a caller too terse to read `state` will branch on, so the one
+            # answer it must never give here is the reassuring one. Same choice
+            # the unverifiable-`files` branch below already makes.
+            #
+            # The freshness comparison is skipped rather than reported: it would
+            # re-hash every recorded file to answer a question about a graph
+            # that cannot be traversed whatever the answer is.
+            return {
+                "state": "malformed",
+                "stale": True,
+                "generated_at": generated_at if isinstance(generated_at, str) else None,
+                **fault,
+                "reason": "the graph cannot be traversed, so it answers nothing",
+                "hint": CODE_MALFORMED_HINT,
+                "command": CODE_REBUILD_COMMAND,
+            }
+
         files = graph.get("files", {})
         if not isinstance(files, dict):
             return {
@@ -928,6 +1156,42 @@ class CodeGraph:
             return None
         return graph if isinstance(graph, dict) else None
 
+    @staticmethod
+    def _refuse_malformed(graph: dict[str, Any], *, hint: str) -> None:
+        """Stop at the boundary rather than fail partway through a traversal.
+
+        Refusing, not repairing, and the two reasons are different. The first
+        is that only `type` is even conceptually repairable, and repairing it
+        means inventing a relation: `affected` renders it as `via: <type>` and
+        `path` as the label on a hop, so a substituted value would have the
+        tool state a relationship the artefact does not contain. A missing
+        `source`, `id` or `nodes` offers nothing to invent at all, so a
+        `type`-only repair would close one of five holes while looking like it
+        closed the class.
+
+        The second is that refusal is cheap *because* the graph is disposable.
+        The remedy is one `bk code build`, which recomputes the artefact from
+        the tree it describes and destroys nothing. Refusing a raw source or a
+        wiki page would strand content that exists nowhere else; refusing this
+        costs a command.
+
+        Which is also why the merge refuses. `build` used to tolerate a
+        malformed stored edge and write it straight back out, so the fault
+        survived every rebuild and kept `affected` and `path` broken while
+        `build` itself reported success. A scoped build merges into the stored
+        graph and so inherits the fault; a full `bk code build` never merges,
+        which is what keeps the remedy reachable no matter how corrupt the
+        artefact is.
+        """
+
+        fault = _malformation(graph)
+        if fault is None:
+            return
+        raise RefusalError(
+            "The stored code graph is malformed",
+            details={**fault, "hint": hint},
+        )
+
     def _read(self, consumer: str) -> dict[str, Any]:
         _validate_consumer(consumer)
         # The boundary is checked before the graph is opened, not after it is
@@ -948,6 +1212,7 @@ class CodeGraph:
                 "No code graph in this vault",
                 details={"hint": f"Build one with {CODE_PROJECTION_COMMAND}"},
             )
+        self._refuse_malformed(graph, hint=CODE_MALFORMED_HINT)
         return graph
 
     def data(

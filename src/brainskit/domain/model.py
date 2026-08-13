@@ -46,6 +46,10 @@ class BrainskitError(Exception):
 class ValidationError(BrainskitError):
     """The request itself is wrong. Fix it and send it again.
 
+    A malformed payload, an uncited claim, a `proposal_id` already bound to a
+    different payload -- anything the caller clears by sending something
+    different, rather than by sending the same thing again.
+
     The four below narrow that answer without changing it. Each is a
     `ValidationError`, so every `except ValidationError` still catches it and
     every exit code stays what it was; only `code` sharpens. That matters
@@ -60,11 +64,17 @@ class ValidationError(BrainskitError):
 class ConflictError(ValidationError):
     """The request was well-formed, and the vault has moved since it was built.
 
-    A stale `base_hash`, a `proposal_id` reused for a different payload, a
-    proposal already decided. The distinguishing property is that the *same*
-    intent can still succeed: re-read the current state, rebuild the request
-    against it, send it again. This is the one an agent hits most, and the one
-    it most needs to tell apart from "your input was malformed".
+    A stale `base_hash`; an apply rejected only because the pages it targets
+    have newer versions. The distinguishing property is that the *same* intent
+    can still succeed: re-read the current state, rebuild the request against
+    it, send it again. This is the one an agent hits most, and the one it most
+    needs to tell apart from "your input was malformed".
+
+    That property is the whole test, and it excludes anything durable. A record
+    the vault will keep returning -- an id already bound to a payload, a
+    proposal already decided -- fails it: re-reading returns the same answer
+    forever, so calling it a conflict hands the caller a retry that cannot
+    terminate. `proposal_id_reuse_error` below is the case that taught this.
     """
 
     code = "conflict"
@@ -113,6 +123,43 @@ class NotFoundError(BrainskitError):
 
 class PolicyError(BrainskitError):
     code = "policy_denied"
+
+
+def proposal_id_reuse_error(
+    proposal_id: str,
+    *,
+    applied_request_hash: str | None,
+    request_hash: str,
+) -> ValidationError:
+    """The refusal both apply checks raise when an id is reused for new bytes.
+
+    Deliberately not a `ConflictError`, though it reads like one. `applied.json`
+    binds an id to the payload it applied, and nothing releases that binding --
+    so the single remedy `conflict` names, re-read the vault and send the same
+    intent again, is the one remedy that cannot work here. Rebuilding is exactly
+    what changed the payload, and the retry contract holds the id stable, so an
+    agent obeying `conflict` arrives back here on every attempt, forever. The
+    remedy that terminates is the plain `validation_error` one: change the
+    request, by giving this payload an id of its own.
+
+    Shared because two places decide this -- the gate's fast path and the
+    authoritative check under the write lock -- and a caller must not receive a
+    different code depending on which of them answered first.
+    """
+
+    return ValidationError(
+        "proposal_id was already used for a different payload",
+        details={
+            "proposal_id": proposal_id,
+            "applied_request_hash": applied_request_hash,
+            "request_hash": request_hash,
+            "hint": (
+                "Send this payload under a new proposal_id, or omit it and one "
+                "is derived from the payload. That id stays bound to what it "
+                "already applied, so re-reading the vault will not clear this"
+            ),
+        },
+    )
 
 
 class PrivacyMode(StrEnum):

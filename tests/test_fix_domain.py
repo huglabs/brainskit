@@ -1134,7 +1134,15 @@ class ErrorClassificationTest(unittest.TestCase):
         self.assertIn("stale_page", codes)
         self.assertGreater(len(codes), 1)
 
-    def test_reusing_a_proposal_id_for_a_new_payload_is_a_conflict(self) -> None:
+    def test_reusing_a_proposal_id_for_a_new_payload_is_change_the_request(
+        self,
+    ) -> None:
+        """Not a conflict: `applied.json` keeps the binding, so re-reading the
+        vault returns this same refusal forever. The remedy that terminates is
+        a different id, which is the plain `validation_error` one. Driven end
+        to end in `ProposalIdReuseNamesATerminatingRemedyTest`.
+        """
+
         captured = self.service.capture(None, text="Evidence", title="Evidence")
         content_hash = captured["source"]["content_hash"]
         operation = {
@@ -1148,8 +1156,8 @@ class ErrorClassificationTest(unittest.TestCase):
             "links": [],
         }
         self.service.apply({"proposal_id": "same-id", "operations": [operation]})
-        self.assert_code(
-            "conflict",
+        error = self.assert_code(
+            "validation_error",
             lambda: self.service.apply(
                 {
                     "proposal_id": "same-id",
@@ -1159,6 +1167,7 @@ class ErrorClassificationTest(unittest.TestCase):
                 }
             ),
         )
+        self.assertIn("new proposal_id", error.details["hint"])
 
     def test_a_missing_extractor_is_not_configured(self) -> None:
         self.assert_code("not_configured", self.service.code_build)

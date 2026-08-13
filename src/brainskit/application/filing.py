@@ -294,6 +294,16 @@ class Filing:
                 # proposal can prefer the declared taxonomy when the evidence
                 # fits two branches equally well, rather than treating a branch
                 # someone added for one stray document as an equal candidate.
+                # `jobs/file-proposal.md` documents the flag as exactly that --
+                # a tie-breaker -- because a boolean the prompt never mentions
+                # is inert data the model has no instruction for.
+                #
+                # The flag is the whole reader. A separate sorted list was also
+                # passed here and referenced by nothing, which is the same dead
+                # wiring one layer down; it is derivable from these flags, and
+                # `taxonomy_seed` is not constrained to be a subset of
+                # `branches`, so a seed naming an unconfigured branch would only
+                # invite a destination the check below then rejects.
                 "branches": json.dumps(
                     {
                         branch: {
@@ -304,9 +314,6 @@ class Filing:
                         for branch, policy in config.branches.items()
                     },
                     ensure_ascii=False,
-                ),
-                "taxonomy_seed": json.dumps(
-                    sorted(config.taxonomy_seed), ensure_ascii=False
                 ),
             },
         )

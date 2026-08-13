@@ -26,18 +26,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from test_projections import policy
 
 from brainskit.application.codegraph import CODE_PROJECTION
 from brainskit.application.services import BrainskitService
-from brainskit.domain.model import NotFoundError, ValidationError
+from brainskit.domain.model import NotFoundError, RefusalError, ValidationError
 from brainskit.infrastructure.extractor import GraphifyExtractor
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.vault import FileVault
+from brainskit.interfaces.cli import _render, _render_auto
 
 
 def _code_extra_installed() -> bool:
@@ -367,6 +369,262 @@ class BoundaryTest(CodeGraphFixture):
         with self.assertRaises(NotFoundError) as caught:
             self.service.code_hubs()
         self.assertIn("bk code import", caught.exception.details["hint"])
+
+
+class MalformedFixture(CodeGraphFixture):
+    """The eight JSON-valid shapes a stored graph can take and still be useless.
+
+    One table, because the refusal and the diagnostic have to agree about what
+    "malformed" means. A shape added here is automatically a shape every reader
+    must refuse *and* a shape `bk code status` must disclose; keeping two lists
+    would let them drift apart, which is the failure this whole area is about.
+    """
+
+    CORRUPTIONS: ClassVar[dict[str, Callable[[dict[str, Any]], object]]] = {
+        "an edge with no type": lambda g: g["edges"][0].pop("type"),
+        "an edge with no source": lambda g: g["edges"][0].pop("source"),
+        "an edge with no target": lambda g: g["edges"][0].pop("target"),
+        "a node with no id": lambda g: g["nodes"][0].pop("id"),
+        "no edges at all": lambda g: g.pop("edges"),
+        "no nodes at all": lambda g: g.pop("nodes"),
+        "edges that are not a list": lambda g: g.update(edges={"oops": True}),
+        "a node that is not an object": lambda g: g["nodes"].__setitem__(0, "text"),
+    }
+
+    def corrupt(self, how: str) -> None:
+        stored = self.graph_file()
+        self.CORRUPTIONS[how](stored)
+        (self.vault.root / CODE_PROJECTION).write_text(
+            json.dumps(stored), encoding="utf-8"
+        )
+
+
+class MalformedArtefactTest(MalformedFixture):
+    """A stored graph that parses as JSON but cannot be traversed.
+
+    `graph/code.json` is a disposable projection on disk, so it can be
+    truncated, merged by hand, or written by an external extractor that
+    disagreed about the schema. Parsing is not the same question as being
+    traversable, and the gap between the two used to surface as
+    `bk: unhandled internal error` plus a `KeyError` traceback -- the one
+    output shape the CLI otherwise never produces.
+
+    The fault is not one field, which is why it is checked once at the read
+    boundary instead of at each subscript. Each corruption in `MalformedFixture`
+    broke a different command before the check existed: stripping `type` broke
+    `affected` and `path`, stripping `source` broke `hubs`, and a `nodes`
+    value that is not a list of objects broke all three.
+    """
+
+    def test_no_reader_tracebacks_on_a_graph_that_merely_parses(self) -> None:
+        # The invariant, stated over every reader rather than the one that was
+        # reported: a modelled refusal for each, never an exception the CLI has
+        # no envelope for.
+        for how in self.CORRUPTIONS:
+            for name, call in (
+                ("affected", lambda: self.service.code_affected("Db", depth=2)),
+                ("path", lambda: self.service.code_path("app.ts", "Db")),
+                ("hubs", lambda: self.service.code_hubs()),
+            ):
+                with self.subTest(corruption=how, reader=name):
+                    self.service.code_import(self.payload())
+                    self.corrupt(how)
+                    with self.assertRaises(RefusalError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.code, "refused")
+
+    def test_the_refusal_names_the_field_and_the_remedy(self) -> None:
+        # A refusal that does not say which edge, or what to run, sends the
+        # operator back to reading the artefact by hand.
+        self.service.code_import(self.payload())
+        self.corrupt("an edge with no type")
+        with self.assertRaises(RefusalError) as caught:
+            self.service.code_hubs()
+        details = caught.exception.details
+        self.assertEqual(details["collection"], "edges")
+        self.assertEqual(details["missing"], ["type"])
+        self.assertIn("bk code build", details["hint"])
+
+    def test_a_sound_graph_is_not_refused(self) -> None:
+        # The control. Without it, a check that refused everything would pass
+        # every assertion above.
+        self.service.code_import(self.payload())
+        self.assertTrue(self.service.code_hubs()["hubs"])
+        self.assertTrue(self.service.code_affected("Db", depth=2)["affected"])
+        self.assertTrue(self.service.code_path("app.ts", "Db")["found"])
+
+    def test_fields_read_defensively_are_not_grounds_for_refusal(self) -> None:
+        # The shape check covers what readers subscript, not the whole schema.
+        # Refusing a graph for a missing `line` would turn a cosmetic gap into
+        # an outage on an artefact that traverses perfectly well.
+        self.service.code_import(self.payload())
+        stored = self.graph_file()
+        for entry in (*stored["nodes"], *stored["edges"]):
+            entry.pop("line", None)
+            entry.pop("path", None)
+        stored["nodes"][0].pop("label", None)
+        (self.vault.root / CODE_PROJECTION).write_text(
+            json.dumps(stored), encoding="utf-8"
+        )
+        self.assertTrue(self.service.code_hubs()["hubs"])
+
+
+class MalformedStatusTest(MalformedFixture):
+    """`bk code status` must not call a graph fresh that no reader will open.
+
+    `status` never went through `_read`: it answers freshness from the `files`
+    fingerprint alone and never indexes a node or an edge, which is exactly why
+    it could not traceback -- and exactly why it reported `{"state": "fresh"}`
+    on the artefact `affected`, `path`, `hubs`, `communities`, `cycles` and
+    `diff` all refuse.
+
+    Third instance of one shape in this repository: `commit_lint` reported
+    active from a hook file's existence while `core.hooksPath` meant git never
+    ran it, and the write gate reported active without ever being exercised. A
+    report derived from a fingerprint is not a report about the thing.
+
+    Shares `MalformedFixture`'s table with the refusal tests rather than
+    restating it, so a shape added there is automatically a shape `status` has
+    to disclose.
+    """
+
+    def test_every_shape_a_reader_refuses_is_reported_as_malformed(self) -> None:
+        for how in self.CORRUPTIONS:
+            with self.subTest(corruption=how):
+                self.service.code_import(self.payload())
+                self.corrupt(how)
+                # The reader's verdict and the diagnostic's verdict, on one
+                # artefact, in one test: the two may not disagree.
+                with self.assertRaises(RefusalError):
+                    self.service.code_hubs()
+                self.assertEqual(self.service.code_status()["state"], "malformed")
+
+    def test_status_never_raises_on_anything_on_disk(self) -> None:
+        # The whole point of widening what `status` inspects is that it must not
+        # widen what can break it. `status` is the command you run when things
+        # are already broken.
+        stored = self.vault.root / CODE_PROJECTION
+        unreadable: dict[str, str | None] = {
+            **dict.fromkeys(self.CORRUPTIONS),
+            "not JSON at all": "{{{ not json",
+            "JSON that is not a dict": "[1, 2, 3]",
+            "a bare JSON string": '"graph"',
+            "an empty file": "",
+            "whitespace only": "   \n  ",
+        }
+        for how, literal in unreadable.items():
+            with self.subTest(content=how):
+                self.service.code_import(self.payload())
+                if literal is None:
+                    self.corrupt(how)
+                else:
+                    stored.write_text(literal, encoding="utf-8")
+                verdict = self.service.code_status()
+                self.assertIsInstance(verdict, dict)
+                self.assertIn("state", verdict)
+
+    def test_a_file_that_is_not_a_graph_reports_what_a_reader_reports(self) -> None:
+        # Not-JSON and not-a-dict stay `missing`, deliberately: that is what
+        # `_read` raises on them, and a diagnostic that disagreed with the
+        # reader would be a second wrong answer rather than one fewer.
+        for literal in ("{{{ not json", "[1, 2, 3]", ""):
+            with self.subTest(content=literal):
+                self.service.code_import(self.payload())
+                (self.vault.root / CODE_PROJECTION).write_text(
+                    literal, encoding="utf-8"
+                )
+                with self.assertRaises(NotFoundError):
+                    self.service.code_hubs()
+                self.assertEqual(self.service.code_status()["state"], "missing")
+
+    def test_the_verdict_names_the_fault_and_the_same_remedy_the_reader_does(
+        self,
+    ) -> None:
+        # A state word alone sends the operator back to reading the artefact by
+        # hand -- and a remedy that differs from the refusal's is worse still.
+        self.service.code_import(self.payload())
+        self.corrupt("an edge with no type")
+        verdict = self.service.code_status()
+        self.assertEqual(verdict["collection"], "edges")
+        self.assertEqual(verdict["index"], 0)
+        self.assertEqual(verdict["missing"], ["type"])
+        self.assertEqual(verdict["command"], "bk code build")
+        with self.assertRaises(RefusalError) as caught:
+            self.service.code_hubs()
+        self.assertEqual(verdict["hint"], caught.exception.details["hint"])
+
+    def test_a_malformed_graph_is_never_reported_as_not_stale(self) -> None:
+        # `stale` is what `_answer` attaches to every traversal and what a
+        # caller too terse to read `state` branches on. The freshness question
+        # is still answerable here -- the `files` map is intact and every file
+        # is unchanged -- which is precisely why the boolean has to be forced.
+        self.service.code_import(self.payload())
+        self.assertIs(self.service.code_status()["stale"], False)
+        self.corrupt("an edge with no type")
+        self.assertIs(self.service.code_status()["stale"], True)
+
+    def test_a_sound_graph_still_reports_fresh(self) -> None:
+        # The control. A detector that fired on everything would satisfy every
+        # assertion above while making `status` useless.
+        self.service.code_import(self.payload())
+        verdict = self.service.code_status()
+        self.assertEqual(verdict["state"], "fresh")
+        self.assertIs(verdict["stale"], False)
+        self.assertNotIn("collection", verdict)
+
+    def test_a_stale_graph_is_still_stale_and_not_malformed(self) -> None:
+        # The second control: the two verdicts are independent, and the new one
+        # must not swallow the old.
+        self.service.code_import(self.payload())
+        (self.repo / "src" / "db.ts").write_text("class Db { x = 1 }\n", "utf-8")
+        verdict = self.service.code_status()
+        self.assertEqual(verdict["state"], "stale")
+        self.assertEqual(verdict["changed"], ["src/db.ts"])
+
+    def render(self) -> str:
+        return _render(self.service.code_status(), "code", code_command="status")
+
+    def test_the_human_rendering_interrupts_rather_than_burying_the_fault(self) -> None:
+        # `--json` is not the surface an operator reads. A `"state": "malformed"`
+        # line inside a dump is disclosed and still missable, which is the
+        # distinction this whole area turns on.
+        self.service.code_import(self.payload())
+        self.corrupt("an edge with no type")
+        rendered = self.render()
+        self.assertIn("malformed", rendered)
+        self.assertIn("edges[0]", rendered)
+        self.assertIn("missing type", rendered)
+        self.assertIn("refuses this graph", rendered)
+        self.assertIn("bk code build", rendered)
+
+    def test_every_malformed_shape_interrupts_and_none_of_them_raises(self) -> None:
+        # Two properties at once, because the renderer branches on fields the
+        # corruptions do not all carry: `missing` is absent when a collection is
+        # absent, `index` is absent when the collection is not a list. Asserting
+        # only "did not raise" would pass on the rendering `_render_auto` gives
+        # for free, so the interruption is asserted for every shape.
+        for how in self.CORRUPTIONS:
+            with self.subTest(corruption=how):
+                self.service.code_import(self.payload())
+                self.corrupt(how)
+                rendered = self.render()
+                self.assertIn("refuses this graph", rendered)
+                self.assertIn("bk code build", rendered)
+
+    def test_the_other_states_render_exactly_as_they_did(self) -> None:
+        # The control that keeps this change additive: `fresh`, `stale` and
+        # `missing` are drawn by `_render_auto`, untouched, byte for byte.
+        (self.vault.root / CODE_PROJECTION).unlink(missing_ok=True)
+        for expected in ("missing", "fresh", "stale"):
+            with self.subTest(state=expected):
+                verdict = self.service.code_status()
+                self.assertEqual(verdict["state"], expected)
+                self.assertEqual(self.render(), _render_auto(verdict))
+                self.assertNotIn("refuses this graph", self.render())
+                if expected == "missing":
+                    self.service.code_import(self.payload())
+                elif expected == "fresh":
+                    (self.repo / "src" / "db.ts").write_text("class Db {} //", "utf-8")
 
 
 class VendoredImportTest(unittest.TestCase):

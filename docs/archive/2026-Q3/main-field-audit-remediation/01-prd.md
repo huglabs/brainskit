@@ -221,32 +221,32 @@ regression tripwire for this programme:
 
 ## 8. Acceptance criteria
 
-- [ ] `_evidence_privacy` returns `NEVER_INGEST` for unresolvable provenance; the
+- [x] `_evidence_privacy` returns `NEVER_INGEST` for unresolvable provenance; the
       reproduction from the audit (forget a record, read the orphaned page as
       `cloud`) no longer leaks, and the page is not stamped `"privacy": "cloud"`.
-- [ ] Obsidian sync with `consumer="cloud"` writes no file containing the secret,
+- [x] Obsidian sync with `consumer="cloud"` writes no file containing the secret,
       with and without `include_raw`.
-- [ ] `sh brainskit-status.sh | tail -2` agrees with `bk status` in both the Husky
+- [x] `sh brainskit-status.sh | tail -2` agrees with `bk status` in both the Husky
       case and the hooks-present-but-unregistered case.
-- [ ] `bk gate check-write` returns the same verdict for a relative and an
+- [x] `bk gate check-write` returns the same verdict for a relative and an
       absolute path to the same file — or names its base in `--help`, in
       `docs/commands.md`, and in its output.
-- [ ] `bk --version`, `pyproject.toml`, the git tag and MCP `serverInfo.version`
+- [x] `bk --version`, `pyproject.toml`, the git tag and MCP `serverInfo.version`
       all report the same string; CI fails if they diverge.
-- [ ] `bk init ./v --config <(bk init --print-config)` succeeds off a TTY.
-- [ ] `taxonomy_seed` has at least one reader, reachable from `bk ingest`.
-- [ ] No `bk code` traversal answers without a staleness signal; `data()["state"]`
+- [x] `bk init ./v --config <(bk init --print-config)` succeeds off a TTY.
+- [x] `taxonomy_seed` has at least one reader, reachable from `bk ingest`.
+- [x] No `bk code` traversal answers without a staleness signal; `data()["state"]`
       is non-null.
-- [ ] `search(limit=N)` returns exactly N for N ∈ {1,2,3}.
-- [ ] `networkx` is no longer a required dependency; `graphify.build` is not
+- [x] `search(limit=N)` returns exactly N for N ∈ {1,2,3}.
+- [x] `networkx` is no longer a required dependency; `graphify.build` is not
       imported at module level anywhere.
-- [ ] Neo4j/Postgres object names match `docs/integrations.md`, with a documented
+- [x] Neo4j/Postgres object names match `docs/integrations.md`, with a documented
       migration for existing subgraphs.
-- [ ] `pypi.org/simple/brainskit/` returns 200 and `uv tool install brainskit`
+- [x] `pypi.org/simple/brainskit/` returns 200 and `uv tool install brainskit`
       installs `0.6.0`.
-- [ ] Every issue's negative control demonstrated: reverted → fails, restored →
+- [x] Every issue's negative control demonstrated: reverted → fails, restored →
       passes.
-- [ ] Full suite green, `ruff` clean, `bk lint` clean.
+- [x] Full suite green, `ruff` clean, `bk lint` clean.
 
 ---
 

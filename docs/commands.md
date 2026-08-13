@@ -20,7 +20,7 @@ switches to machine-readable output.
 | `search QUERY [--limit N] [--consumer C]` | FTS5 BM25 search |
 | `context QUERY [--limit N] [--max-chars N] [--consumer C]` | Bounded evidence bundle |
 | `apply PROPOSAL\|-` | Validate and atomically commit wiki writes |
-| `gate check-write PATH [--agent A]` | Whether a direct write to `PATH` is permitted |
+| `gate check-write PATH [--agent A]` | Whether a direct write to `PATH` is permitted. A relative `PATH` resolves against the current directory, like every other command |
 | `views` · `graph [--html]` | Regenerate views and the knowledge graph |
 | `enrich apply PROPOSAL\|-` · `enrich list [--consumer C]` · `enrich forget ID` | Model-inferred edges, gated and stored apart from the projection |
 | `code build [PATH …]` · `code import` · `code status` | Extract the repository graph, import one, re-check it — `build` needs `[code]`. Given `PATH`s, merges that subset into the stored graph instead of replacing it |

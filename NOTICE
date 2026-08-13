@@ -1,7 +1,12 @@
-Brainkit
-Copyright 2026 the Brainkit contributors.
+Brainskit
+Copyright 2026 HugLabs and the Brainskit contributors.
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Two paths are given for every vendored file below. This file ships inside the
+distribution as `brainskit-<version>.dist-info/licenses/NOTICE`, where a `src/`
+path resolves to nothing; the second path is where the file actually sits in an
+installed copy.
 
 --------------------------------------------------------------------------------
 
@@ -14,9 +19,29 @@ This product includes software developed by the Graphify project.
 
   Portions of Graphify were contributed under the MIT License prior to its
   relicensing and remain available under those terms. That license text is
-  retained at src/brainkit/infrastructure/codeanalysis/LICENSE-MIT.
+  retained at:
 
-The vendored subset, the upstream revision it was taken from, and the changes
-made to it are recorded in:
+    in this repository:    src/brainskit/infrastructure/codeanalysis/LICENSE-MIT
+    in an installed copy:  brainskit/infrastructure/codeanalysis/LICENSE-MIT
 
-  src/brainkit/infrastructure/codeanalysis/NOTICE
+  The vendored subset, the upstream revision it was taken from, and the changes
+  made to it are recorded in:
+
+    in this repository:    src/brainskit/infrastructure/codeanalysis/NOTICE
+    in an installed copy:  brainskit/infrastructure/codeanalysis/NOTICE
+
+--------------------------------------------------------------------------------
+
+This product includes three.js.
+
+  three.js, revision 148
+  Copyright 2010-2022 Three.js Authors
+  https://github.com/mrdoob/three.js
+  Licensed under the MIT License (SPDX-License-Identifier: MIT).
+
+  A minified build is vendored verbatim and served by `bk web` at
+  `/static/three.min.js`. Its MIT permission notice is retained in the file's
+  own header, which is the copy that accompanies the software:
+
+    in this repository:    src/brainskit/templates/web/three.min.js
+    in an installed copy:  brainskit/templates/web/three.min.js

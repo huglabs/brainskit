@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -565,6 +566,91 @@ class RegistryIntegrityTest(RegistryFixture):
         )
         with self.assertRaises(ValidationError):
             VaultRegistry(path).entries()
+
+
+class RegistryIsolationTest(unittest.TestCase):
+    """Running the suite must add nothing to the operator's own registry.
+
+    `bk init` registers what it creates, which is the behaviour an operator
+    wants and the one a test must not inherit: the suite makes vaults in
+    temporary directories and never unregisters them, so a real machine
+    collected dozens of `/var/folders/.../T/tmp*/v` entries pointing at
+    directories that no longer exist.
+
+    `tests/conftest.py` fixes that by pointing `XDG_CONFIG_HOME` at a
+    throwaway directory for the whole run. These two cases are what stops
+    that from being deleted, or defeated by an unrelated change, without
+    anyone noticing -- deliberately taking the environment as the run
+    actually has it rather than patching one of their own, because the
+    ambient environment is the thing under test.
+    """
+
+    def real_config_home(self) -> Path:
+        return (Path.home() / ".config").resolve()
+
+    def refuse_the_operator_s_registry(self, moment: str) -> None:
+        written = VaultRegistry().path.resolve()
+        self.assertFalse(
+            written.is_relative_to(self.real_config_home()),
+            f"{moment}: the operator's own registry is in reach at {written}",
+        )
+
+    def forget(self, root: Path) -> None:
+        """Drop an entry if it is still there; a failed case may have left none."""
+
+        with contextlib.suppress(NotFoundError, ValidationError, OSError):
+            VaultRegistry().forget(str(root))
+
+    def test_the_registry_this_run_writes_is_not_the_operator_s(self) -> None:
+        self.refuse_the_operator_s_registry("this run")
+        # `VaultRegistry()` only expands the path it is given, so pin the
+        # function that decides it too: an isolation defeated upstream of the
+        # environment lookup would leave the case above passing on the alias.
+        self.assertEqual(VaultRegistry().path, default_registry_path().expanduser())
+
+    def test_an_ordinary_init_registers_into_the_throwaway_registry(self) -> None:
+        """The product behaviour is intact; only its destination moved.
+
+        A test asserting merely that nothing was written would also pass if
+        `bk init` had quietly stopped registering at all, which is the
+        regression this pollution must not be traded for.
+
+        The destination is checked before `init` runs as well as after, so
+        this fails without polluting anything when the isolation is missing
+        -- running one of these files directly through `unittest` loads no
+        `conftest.py` and is exactly that case.
+        """
+
+        self.refuse_the_operator_s_registry("before init")
+        with tempfile.TemporaryDirectory(prefix="registry-isolation-") as temporary:
+            root = Path(temporary).resolve()
+            config = root / "policy.json"
+            config.write_text(json.dumps(policy()), encoding="utf-8")
+            target = root / "v"
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                code = cli.main(
+                    [
+                        "--json",
+                        "init",
+                        str(target),
+                        "--config",
+                        str(config),
+                        "--skip-code-build",
+                    ]
+                )
+            self.assertEqual(code, 0, stream.getvalue())
+            registered = json.loads(stream.getvalue())["result"]["registered"]
+            self.assertIsNotNone(registered, "bk init must still register the vault")
+            # This is the one case that deliberately writes the ambient
+            # registry, so it is also the one that has to leave it as it found
+            # it: the vault itself vanishes with the temporary directory.
+            self.addCleanup(self.forget, target)
+
+            self.refuse_the_operator_s_registry("after init")
+            self.assertIn(
+                target.resolve(), [entry.path for entry in VaultRegistry().entries()]
+            )
 
 
 if __name__ == "__main__":

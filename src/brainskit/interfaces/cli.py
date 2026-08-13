@@ -3312,6 +3312,50 @@ def _render_code_build(value: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _render_code_status(value: dict[str, Any]) -> str:
+    """The freshness verdict, plus a loud line when the graph is unreadable.
+
+    Every existing state keeps exactly the rendering it had -- `_render_auto`
+    is still what draws it -- because `fresh`, `stale` and `missing` were never
+    the problem. `malformed` is, and it is the one verdict a reader must not
+    have to notice inside a dump: the graph parses, its `generated_at` looks
+    recent, and nothing about the block says the artefact answers nothing.
+
+    Same treatment `_render_code_build` gives a build that dropped a language,
+    and for the same reason: the panel above is not wrong, it is beside the
+    point, and only an interruption says so.
+    """
+
+    rendered = _render_auto(value)
+    if value.get("state") != "malformed":
+        return rendered
+    where = str(value.get("collection", "the graph"))
+    index = value.get("index")
+    if index is not None:
+        where = f"{where}[{index}]"
+    missing = value.get("missing") or []
+    problem = (
+        f"missing {', '.join(str(field) for field in missing)}"
+        if missing
+        else str(value.get("problem", "malformed"))
+    )
+    return "\n".join(
+        [
+            rendered,
+            "",
+            console.style(
+                f"  {console.CROSS} {where} is {problem} — every other "
+                "bk code command refuses this graph.",
+                console.ERR,
+            ),
+            console.style(
+                f"     {value.get('hint', '')}",
+                console.MUTED,
+            ),
+        ]
+    )
+
+
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "init": _render_init,
     "capture": _render_capture,
@@ -3333,6 +3377,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
 
 _CODE_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "build": _render_code_build,
+    "status": _render_code_status,
     "affected": _render_code_affected,
     "path": _render_code_path,
     "hubs": _render_code_hubs,

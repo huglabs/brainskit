@@ -62,7 +62,9 @@ name it explicitly only when the operator asked for unrestricted evidence.
   the source hashes and the proposal contract you need.
 - Write wiki pages **only** through `bk apply`. Every claim carries a
   `[^source:<sha256>]` citation, updates carry the `base_hash` returned by
-  `context`, and retries carry a stable `proposal_id`.
+  `context`, and a retry of the same payload carries the same `proposal_id`.
+  That id binds to the bytes it applied, so a payload you repaired is a new
+  one: give it a new id, or omit it and one is derived from the payload.
 - Never edit anything under `raw/` — sources are immutable and identified by
   their hash. Never hand-edit anything under `wiki/`; `bk lint` reports it as
   `wiki.outside_apply`. Both are refused mechanically rather than by

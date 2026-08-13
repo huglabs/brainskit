@@ -5,22 +5,32 @@ Vendored from Graphify
   Revision:  00efd6e7969837ae4a9f11d8d504dcd3b20b09df  (2026-08-01)
   Version:   0.9.32
   Copyright: 2026 Safi Shamsi and the Graphify contributors
-  License:   Apache License, Version 2.0 — see ../../../../LICENSE
+  License:   Apache License, Version 2.0
+
+The Apache-2.0 text is the distribution's own LICENSE: in this repository at the
+repository root, and in an installed copy at
+`brainskit-<version>.dist-info/licenses/LICENSE`.
 
 Portions of Graphify were contributed under the MIT License prior to its
 relicensing and remain available under those terms; that text is in LICENSE-MIT
-alongside this file.
+alongside this file. Both files travel with the source they cover — they are
+globbed as package data in `pyproject.toml` and asserted present in the built
+artifact by `scripts/verify-wheel.sh`, because a licence that ships only in the
+repository does not accompany the copies that matter.
 
 Apache-2.0 section 4(b) requires that modified files carry prominent notices
 stating that they were changed, and 4(c) that attribution notices are retained.
-Both are satisfied here rather than file by file: nothing in this directory is
-edited in place.
+Both are satisfied here rather than file by file: every departure from upstream —
+three edits and three removals — is declared under "What was changed" below, and
+every other file in this tree is a verbatim copy. `tests/test_vendoring.py` pins
+the content of all 43 vendored modules, so that second half is checked rather
+than asserted.
 
 
 Why it is vendored rather than imported
 ---------------------------------------
 
-Brainkit does not parse code and should not learn to. What it has, and what a
+Brainskit does not parse code and should not learn to. What it has, and what a
 code-graph tool generally does not, is a way to say when a derived artefact
 stopped being true and who is allowed to read it. Vendoring keeps that division
 intact while removing the process boundary that used to sit between them: the
@@ -32,11 +42,11 @@ What is vendored
 ----------------
 
 The import closure of `graphify.extract`, measured rather than guessed, plus the
-analysis modules Brainkit has no equivalent for (`cluster`, `analyze`, and the
+analysis modules Brainskit has no equivalent for (`cluster`, `analyze`, and the
 `build`/`validate` pair those import at module level). Everything else in
 Graphify — its CLI, LLM backends, report and export renderers, watch mode, MCP
 server, HTML visualisers, database exporters — is deliberately absent, because
-Brainkit already answers those questions its own way or does not ask them.
+Brainskit already answers those questions its own way or does not ask them.
 
 "Measured rather than guessed" is not a flourish. A static read of the imports
 gives 39 modules; the real closure is 41. `detect` and `google_workspace` are
@@ -54,7 +64,7 @@ oversight. `build.py` imports them, but only inside two function bodies:
     build()        line 1126   imports graphify.dedup
     build_merge()  line 1538   imports graphify.export
 
-Brainkit calls neither. It constructs the NetworkX graph the analysis modules
+Brainskit calls neither. It constructs the NetworkX graph the analysis modules
 want from its own already-normalised `graph/code.json`, so Graphify's builder
 never runs. Vendoring the two would add 1,861 lines and, more to the point, a
 `rapidfuzz` dependency — for code paths that are never reached.
@@ -70,9 +80,9 @@ What was changed
 ----------------
 
 The rule is that adaptation lives OUTSIDE this directory, in the adapter that
-implements Brainkit's `CodeExtractorPort`. That is where the vault is excluded
+implements Brainskit's `CodeExtractorPort`. That is where the vault is excluded
 from its own graph, prose nodes are dropped, and the result is normalised to
-Brainkit's node shape. Keeping this tree close to upstream is what makes a
+Brainskit's node shape. Keeping this tree close to upstream is what makes a
 re-vendor a copy rather than a merge, and what lets behaviour seen here be
 reported against Graphify without first subtracting our edits.
 
@@ -82,19 +92,26 @@ notice, and because a claim of byte-identity that is not true is worse than no
 claim at all — the AST cache is namespaced by a hash of this tree precisely so
 that a change here cannot be served from a cache built before it.
 
-`tests/test_vendoring.py` pins both lists. A fourth edit, or a fourth removal,
-fails that test until it is declared here, which is the point: the exception
-must stay visible and argued for rather than accumulating quietly.
+The two lists are under their own headings below, and the distinction is load
+bearing: a file under REMOVED is absent from this tree, a file under MODIFIED is
+present and differs from upstream. Reading a present-and-edited file as removed
+loses exactly the section 4(b) notice this file exists to give.
 
-REMOVED
+`tests/test_vendoring.py` pins both lists, and pins the sha256 of every vendored
+module besides. A fourth edit, a fourth removal, a new file, or a silent change
+to any of the other 40 fails that test until it is declared here — which is the
+point: the exception must stay visible and argued for rather than accumulating
+quietly.
+
+REMOVED — absent from this tree
 
   analyze.py, build.py, validate.py
-      Removed, not modified. Brainkit reached this tree for two functions,
+      Removed, not modified. Brainskit reached this tree for two functions,
       `find_import_cycles` and `graph_diff`, and `analyze.py` imports
       `build.py` at module scope for a thirteen-line helper — so asking whether
       a repository has import cycles loaded 2,487 lines and networkx.
 
-      Both questions are about Brainkit's own normalised `code.json` rather than
+      Both questions are about Brainskit's own normalised `code.json` rather than
       about extraction, so they are answered in `application/codegraph.py`
       directly, verified against output captured from this implementation before
       it was removed. Nothing in this tree imported these three either, so they
@@ -103,6 +120,8 @@ REMOVED
       A re-vendor should not restore them without a caller. `graphify.cluster`
       remains vendored and imported: community detection is genuine graph
       theory and is not reimplemented here.
+
+MODIFIED — present in this tree, and changed from upstream
 
   extract.py
       1. `skipped` results are cached and excluded from the "produced zero
@@ -114,13 +133,13 @@ REMOVED
          same condition.
       2. The missing-grammar hint is derived from the module named in the error
          (`tree_sitter_x` -> `tree-sitter-x`) instead of an extension->extra
-         table. The table pointed at `graphifyy` extras; Brainkit vendors this
+         table. The table pointed at `graphifyy` extras; Brainskit vendors this
          code and does not depend on that distribution, so following the hint
          installed something unrelated while the grammar stayed missing.
 
   detect.py, google_workspace.py
       Two user-facing strings that told the reader to `pip install graphifyy[…]`
-      now name Brainkit's own extra, or say plainly that the capability is not
+      now name Brainskit's own extra, or say plainly that the capability is not
       vendored. Message text only; no behaviour.
 
 
@@ -128,8 +147,8 @@ Consequences that are not obvious
 ---------------------------------
 
 - This directory is excluded from `ruff` and `mypy` in `pyproject.toml`. It does
-  not meet Brainkit's lint contract and reformatting it would make the next
+  not meet Brainskit's lint contract and reformatting it would make the next
   upstream diff unreadable. The exclusion is scoped to this path only.
 - The third-party runtime it needs (tree-sitter grammars, and networkx for the
   analysis modules) is an optional dependency group. Vendoring source does not
-  vendor a parser: `pip install brainkit[code]` is still required.
+  vendor a parser: `pip install brainskit[code]` is still required.

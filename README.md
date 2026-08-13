@@ -14,6 +14,8 @@ Local-first · LLM-agnostic · nothing reaches the wiki without provenance
 [![CI](https://img.shields.io/github/actions/workflow/status/huglabs/brainskit/ci.yml?branch=main&style=flat-square&color=ee502c&labelColor=0c0c0c&logo=githubactions&logoColor=white)](https://github.com/huglabs/brainskit/actions/workflows/ci.yml)
 [![by HugLabs](https://img.shields.io/badge/by-HugLabs-ee502c?style=flat-square&labelColor=0c0c0c)](https://huglabs.ai)
 
+**English** · [Português](./README.pt-BR.md)
+
 [Getting started](./docs/getting-started.md) ·
 [Commands](./docs/commands.md) ·
 [Privacy](./docs/privacy.md) ·
@@ -26,6 +28,8 @@ Local-first · LLM-agnostic · nothing reaches the wiki without provenance
 
 ---
 
+<div align="center">
+
 ```
 ██████╗ ██████╗  █████╗ ██╗███╗   ██╗███████╗██╗  ██╗██╗████████╗
 ██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║██╔════╝██║ ██╔╝██║╚══██╔══╝
@@ -33,9 +37,11 @@ Local-first · LLM-agnostic · nothing reaches the wiki without provenance
 ██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║╚════██║██╔═██╗ ██║   ██║
 ██████╔╝██║  ██║██║  ██║██║██║ ╚████║███████║██║  ██╗██║   ██║
 ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝   ╚═╝
-        by HugLabs • Enterprise AI that ships
-        www.huglabs.ai • open source, Apache-2.0
+by HugLabs • Enterprise AI that ships
+www.huglabs.ai • open source, Apache-2.0
 ```
+
+</div>
 
 ## Your agent has been writing your knowledge base for six months
 
@@ -296,7 +302,7 @@ code-analysis subset and its attribution.
   </picture>
 </a>
 
-### Built and maintained by HugLabs
+### Created by HugLabs. Maintained by the community.
 
 **The applied research laboratory for enterprise AI that ships.**
 
@@ -305,9 +311,11 @@ science into real systems for critical business problems — six product
 families, eleven products in production, and an academic partnership with
 CEIA-UFG.
 
-We don't sell capabilities. We sell delivery. brainskit is the memory layer
-underneath that work, released as open source because a provenance gate is only
-worth trusting if you can read it.
+We don't sell capabilities. We sell delivery. brainskit started as the memory
+layer underneath that work, and was released as open source because a
+provenance gate is only worth trusting if you can read it. Day-to-day
+development now happens in the open, driven by the people who run it — see
+[CONTRIBUTING.md](./CONTRIBUTING.md) to join in.
 
 [huglabs.ai](https://huglabs.ai) ·
 [github.com/huglabs](https://github.com/huglabs) ·

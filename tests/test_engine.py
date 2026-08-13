@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
+    ConflictError,
     PolicyError,
     ValidationError,
     VaultConfig,
@@ -1810,6 +1811,203 @@ class PolicyTest(unittest.TestCase):
                 branches=["_inbox", "20-research"],
                 variables={"question": "Q", "context": "{}"},
             )
+
+
+class ProposalIdReuseNamesATerminatingRemedyTest(unittest.TestCase):
+    """A reused `proposal_id` is not a conflict, and the difference is a loop.
+
+    The shipped contract tells an agent to hold `proposal_id` stable across
+    retries. Repairing a rejected body is a retry, and it changes the payload --
+    so the reuse check fires, and the code it reports decides whether the agent
+    can ever finish. `conflict` means "re-read the vault and send the same
+    intent again", which is exactly what the agent already did.
+
+    So the assertions here are about the *remedy*, not the code. Asserting
+    `code == "validation_error"` alone would have passed before this bug existed
+    and after it was introduced; what discriminates is driving each code's
+    stated remedy and seeing which one terminates.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.service = BrainskitService(
+            self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
+        )
+        self.hash = self.service.capture(
+            None, text="Evidence about widgets.", title="Evidence"
+        )["source"]["content_hash"]
+        self.page = "wiki/concepts/widget.md"
+        self.service.apply(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(f"A first claim.[^source:{self.hash}]")],
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def operation(self, body: str, base_hash: str | None = None) -> dict:
+        operation = {
+            "action": "upsert",
+            "kind": "concept",
+            "slug": "widget",
+            "title": "Widget",
+            "aliases": [],
+            "source_hashes": [self.hash],
+            "body": body,
+            "links": [],
+        }
+        if base_hash is not None:
+            operation["base_hash"] = base_hash
+        return operation
+
+    def revised(self, note: str = "revised") -> str:
+        return f"A first claim, {note}.[^source:{self.hash}]"
+
+    def refusal(self, payload: dict) -> ValidationError:
+        with self.assertRaises(ValidationError) as refused:
+            self.service.apply(payload)
+        return refused.exception
+
+    def test_the_conflict_remedy_can_never_clear_this_refusal(self) -> None:
+        """The loop itself. This is the test the old classification failed.
+
+        Five cycles of exactly what `conflict` instructs -- re-read the page's
+        current version, rebuild the request against it, send it again under the
+        stable id the contract asks for. The binding is in `applied.json`, so
+        every cycle reads the same answer back.
+        """
+
+        base_hash = None
+        for attempt in range(5):
+            error = self.refusal(
+                {
+                    "proposal_id": "agent-turn-1",
+                    "operations": [self.operation(self.revised(str(attempt)), base_hash)],
+                }
+            )
+            self.assertEqual(
+                error.details.get("proposal_id"), "agent-turn-1", f"cycle {attempt}"
+            )
+            base_hash = self.vault.wiki_version(self.page)
+
+    def test_the_remedy_it_states_actually_succeeds(self) -> None:
+        """Read the hint, do what it says, and the turn finishes."""
+
+        error = self.refusal(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(self.revised())],
+            }
+        )
+        self.assertIn("new proposal_id", error.details["hint"])
+        applied = self.service.apply(
+            {
+                "proposal_id": "agent-turn-2",
+                "operations": [
+                    self.operation(self.revised(), self.vault.wiki_version(self.page))
+                ],
+            }
+        )
+        self.assertEqual(applied["applied"], 1)
+        self.assertIn(self.revised(), (self.root / self.page).read_text())
+
+    def test_omitting_the_id_is_the_other_stated_remedy(self) -> None:
+        """The hint offers two moves; both have to work, or it misleads."""
+
+        error = self.refusal(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(self.revised())],
+            }
+        )
+        self.assertIn("omit it", error.details["hint"])
+        applied = self.service.apply(
+            {
+                "operations": [
+                    self.operation(self.revised(), self.vault.wiki_version(self.page))
+                ]
+            }
+        )
+        self.assertEqual(applied["applied"], 1)
+
+    def test_it_is_reported_as_change_the_request_not_as_a_conflict(self) -> None:
+        error = self.refusal(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(self.revised())],
+            }
+        )
+        self.assertEqual(error.code, "validation_error")
+        self.assertNotIsInstance(error, ConflictError)
+
+    def test_the_refusal_shows_the_payload_really_differs(self) -> None:
+        """Without both hashes the caller cannot tell a real reuse from a bug."""
+
+        error = self.refusal(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(self.revised())],
+            }
+        )
+        self.assertNotEqual(
+            error.details["applied_request_hash"], error.details["request_hash"]
+        )
+
+    def test_replaying_the_identical_payload_is_still_a_no_op(self) -> None:
+        """Control: idempotent replay is the whole reason the binding exists."""
+
+        replay = self.service.apply(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(f"A first claim.[^source:{self.hash}]")],
+            }
+        )
+        self.assertTrue(replay["idempotent"])
+
+    def test_a_genuinely_stale_page_is_still_a_conflict(self) -> None:
+        """Control: the narrowing must not swallow the case that *is* one."""
+
+        error = self.refusal(
+            {
+                "proposal_id": "agent-turn-2",
+                "operations": [self.operation(self.revised(), "f" * 64)],
+            }
+        )
+        self.assertEqual(error.code, "conflict")
+
+    def test_the_locked_check_answers_exactly_the_same(self) -> None:
+        """The twin under the write lock, driven directly.
+
+        The gate checks this before taking the lock and the vault checks it
+        again after; a caller must not learn a different remedy depending on
+        which of them won the race.
+        """
+
+        with self.assertRaises(ValidationError) as refused:
+            self.vault.commit_wiki_batch(
+                {},
+                {},
+                {},
+                "agent-turn-1",
+                "0" * 64,
+                {},
+                None,
+                lambda records: 0,
+            )
+        locked = refused.exception
+        gate = self.refusal(
+            {
+                "proposal_id": "agent-turn-1",
+                "operations": [self.operation(self.revised())],
+            }
+        )
+        self.assertEqual(locked.code, gate.code)
+        self.assertEqual(str(locked), str(gate))
+        self.assertEqual(locked.details["hint"], gate.details["hint"])
 
 
 if __name__ == "__main__":

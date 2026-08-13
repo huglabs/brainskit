@@ -57,7 +57,7 @@ not its body, not its name.
 
 ```json
 {
-  "proposal_id": "stable-id-for-retries",
+  "proposal_id": "id-for-this-exact-payload",
   "operations": [
     {
       "action": "upsert",
@@ -80,8 +80,12 @@ not its body, not its name.
   `context`. A stale value is rejected rather than overwritten.
 - Each `links` target must already exist or be created in the same batch.
 - Validation covers the whole batch: one bad operation writes nothing.
-- Retrying with the same `proposal_id` and payload is a no-op; reusing that id
-  with a different payload is rejected.
+- `proposal_id` binds to the bytes it applied, not to the turn that sent it.
+  Re-sending that exact payload under it is a no-op — which is what makes a
+  retry safe after a timeout. Sending a changed payload under it is rejected
+  as `validation_error` and re-reading the vault never clears it: a body you
+  repaired is a new payload, so give it a new id, or omit `proposal_id` and
+  one is derived from the payload.
 
 ## Commands
 
