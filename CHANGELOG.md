@@ -9,6 +9,8 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-13
+
 Remediation of a five-agent field audit of 0.5.0. The defects clustered in one
 place: the mechanisms meant to *refuse*, and the surfaces reporting on them. A
 check verified that a thing existed rather than that it worked, or resolved an

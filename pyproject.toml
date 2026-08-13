@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brainskit"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-first, LLM-agnostic second-brain engine: the compilation gate between raw evidence and knowledge an agent may act on"
 readme = "README.md"
 requires-python = ">=3.11"
