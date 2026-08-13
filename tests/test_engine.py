@@ -24,6 +24,7 @@ from brainskit.domain.model import (
     PolicyError,
     ValidationError,
     VaultConfig,
+    resolve_source_path,
 )
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
@@ -1784,6 +1785,47 @@ class PolicyTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             VaultConfig.from_dict(incomplete)
 
+    def test_a_source_must_be_a_string_path(self) -> None:
+        # `{"type": "folder", "path": ...}` is a plausible guess at the schema.
+        # `str()` coercion accepted it as the literal path "{'type': ...}",
+        # which resolved to a directory that cannot exist and was skipped in
+        # silence -- so the policy is refused where every other malformed
+        # policy value is.
+        raw = policy()
+        raw["sources"] = [{"type": "folder", "path": "../inbox"}]
+        with self.assertRaises(ValidationError) as caught:
+            VaultConfig.from_dict(raw)
+        self.assertEqual(caught.exception.details["index"], 0)
+
+    def test_a_source_cannot_be_blank(self) -> None:
+        raw = policy()
+        raw["sources"] = ["   "]
+        with self.assertRaises(ValidationError):
+            VaultConfig.from_dict(raw)
+
+    def test_a_relative_source_resolves_against_the_vault(self) -> None:
+        # Not against the process's current directory: `bk schedule` emits
+        # cron lines, and cron runs from `$HOME`.
+        vault = Path("/vaults/brain")
+        self.assertEqual(
+            resolve_source_path(vault, "../inbox"), Path("/vaults/inbox")
+        )
+        self.assertEqual(
+            resolve_source_path(vault, "./inbox"), Path("/vaults/brain/inbox")
+        )
+
+    def test_an_absolute_source_is_returned_unchanged(self) -> None:
+        # Unlike `code_root`, which refuses one: watching `~/Downloads` is a
+        # documented use, so this path must keep working exactly as it did.
+        self.assertEqual(
+            resolve_source_path(Path("/vaults/brain"), "/srv/dropbox"),
+            Path("/srv/dropbox"),
+        )
+        self.assertEqual(
+            resolve_source_path(Path("/vaults/brain"), "~/Downloads"),
+            Path.home().resolve() / "Downloads",
+        )
+
     def test_never_ingest_fails_before_provider_call(self) -> None:
         config = VaultConfig.from_dict(policy())
         router = PolicyJudgmentRouter(config, JobSpecs())
@@ -2008,6 +2050,130 @@ class ProposalIdReuseNamesATerminatingRemedyTest(unittest.TestCase):
         self.assertEqual(locked.code, gate.code)
         self.assertEqual(str(locked), str(gate))
         self.assertEqual(locked.details["hint"], gate.details["hint"])
+
+
+class WikiCatalogHasNoSelfDeclaredExemptionTest(unittest.TestCase):
+    """A page could exempt itself from the apply gate's duplicate check.
+
+    `ApplyGate._wiki_catalog` skipped any page whose *own* frontmatter said
+    `type: "system"`, and that catalog is what `_validate_novelty` compares a
+    proposal against. So four words in a page's own header bought it permanent
+    invisibility to `duplicate_identity` -- the same shape as the
+    `wiki.outside_apply` exemption, where the file being checked decided whether
+    it would be checked.
+
+    The seeded pages are deliberately *not* exempted here, unlike in
+    `SEEDED_SYSTEM_PAGES`. That constant answers a provenance question ("which
+    pages may exist with no ledger entry"); this asks which identities are
+    already taken, and `wiki/index.md` does take one. Sharing a constant would
+    couple two questions that only agree by coincidence today.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.service = BrainskitService(
+            self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
+        )
+        self.hash = self.service.capture(
+            None, text="Evidence about compiled memory.", title="Evidence"
+        )["source"]["content_hash"]
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def write_page(self, name: str, title: str, page_type: str) -> str:
+        path = f"wiki/{name}.md"
+        (self.root / path).write_text(
+            "---\n"
+            f'id: "concept:{name}"\n'
+            f'type: "{page_type}"\n'
+            f"title: {json.dumps(title)}\n"
+            "aliases:\nsources:\n"
+            'updated_at: "2026-01-01T00:00:00Z"\n'
+            "---\n\n"
+            f"# {title}\n\nCompiled memory moves work out of query time.\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def proposal(self, slug: str, title: str) -> dict:
+        return {
+            "operations": [
+                {
+                    "action": "upsert",
+                    "kind": "concept",
+                    "slug": slug,
+                    "title": title,
+                    "aliases": [],
+                    "source_hashes": [self.hash],
+                    "body": f"Compiled memory moves work.[^source:{self.hash}]",
+                    "links": [],
+                }
+            ]
+        }
+
+    def test_a_page_declaring_type_system_is_still_catalogued(self) -> None:
+        path = self.write_page("impostor", "Compiled memory", "system")
+        catalog = {entry["path"] for entry in self.service.gate._wiki_catalog()}
+        self.assertIn(path, catalog)
+
+    def test_it_cannot_buy_silence_from_the_duplicate_check(self) -> None:
+        """The defect end to end: the refusal a stolen title must produce."""
+
+        self.write_page("impostor", "Compiled memory", "system")
+        with self.assertRaises(ValidationError) as refused:
+            self.service.apply(self.proposal("compiled-memory", "Compiled memory"))
+        failures = refused.exception.details["failures"]
+        self.assertEqual(
+            [(item["code"], item["existing_path"]) for item in failures],
+            [("duplicate_identity", "wiki/impostor.md")],
+        )
+
+    def test_the_declared_type_changes_nothing_about_being_seen(self) -> None:
+        """`system` was the exempt spelling; every other one already collided.
+
+        Asserted as one behaviour across spellings, because the bug was that a
+        single value behaved differently from the rest.
+        """
+
+        for page_type in ("system", "concept", "entity", "synthesis", "source"):
+            with self.subTest(page_type=page_type):
+                path = self.write_page(f"impostor-{page_type}", "Shared name", page_type)
+                catalog = {entry["path"] for entry in self.service.gate._wiki_catalog()}
+                self.assertIn(path, catalog)
+                with self.assertRaises(ValidationError) as refused:
+                    self.service.apply(self.proposal(f"page-{page_type}", "Shared name"))
+                codes = {
+                    item["code"] for item in refused.exception.details["failures"]
+                }
+                self.assertIn("duplicate_identity", codes)
+                (self.root / path).unlink()
+
+    def test_the_pages_bk_init_seeds_are_catalogued_too(self) -> None:
+        """They hold real titles and real slugs, so they are real occupants."""
+
+        catalog = {entry["path"] for entry in self.service.gate._wiki_catalog()}
+        self.assertLessEqual({"wiki/index.md", "wiki/log.md"}, catalog)
+        with self.assertRaises(ValidationError) as refused:
+            self.service.apply(self.proposal("brainskit-index", "Brainskit index"))
+        failures = refused.exception.details["failures"]
+        self.assertEqual(
+            [(item["code"], item["existing_path"]) for item in failures],
+            [("duplicate_identity", "wiki/index.md")],
+        )
+
+    def test_cataloguing_them_does_not_block_an_ordinary_apply(self) -> None:
+        """The control: the seeded pages must not collide with normal work.
+
+        Only an identity clash is a clash. A proposal with its own title still
+        applies, and the `type` partition keeps the seeded bodies out of the
+        similarity comparison.
+        """
+
+        result = self.service.apply(self.proposal("memoria-compilada", "Memória compilada"))
+        self.assertEqual(result["applied"], 1)
 
 
 if __name__ == "__main__":

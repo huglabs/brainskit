@@ -34,6 +34,7 @@ from brainskit.domain.model import (
     RefusalError,
     ValidationError,
     VaultConfig,
+    resolve_vault_relative_path,
     utc_now,
 )
 
@@ -249,7 +250,19 @@ class NativeIntegrations:
         if not policy.enabled:
             return "disabled"
         if name == "obsidian":
-            target = Path(str(policy.options.get("path", ""))).expanduser()
+            # Resolved against the vault, so `bk status` answers about the
+            # vault rather than about the terminal it was typed into. It used
+            # to report `ready` or `not-synced` for one unchanged vault and one
+            # unchanged policy depending on which directory the operator was
+            # standing in.
+            configured = str(policy.options.get("path", ""))
+            if not configured:
+                # An enabled integration with no destination has nothing to be
+                # ready for. Worth stating, because under vault-relative
+                # resolution an empty value would otherwise resolve to the
+                # vault itself and report `ready` forever.
+                return "not-synced"
+            target = resolve_vault_relative_path(self.vault.root, configured)
             return "ready" if target.is_dir() else "not-synced"
         if name == "web":
             runtime = self.vault.read_state("integration-state").get(
@@ -316,11 +329,23 @@ class NativeIntegrations:
     def _sync_obsidian(
         self, policy: IntegrationPolicy, graph: dict[str, Any]
     ) -> dict[str, Any]:
-        target = Path(str(policy.options["path"])).expanduser().resolve()
+        configured = str(policy.options["path"])
+        target = resolve_vault_relative_path(self.vault.root, configured)
+        runtime = self.vault.read_state("integration-state").get(
+            "integrations", {}
+        ).get("obsidian", {})
+        _refuse_relocated_obsidian_target(configured, target, runtime)
         if target != self.vault.root and self.vault.root in target.parents:
             raise ValidationError(
                 "Obsidian target cannot be nested inside the source vault"
             )
+        # Only now, once the destination is a property of the vault rather than
+        # of the caller's shell. This creates directories, so a cwd-resolved
+        # relative path did not merely read the wrong place -- it built a whole
+        # Obsidian vault, `.obsidian/app.json` and all, wherever the process
+        # happened to start. `bk schedule` emits cron lines and cron runs from
+        # `$HOME`. The nesting guard above was checking that same wrong path,
+        # so it was answering about a location nobody had named either.
         target.mkdir(parents=True, exist_ok=True)
         obsidian_dir = target / ".obsidian"
         obsidian_dir.mkdir(exist_ok=True)
@@ -366,9 +391,6 @@ class NativeIntegrations:
             json.dumps(graph, ensure_ascii=False, indent=2) + "\n",
         )
         managed.add("graph/graph.json")
-        runtime = self.vault.read_state("integration-state").get(
-            "integrations", {}
-        ).get("obsidian", {})
         for relative in runtime.get("managed_files", []):
             if relative in managed:
                 continue
@@ -646,7 +668,9 @@ class NativeIntegrations:
         try:
             _docker(arguments, environment=docker_environment)
         except ValidationError as exc:
-            raise ValidationError(
+            # `type(exc)`, not `ValidationError`: adding context must not change
+            # the remedy. See `_start_managed_container` for why.
+            raise type(exc)(
                 "Managed database container could not be created",
                 details={
                     "integration": name,
@@ -752,6 +776,63 @@ class NativeIntegrations:
                     details={"pid": pid},
                 )
         return {"integration": "web", "state": "stopped", "pid": pid}
+
+
+def _refuse_relocated_obsidian_target(
+    configured: str, target: Path, runtime: dict[str, Any]
+) -> None:
+    """Refuse to sync when the mirror this vault owns is somewhere else.
+
+    A relative destination used to resolve against the process's current
+    directory, so an operator who always ran `bk integration sync` from the
+    same place had a configuration that worked by coincidence. Repointing it
+    silently would orphan a real Obsidian vault -- the notes stay on disk,
+    Obsidian keeps opening them, and every later sync updates a second copy
+    nobody is reading. That is worse than the ambiguity being removed, so the
+    upgrade note is delivered to the one person it concerns, the way a missing
+    `sources` entry names `found_at_cwd` rather than repointing itself.
+
+    The manifest answers this exactly. Each successful sync records the
+    directory it wrote, so `synced_at` is where the bytes actually are --
+    unlike a probe of today's current directory, which only answers where they
+    *would* have gone if the operator were standing where they are standing
+    now, which is the very ambiguity this refusal exists to end.
+
+    Three cases pass through untouched, and each has to:
+
+    - **An absolute destination** was never ambiguous, so a deliberate move
+      from one absolute path to another is a reconfiguration, not a relocation.
+    - **A first sync** has orphaned nothing; there is no mirror to lose.
+    - **A mirror already inside the new target** is the operator whose relative
+      path was unambiguous all along, because they only ever synced from the
+      vault. They must see no change at all. A changed `subdirectory` lands
+      here too, which is right: that moves the mirror within a destination the
+      operator still names.
+    """
+
+    recorded = str(runtime.get("path") or "")
+    if not recorded or Path(configured).is_absolute():
+        return
+    previous = Path(recorded)
+    if previous == target or target in previous.parents:
+        return
+    raise NotConfiguredError(
+        "Obsidian destination is relative, and this vault is already mirrored "
+        "somewhere else",
+        details={
+            "integration": "obsidian",
+            "path": configured,
+            "resolved": str(target),
+            "synced_at": recorded,
+            "hint": (
+                "A relative destination is now resolved against the vault, "
+                "not against the current directory. Set path to an absolute "
+                "directory: the one holding the existing mirror at "
+                f"{recorded}, to keep it — or {target}, to adopt the new "
+                "location and remove the old mirror yourself."
+            ),
+        },
+    )
 
 
 def _integration_name(value: str | None) -> str:
@@ -1303,7 +1384,16 @@ def _start_managed_container(
     try:
         _docker(["start", container])
     except ValidationError as exc:
-        raise ValidationError(
+        # `type(exc)`, not `ValidationError`. This clause exists only to attach
+        # context -- which container, which ports -- and adding context must not
+        # change what the caller is being told to do. Naming `ValidationError`
+        # here re-raised `_docker`'s `not_configured` as `validation_error`,
+        # because the sharper classes subclass it: the same stopped Docker
+        # daemon said "tell the operator" when `_docker` was called directly and
+        # "fix your request and send it again" through `bk integration up`.
+        # Rebuilding the class from the caught instance keeps the remedy the
+        # decision of whoever diagnosed the failure.
+        raise type(exc)(
             "Managed database container could not be started",
             details={
                 "integration": name,

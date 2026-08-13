@@ -17,7 +17,7 @@ from typing import Any
 
 from brainskit.application.filing import Filing
 from brainskit.application.freshness import _freshness_summary
-from brainskit.application.health import Health
+from brainskit.application.health import Health, enforcement_ok
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
 from brainskit.application.privacy import (
@@ -29,6 +29,34 @@ from brainskit.application.privacy import (
 )
 from brainskit.application.projections import Projections
 from brainskit.domain.model import NotFoundError, PolicyError, ValidationError
+
+
+def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
+    """The enforcement report with the machine-specific fields dropped.
+
+    Enforcement is not evidence, so the consumer filter has nothing to say about
+    it: a hook is installed or it is not, identically for whoever asks, and this
+    surface already reports `vault` and `index` on the same footing. What is
+    withheld here is withheld for minimality rather than for privacy. `detail`
+    interpolates the workspace root and the redirected hooks directory, and
+    `script` is an absolute path added for `bk doctor`, which opens the file;
+    the viewer only has to name the layer that is off. A hook path names a local
+    filesystem layout, and there is no reason to spend that on a caller with no
+    use for it.
+    """
+
+    return {
+        "gated": enforcement.get("gated", False),
+        "inactive": list(enforcement.get("inactive", [])),
+        "layers": [
+            {
+                key: layer[key]
+                for key in ("layer", "mechanism", "active", "advisory")
+                if key in layer
+            }
+            for layer in enforcement.get("layers", [])
+        ],
+    }
 
 
 class Reader:
@@ -89,6 +117,7 @@ class Reader:
             },
         }
         index_state = self.index.stats()
+        enforcement = _reportable_enforcement(self.health.enforcement())
         return {
             "vault": str(self.vault.root),
             "sources": len(visible_records),
@@ -102,9 +131,26 @@ class Reader:
                 "documents": len(visible_records) + len(visible_pages),
             },
             "freshness": _freshness_summary(filtered_freshness),
+            "enforcement": enforcement,
+            # The same two inputs `Health.status` weighs, and for the same
+            # reason: this feeds `/api/status`, which the viewer renders as
+            # "healthy" or "needs attention". Computed from lint alone, it told
+            # an operator the vault was healthy while the write gate protecting
+            # it was off -- the divergence `bk status` was fixed for, one layer
+            # up, on the surface with no enforcement rows underneath to
+            # contradict it.
+            #
+            # The lint half stays consumer-scoped while the enforcement half
+            # does not, and the asymmetry is the point. Findings are evidence:
+            # letting one on a redacted page flip this would let restricted
+            # content decide a filtered consumer's answer, and `lint_errors`
+            # below would then read 0 beside it. Enforcement is not evidence --
+            # it describes the installation, which is the same for every
+            # consumer asking.
             "healthy": not any(
                 finding["severity"] == "error" for finding in visible_findings
-            ),
+            )
+            and enforcement_ok(enforcement),
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in visible_findings
             ),

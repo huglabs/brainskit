@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
+from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -21,6 +22,11 @@ from brainskit.domain.model import (
 )
 
 SUPPORTED_PROVIDERS = {"anthropic", "openai", "openrouter", "ollama"}
+
+#: Attempts `_post_json` makes before giving up on a retryable failure. Named
+#: because the refusals quote it: "rate limited on all 3 attempts" is what
+#: tells an operator that waiting a moment longer is not the missing step.
+_HTTP_ATTEMPTS = 3
 
 #: Request options sent to Ollama unless `providers.ollama.options` overrides
 #: them. Ollama defaults `num_ctx` to 4096 regardless of what the model
@@ -198,11 +204,15 @@ class OpenAICompatibleDriver:
         api_key: str,
         extra_headers: dict[str, str] | None = None,
         timeout: float = 120,
+        provider: str = "",
+        api_key_env: str = "",
     ):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key
         self.extra_headers = extra_headers or {}
         self.timeout = timeout
+        self.provider = provider
+        self.api_key_env = api_key_env
 
     def complete(
         self, prompt: str, *, model: str, output_schema: dict[str, Any] | None
@@ -231,7 +241,17 @@ class OpenAICompatibleDriver:
             "Content-Type": "application/json",
             **self.extra_headers,
         }
-        response = _post_json(self.url, payload, headers, self.timeout)
+        response = _post_json(
+            self.url,
+            payload,
+            headers,
+            self.timeout,
+            context=ProviderContext(
+                provider=self.provider,
+                api_key_env=self.api_key_env,
+                model=model,
+            ),
+        )
         try:
             return str(response["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:
@@ -255,11 +275,13 @@ class AnthropicDriver:
         api_key: str,
         timeout: float = 120,
         max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
+        api_key_env: str = "",
     ):
         self.url = base_url.rstrip("/") + "/messages"
         self.api_key = api_key
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.api_key_env = api_key_env
 
     def complete(
         self, prompt: str, *, model: str, output_schema: dict[str, Any] | None
@@ -300,6 +322,11 @@ class AnthropicDriver:
                 "content-type": "application/json",
             },
             self.timeout,
+            context=ProviderContext(
+                provider="anthropic",
+                api_key_env=self.api_key_env,
+                model=str(payload.get("model", "")),
+            ),
         )
 
     def _text(self, response: dict[str, Any]) -> str:
@@ -370,7 +397,11 @@ class OllamaDriver:
         if output_schema:
             payload["format"] = output_schema
         response = _post_json(
-            self.url, payload, {"Content-Type": "application/json"}, self.timeout
+            self.url,
+            payload,
+            {"Content-Type": "application/json"},
+            self.timeout,
+            context=ProviderContext(provider="ollama", model=model),
         )
         try:
             return str(response["message"]["content"])
@@ -511,6 +542,7 @@ def _create_driver(name: str, config: dict[str, Any]) -> ProviderDriver:
             max_tokens=_positive_int(
                 config, "max_tokens", DEFAULT_ANTHROPIC_MAX_TOKENS, provider=name
             ),
+            api_key_env=api_key_env,
         )
     return OpenAICompatibleDriver(
         base_url=_required(config, "base_url", provider=name),
@@ -520,6 +552,8 @@ def _create_driver(name: str, config: dict[str, Any]) -> ProviderDriver:
             for key, value in config.get("headers", {}).items()
         },
         timeout=timeout,
+        provider=name,
+        api_key_env=api_key_env,
     )
 
 
@@ -568,8 +602,116 @@ def _required(config: dict[str, Any], field: str, *, provider: str) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class ProviderContext:
+    """What an HTTP failure needs in order to name its own next step.
+
+    `_post_json` sees a URL and a status code; an operator reading a 401 needs
+    to hear *which* environment variable holds the rejected key, and one
+    reading a 404 needs the model id the config routed the job to. Every field
+    is optional so a driver built without it still works and simply reports
+    less.
+    """
+
+    provider: str = ""
+    api_key_env: str = ""
+    model: str = ""
+
+
+def _http_failure(
+    status: int, body: str, context: ProviderContext
+) -> ValidationError:
+    """Code an HTTP failure by what the caller has to do differently.
+
+    Every status used to be `validation_error` -- *"the request itself is wrong,
+    fix it and send it again"* -- which is true of a 400 and false of every
+    other status a provider returns. Twenty lines below, the `URLError` arm of
+    the same `try` already made the argument this function generalises: an agent
+    told to fix a well-formed request will rewrite it forever against a provider
+    that is refusing its credentials, has retired its model, or is simply down.
+
+    The split is one question: **is the failure about the bytes the caller
+    sent?** A 400 says yes and stays `validation_error`. Credentials (401),
+    entitlement (403), an identifier the provider does not know (404), an
+    exhausted quota (429) and a provider erroring out (5xx) all say no, and are
+    `not_configured` -- "stop retrying and tell the operator" -- because none of
+    them is cleared by any request an agent can construct.
+
+    Anything unlisted keeps `validation_error`. The default is deliberately the
+    status quo, so a status nobody has reasoned about never changes meaning as
+    a side effect of this table.
+    """
+
+    details: dict[str, Any] = {"status": status, "response": body}
+    if context.provider:
+        details["provider"] = context.provider
+    if context.model:
+        details["model"] = context.model
+    key_env = context.api_key_env or "the provider's api_key_env"
+
+    if status == 401:
+        details["api_key_env"] = context.api_key_env
+        details["hint"] = (
+            f"The provider rejected the credential, not the request. Set a "
+            f"valid key in {key_env} and run the job again; no change to the "
+            f"request will clear this."
+        )
+        return NotConfiguredError("Provider rejected the API key", details=details)
+
+    if status == 403:
+        details["api_key_env"] = context.api_key_env
+        details["hint"] = (
+            f"The key in {key_env} authenticated but is not permitted to use "
+            f"this model or endpoint. Check the account's entitlements, "
+            f"billing and region -- rewriting the request will not clear this."
+        )
+        return NotConfiguredError(
+            "Provider refused this key's access", details=details
+        )
+
+    if status == 404:
+        details["hint"] = (
+            f"The provider does not know this endpoint or model id. Check "
+            f"job_models in .brain/config.json (routed to "
+            f"{context.model or 'an unnamed model'}) and the provider's "
+            f"base_url; model ids are retired without notice."
+        )
+        return NotConfiguredError(
+            "Provider does not recognise the model or endpoint", details=details
+        )
+
+    if status == 429:
+        details["hint"] = (
+            f"Rate limited on all {_HTTP_ATTEMPTS} attempts, honouring "
+            f"Retry-After. Wait for the quota window to reset, raise the "
+            f"quota, or route this job to another model in job_models."
+        )
+        return NotConfiguredError(
+            "Provider rate limit outlasted the retries", details=details
+        )
+
+    if status >= 500:
+        details["hint"] = (
+            f"The provider accepted the request and failed to answer it on all "
+            f"{_HTTP_ATTEMPTS} attempts. Retry later or route this job to "
+            f"another provider in job_models; the request body is not the cause."
+        )
+        return NotConfiguredError("Provider failed to answer", details=details)
+
+    details["hint"] = (
+        "The provider judged the request itself invalid; the response above "
+        "says why. Fix the request and send it again."
+    )
+    return ValidationError("Provider rejected the request", details=details)
+
+
 def _post_json(
-    url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float,
+    *,
+    context: ProviderContext | None = None,
 ) -> dict[str, Any]:
     # `base_url` is operator configuration, and urlopen honours `file:` and
     # `data:` as readily as `https:`. A judgment job must reach a provider or
@@ -580,9 +722,10 @@ def _post_json(
             "Provider base_url must be an http(s) URL",
             details={"scheme": scheme or "(none)"},
         )
+    resolved = context or ProviderContext()
     raw = b""
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(_HTTP_ATTEMPTS):
         request = urllib.request.Request(  # noqa: S310 - scheme checked above
             url,
             data=json.dumps(payload).encode("utf-8"),
@@ -598,13 +741,10 @@ def _post_json(
             break
         except urllib.error.HTTPError as exc:
             body = exc.read(2_000).decode("utf-8", errors="replace")
-            last_error = ValidationError(
-                "Provider request failed",
-                details={"status": exc.code, "response": body},
-            )
+            last_error = _http_failure(exc.code, body, resolved)
             if exc.code != 429 and exc.code < 500:
                 raise last_error from exc
-            if attempt == 2:
+            if attempt == _HTTP_ATTEMPTS - 1:
                 raise last_error from exc
             retry_after = exc.headers.get("Retry-After")
             delay = (
@@ -619,9 +759,18 @@ def _post_json(
             # send it again" will rewrite a well-formed body forever against a
             # provider that is simply not running.
             last_error = NotConfiguredError(
-                "Provider is unreachable", details={"reason": str(exc.reason)}
+                "Provider is unreachable",
+                details={
+                    "reason": str(exc.reason),
+                    "provider": resolved.provider,
+                    "hint": (
+                        f"Nothing answered on {_HTTP_ATTEMPTS} attempts. Check "
+                        f"that the provider is running and that its base_url in "
+                        f".brain/config.json points at it."
+                    ),
+                },
             )
-            if attempt == 2:
+            if attempt == _HTTP_ATTEMPTS - 1:
                 raise last_error from exc
             time.sleep(float(2**attempt))
     if last_error:

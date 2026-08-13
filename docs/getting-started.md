@@ -107,7 +107,7 @@ my-vault/
 ├── graph/                   generated graph.json
 ├── output/                  digests/, reports/, answers/
 └── .brain/                  policy and durable state
-    ├── config.json          branches, providers, ignore, integrations (no secrets)
+    ├── config.json          branches, providers, sources, ignore, integrations (no secrets)
     ├── schema.json          human-owned page schema, enforced by apply/lint
     ├── registry.json        source hash → path and status
     ├── freshness.json       applied page hashes and lifecycle state
@@ -116,6 +116,25 @@ my-vault/
     ├── integration-state.json   PIDs, containers, sync checkpoints
     └── index.db             disposable FTS5 index (git-ignored)
 ```
+
+A path written into `.brain/config.json` is resolved **against the vault**,
+never against the directory you happen to run `bk` from — `sources`, the
+Obsidian integration's `path` and `code_root` all follow the same rule. It is
+what lets a vault be moved without rewriting its policy, and it is what makes
+the scheduled path work at all: `bk schedule` hands you a cron expression and a
+command to register, and cron runs jobs from `$HOME`, so a value resolved
+against the current directory would mean a different folder on every run. A
+`bk watch` whose configured sources have all gone missing now refuses, naming
+where each one resolved, rather than reporting a successful run that captured
+nothing.
+
+`~` is expanded, and `sources` and the Obsidian `path` take an absolute value
+exactly as written — watching `~/Downloads` and mirroring to
+`~/Obsidian/MyVault` are ordinary things to want. `code_root` deliberately
+parts company here and **refuses** an absolute path: the tree a vault documents
+is part of the repository the vault sits in, not an arbitrary directory
+elsewhere on the machine. Every `sources` entry must be a non-empty string;
+anything else is refused when the policy is read, naming the entry at fault.
 
 `.brain/schema.json` is yours to edit. Everything else under `.brain/` is engine
 state: change it by running a command, not with a text editor.
@@ -128,3 +147,4 @@ Next: the [command reference](./commands.md), or
 ---
 <!-- doc-tracking -->
 - Created: 2026-08-12 14:47
+- Updated: 2026-08-13 15:41

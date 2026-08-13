@@ -488,6 +488,213 @@ class StaleHookReplacementTest(VaultCase):
         self.assertEqual(self.settings_path().read_bytes(), before)
 
 
+class PreRenameInstallMigrationTest(VaultCase):
+    """A rename has to migrate an install, not duplicate it.
+
+    `_prune_stale_hook_entries` and the instruction-block writer both keyed on
+    the *current* name, so artefacts of a former one were invisible to them.
+    Reproduced on a workspace carrying only pre-rename artefacts: `--force`
+    pruned nothing, the old gate stayed registered beside the new one, both
+    scripts stayed on disk, and the instruction file ended with two managed
+    blocks. That is the state every install predating the rename upgrades into.
+    """
+
+    LEGACY = cli.LEGACY_BRANDS[0]
+
+    def legacy_name(self, template: str) -> str:
+        return template.replace(cli.BRAND, self.LEGACY)
+
+    def legacy_script(self, template: str) -> Path:
+        return self.root / ".claude" / "hooks" / f"{self.legacy_name(template)}.sh"
+
+    def seed_pre_rename_install(self, *, sentinel: bool = True) -> None:
+        """A workspace as an install under the former name left it.
+
+        The scripts carry that brand's generated sentinel, because that is what
+        an unedited pre-rename install actually has on disk and it is the only
+        thing distinguishing its files from the operator's.
+        """
+
+        hooks = self.root / ".claude" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        mark = cli.HOOK_SENTINEL.replace(cli.BRAND, self.LEGACY)
+        entries: dict[str, list[Any]] = {"PreToolUse": [], "SessionStart": []}
+        for hook in cli.CLAUDE_HOOKS:
+            path = self.legacy_script(hook.template)
+            body = f"#!/bin/sh\n{mark} - old\nexit 0\n" if sentinel else "#!/bin/sh\nexit 0\n"
+            path.write_text(body, encoding="utf-8")
+            path.chmod(0o755)
+            entry: dict[str, Any] = {}
+            if hook.matcher:
+                entry["matcher"] = hook.matcher
+            entry["hooks"] = [{"type": "command", "command": str(path), "timeout": 10}]
+            entries[hook.event].append(entry)
+        self.settings_path().write_text(
+            json.dumps({"hooks": entries}, indent=2), encoding="utf-8"
+        )
+        (self.root / "CLAUDE.md").write_text(
+            "keep above\n\n"
+            f"{cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY)}\n"
+            "old contract\n"
+            f"{cli.INSTRUCTION_END.replace(cli.BRAND, self.LEGACY)}\n\n"
+            "keep below\n",
+            encoding="utf-8",
+        )
+
+    def instructions(self) -> str:
+        return (self.root / "CLAUDE.md").read_text(encoding="utf-8")
+
+    # settings.json -----------------------------------------------------------
+
+    def test_a_former_brands_hook_is_replaced_not_run_alongside(self) -> None:
+        self.seed_pre_rename_install()
+        self.install()
+        self.assertEqual(self.commands("PreToolUse"), [str(self.script("brainskit-gate"))])
+        self.assertEqual(
+            self.commands("SessionStart"), [str(self.script("brainskit-status"))]
+        )
+
+    def test_the_migration_needs_no_force(self) -> None:
+        """`--force` decides whether to clobber an install that is *currently*
+        the right one. Finishing a rename this tool performed is not that
+        question, and gating it would leave the documented no-flag upgrade
+        silently running two gates."""
+
+        self.seed_pre_rename_install()
+        self.install(force=False)
+        self.assertEqual(self.commands("PreToolUse"), [str(self.script("brainskit-gate"))])
+        self.assertFalse(self.legacy_script("brainskit-gate").exists())
+        self.assertEqual(1, self.instructions().count(cli.INSTRUCTION_START))
+
+    # the instruction file ----------------------------------------------------
+
+    def test_the_instruction_file_ends_with_exactly_one_managed_block(self) -> None:
+        self.seed_pre_rename_install()
+        self.install()
+        text = self.instructions()
+        self.assertEqual(1, text.count(cli.INSTRUCTION_START))
+        self.assertNotIn(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY), text)
+
+    def test_the_block_keeps_the_position_the_former_one_held(self) -> None:
+        """Appending would move the contract below whatever the operator wrote
+        after it, which is a change they never asked for."""
+
+        self.seed_pre_rename_install()
+        self.install()
+        text = self.instructions()
+        self.assertLess(text.index("keep above"), text.index(cli.INSTRUCTION_START))
+        self.assertLess(text.index(cli.INSTRUCTION_START), text.index("keep below"))
+
+    def test_a_current_block_beside_a_former_one_keeps_only_the_current(self) -> None:
+        """This repository's own state: both blocks present at once."""
+
+        self.seed_pre_rename_install()
+        (self.root / "CLAUDE.md").write_text(
+            self.instructions()
+            + f"\n{cli.INSTRUCTION_START}\ncurrent\n{cli.INSTRUCTION_END}\n",
+            encoding="utf-8",
+        )
+        before = self.instructions()
+        self.assertEqual(1, before.count(cli.INSTRUCTION_START))
+        self.assertEqual(
+            1, before.count(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY))
+        )
+        self.install()
+        text = self.instructions()
+        self.assertEqual(1, text.count(cli.INSTRUCTION_START))
+        self.assertNotIn(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY), text)
+
+    # scripts on disk ---------------------------------------------------------
+
+    def test_an_unedited_former_script_is_removed(self) -> None:
+        self.seed_pre_rename_install()
+        outcome = self.install()["claude_hook"]["legacy"]
+        for hook in cli.CLAUDE_HOOKS:
+            with self.subTest(hook=hook.template):
+                self.assertFalse(self.legacy_script(hook.template).exists())
+        self.assertEqual({"removed"}, {item["state"] for item in outcome})
+
+    def test_an_edited_former_script_is_unregistered_but_never_deleted(self) -> None:
+        """Dropping a settings entry is reversible by reinstalling. Deleting a
+        file the operator edited is not, and nothing here proves it was ours."""
+
+        self.seed_pre_rename_install(sentinel=False)
+        outcome = self.install()["claude_hook"]["legacy"]
+        for hook in cli.CLAUDE_HOOKS:
+            with self.subTest(hook=hook.template):
+                self.assertTrue(self.legacy_script(hook.template).is_file())
+        self.assertEqual({"kept"}, {item["state"] for item in outcome})
+        self.assertTrue(all(item["reason"] for item in outcome))
+        self.assertEqual(self.commands("PreToolUse"), [str(self.script("brainskit-gate"))])
+
+    def test_a_former_script_survives_when_its_replacement_was_not_installed(
+        self,
+    ) -> None:
+        """Its registration survives too, so deleting the file would turn inert
+        debris into a command pointing at nothing."""
+
+        self.seed_pre_rename_install()
+        target = self.script("brainskit-gate")
+        target.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
+        self.install()
+        self.assertTrue(self.legacy_script("brainskit-gate").is_file())
+        self.assertFalse(self.legacy_script("brainskit-status").exists())
+
+    # the skill ---------------------------------------------------------------
+
+    def test_a_former_skill_directory_is_reported_and_left_alone(self) -> None:
+        """A hook proves it is ours with the generated sentinel; a skill is plain
+        markdown with no such mark, and it is read rather than executed."""
+
+        legacy = self.root / ".claude" / "skills" / self.LEGACY
+        legacy.mkdir(parents=True)
+        (legacy / "SKILL.md").write_text("mine\n", encoding="utf-8")
+        outcome = self.install()["skill"]
+        self.assertEqual([str(legacy)], outcome["legacy"])
+        self.assertTrue((legacy / "SKILL.md").is_file())
+
+    # reporting ---------------------------------------------------------------
+
+    def test_the_whole_migration_is_announced_on_stderr(self) -> None:
+        self.seed_pre_rename_install()
+        (self.root / ".claude" / "skills" / self.LEGACY).mkdir(parents=True)
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            cli._install_hooks(self.service, "claude", skip_code_build=True)
+        warning = buffer.getvalue()
+        self.assertIn("RENAME", warning)
+        self.assertIn(str(self.legacy_script("brainskit-gate")), warning)
+        self.assertIn(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY), warning)
+        self.assertIn(str(self.root / ".claude" / "skills" / self.LEGACY), warning)
+
+    # controls ----------------------------------------------------------------
+
+    def test_a_clean_install_reports_no_migration_at_all(self) -> None:
+        """Control: nothing here may fire on a workspace with no former brand."""
+
+        buffer = StringIO()
+        with redirect_stderr(buffer):
+            result = cli._install_hooks(self.service, "claude", skip_code_build=True)
+        self.assertNotIn("RENAME", buffer.getvalue())
+        self.assertNotIn("legacy", result["claude_hook"])
+        self.assertNotIn("legacy", result["skill"])
+        self.assertNotIn("migrated", result["instructions"])
+
+    def test_the_brand_the_migration_keys_on_is_the_one_in_use(self) -> None:
+        """One list of former names covers hooks, sentinels, blocks and skills
+        only while every artefact spells the brand identically. If a rename ever
+        breaks that, this fails instead of the migration silently doing nothing.
+        """
+
+        self.assertIn(cli.BRAND, cli.INSTRUCTION_START)
+        self.assertIn(cli.BRAND, cli.INSTRUCTION_END)
+        self.assertIn(cli.BRAND, cli.HOOK_SENTINEL)
+        for hook in cli.CLAUDE_HOOKS:
+            with self.subTest(hook=hook.template):
+                self.assertTrue(hook.template.startswith(f"{cli.BRAND}-"))
+        self.assertNotIn(cli.BRAND, cli.LEGACY_BRANDS)
+
+
 class EnforcementReportTest(VaultCase):
     """Every layer that is off has to say so; a quiet skip is how one disappears."""
 
@@ -1132,6 +1339,73 @@ class DoctorGateProbeTest(ShellHookCase):
             for path in self.root.parent.rglob("*brainskit-doctor-probe*")
         ]
         self.assertEqual(stray, [])
+
+
+class DoctorHeadlineSaysWhyTest(unittest.TestCase):
+    """`bk doctor`'s headline has to mean what its `healthy` means.
+
+    Twin of the `bk status` headline: `healthy` is "every grammar present *and*
+    the gate probe landed on a state an installation can have", but the headline
+    restated only the grammar half. A machine with every grammar installed and a
+    gate failing open printed `0 language(s) cannot be parsed` under a red cross
+    -- on the very run whose purpose is to exercise that gate.
+    """
+
+    def headline(self, **over: Any) -> str:
+        value: dict[str, Any] = {
+            "vault": "/tmp/v",
+            "environment": {"label": "uv tool"},
+            "code": {
+                "grammars_known": 5,
+                "grammars_installed": 5,
+                "grammars_missing": [],
+            },
+            "enforcement": {"write_gate_probe": {"state": "enforcing"}},
+            "healthy": False,
+        }
+        value.update(over)
+        return cli._doctor_headline(value)
+
+    def probe(self, state: str) -> dict[str, Any]:
+        return {"enforcement": {"write_gate_probe": {"state": state}}}
+
+    def test_a_complete_installation_says_so(self) -> None:
+        """Control: the headline must still be reachable."""
+
+        self.assertEqual("installation complete", self.headline(healthy=True))
+
+    def test_a_gate_that_fails_open_is_named_instead_of_a_zero(self) -> None:
+        headline = self.headline(**self.probe("not_enforcing"))
+        self.assertIn("not_enforcing", headline)
+        self.assertNotIn("0 language(s)", headline)
+
+    def test_a_gate_that_blocks_everything_is_named_too(self) -> None:
+        """Over-blocking is a fault in the other direction, and just as quiet."""
+
+        self.assertIn("over_blocking", self.headline(**self.probe("over_blocking")))
+
+    def test_missing_grammars_are_still_counted(self) -> None:
+        """Control: the case the old headline got right must keep working."""
+
+        self.assertEqual(
+            "2 language(s) cannot be parsed",
+            self.headline(
+                code={
+                    "grammars_missing": ["go", "rust"],
+                    "grammars_known": 5,
+                    "grammars_installed": 3,
+                }
+            ),
+        )
+
+    def test_an_absent_gate_is_not_a_fault(self) -> None:
+        """A vault with no agent installed is a choice, not a broken machine --
+        the same allowlist `_doctor` builds `healthy` from."""
+
+        self.assertNotIn("write gate", self.headline(**self.probe("absent")))
+
+    def test_an_unrecognised_reason_points_at_the_sections(self) -> None:
+        self.assertIn("see the sections below", self.headline())
 
 
 class StatusScriptTest(ShellHookCase):

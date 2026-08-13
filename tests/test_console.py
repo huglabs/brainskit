@@ -304,5 +304,47 @@ class IndentTests(unittest.TestCase):
         self.assertEqual("  a\n\n  b", console.indent("a\n\nb"))
 
 
+class StateTagTests(unittest.TestCase):
+    """A projection state has to *look* like what it means.
+
+    `state_tag` knew three words. `malformed` and `partial` were added to the
+    projection reports without it, so both rendered in the same muted grey as
+    `missing` -- the one state that is genuinely fine -- and a broken artefact
+    read as a quiet, healthy one.
+    """
+
+    def test_fresh_is_the_only_green_state(self) -> None:
+        self.assertIn(console.OK, console.state_tag("fresh", stream=TTY))
+
+    def test_missing_stays_muted_because_it_is_healthy(self) -> None:
+        """Control: a vault that has not generated yet needs nothing done."""
+
+        self.assertIn(console.MUTED, console.state_tag("missing", stream=TTY))
+
+    def test_malformed_reads_as_an_error(self) -> None:
+        tagged = console.state_tag("malformed", stream=TTY)
+        self.assertIn(console.ERR, tagged)
+        self.assertNotIn(console.MUTED, tagged)
+
+    def test_partial_reads_as_a_warning(self) -> None:
+        tagged = console.state_tag("partial", stream=TTY)
+        self.assertIn(console.WARN, tagged)
+        self.assertNotIn(console.MUTED, tagged)
+
+    def test_an_unknown_state_is_never_drawn_quietly(self) -> None:
+        """The fallback is the whole bug: a denylist with a calm default.
+
+        Whatever the next state added is, it must not arrive looking like
+        `missing` before anyone remembers to map it.
+        """
+
+        self.assertNotIn(console.MUTED, console.state_tag("?", stream=TTY))
+
+    def test_the_word_itself_survives_off_a_terminal(self) -> None:
+        for state in ("fresh", "stale", "partial", "malformed", "missing"):
+            with self.subTest(state=state):
+                self.assertEqual(state, console.state_tag(state, stream=PIPE))
+
+
 if __name__ == "__main__":
     unittest.main()

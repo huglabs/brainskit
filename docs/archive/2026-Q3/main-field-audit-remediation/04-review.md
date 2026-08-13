@@ -64,7 +64,7 @@ the track that found it.
 | R1 | `SECURITY.md`'s only sanctioned reporting channel does not exist | open |
 | R4 | The PyPI-visibility guard matches the version as a substring | open |
 | R5 | Publishing is unattended — no required reviewers on `environments/pypi` | open |
-| R7 | The workflow comment's premise is not what the run logs show | see below |
+| R7 | Withdrawn — the finding quoted a sentence `release.yml` does not contain | see below |
 | — | 14 production behaviours neutralised with the full suite still green | open |
 | — | `health.py:563-587` reports `fresh` for a `graph/graph.json` that is not JSON | open |
 
@@ -210,13 +210,20 @@ digests == in-toto attestation subjects == GitHub Release assets.
   and the sdist landed. **Not fixed.**
 - **R5 —** publishing is unattended: `environments/pypi` has no required
   reviewers, and any `v*` tag push publishes. **Not fixed.**
-- **R7 — record this one carefully.** The workflow comment at
-  `release.yml:92-95` says a release "reported Success while publishing
-  nothing". The complete run history is four runs — `v0.5.0` × 3 failure,
-  `v0.6.0` success — and none has that shape. The guard added in response is
-  good hardening and should stay; the *premise* is not what the logs show.
-  `implementation-log.md` §2.11 already records the spike as resolved on exactly
-  this point, so the stale claim is the comment, not the investigation.
+- **R7 — withdrawn.** This finding was raised in error: the reviewing agent
+  quoted a sentence — a release "reported Success while publishing nothing" —
+  that appears in no revision of `release.yml`, then refuted the claim it had
+  just attributed. `git log -S "reported Success while publishing nothing" --
+  .github/workflows/release.yml` returns no results, in this or any commit.
+  What the comment at `release.yml:91-98` actually says is narrower and true:
+  `v0.5.0` failed three times on `invalid-publisher` because PyPI had no
+  Trusted Publisher matching the workflow's OIDC claim, and the failure went
+  unnoticed for weeks, until the README's install line stopped working. That
+  matches the run history this review reported elsewhere: four runs, `v0.5.0`
+  × 3 failure, `v0.6.0` success. The guard the comment introduces is good
+  hardening, and its stated premise holds — there was nothing here to fix.
+  Caught by a later agent, who re-derived the finding against the file and
+  `git log -S` before carrying it into the roadmap.
 
 Dependabot queue: **four of the five red X's are a billing lock, not test
 failures** — those jobs ran for 2s with zero steps. Only #3 is genuinely green.
@@ -378,3 +385,4 @@ a **0.6.1** is what reaches users. `docs/product/roadmap/now.md` leads with it.
 ---
 <!-- doc-tracking -->
 - Created: 2026-08-13 13:12
+- Updated: 2026-08-13 15:54

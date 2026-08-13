@@ -23,8 +23,10 @@ from brainskit.application.codegraph import CODE_PROJECTION, CodeGraph
 from brainskit.application.freshness import (
     PROJECTION_ANCHORS,
     PROJECTION_COMMANDS,
+    PROJECTION_INTEGRITY,
     PROJECTION_LINT_CODES,
     PROJECTION_RAW_FIELDS,
+    REGENERATE_STATES,
     _age_in_days,
     _freshness_summary,
     _orphaned_freshness,
@@ -50,6 +52,42 @@ from brainskit.domain.model import (
 
 #: Where git reads hooks from when `core.hooksPath` says nothing.
 DEFAULT_GIT_HOOKS = Path(".git") / "hooks"
+
+#: Returned by `_artefact_fault` when the anchor could not be opened at all.
+#: Compared by identity, never by value, so it can never be confused with a real
+#: fault a detector reports.
+_ARTEFACT_ABSENT: dict[str, Any] = {"problem": "no artefact"}
+
+#: The two pages `bk init` writes before any apply has run, so they exist with
+#: no entry in the freshness ledger. `Vault.initialize` writes them from
+#: `_system_page` and nothing writes them again -- not `bk apply`, which only
+#: ever writes the pages a proposal names, and not `bk views`, which writes
+#: `views/`. They are named here rather than recognised by their `type: system`
+#: frontmatter because that field is written by whatever wrote the file: keying
+#: the exemption on it let any page opt itself out of `wiki.outside_apply`
+#: forever, which is the one thing an integrity check must not let its subject
+#: decide. `SeededSystemPageTest` builds a page with the real `_system_page` and
+#: asserts lint stays quiet, so this list cannot drift from what init writes.
+SEEDED_SYSTEM_PAGES: frozenset[str] = frozenset({"wiki/index.md", "wiki/log.md"})
+
+
+def _is_seeded_shape(body: str) -> bool:
+    """Whether a page body is still the heading `bk init` seeded and nothing else.
+
+    The seeded pages have no sources and no ledger entry, so there is no hash to
+    compare against and nothing to say what they looked like when they were
+    written. What can be checked is the shape init gives them -- a single
+    heading -- which holds across every version that has ever seeded them,
+    including the ones that spelled the title differently.
+
+    That makes this narrower than the hash comparison a tracked page gets: an
+    edit that replaced the heading with another heading would pass. It is the
+    strongest claim available without inventing state, and it catches the case
+    that actually happens, which is content appended below.
+    """
+
+    lines = [line for line in body.strip().splitlines() if line.strip()]
+    return len(lines) == 1 and lines[0].startswith("# ")
 
 
 def redirected_git_hooks_path(root: Path) -> Path | None:
@@ -104,6 +142,35 @@ def redirected_git_hooks_path(root: Path) -> Path | None:
     except OSError:
         same = hooks == default
     return None if same else hooks
+
+
+def enforcement_ok(enforcement: dict[str, Any]) -> bool:
+    """Whether every enforcement layer that actually stops a write is live.
+
+    An enforcement report's layers are not all the same kind. `write_gate`,
+    `session_status` and `commit_lint` are mechanisms that run and either let
+    a write through or refuse it; `instructions` (the CLAUDE.md managed block)
+    only tells an agent what the rules are and stops nothing by itself, which
+    is why `_enforcement_state` marks it `advisory: True`. A vault whose
+    CLAUDE.md block went stale is not unhealthy in the sense this predicate is
+    about; a vault whose write gate stopped running is -- so advisory layers
+    are read past rather than folded into the same `all(...)`, and failing the
+    headline on one would make it fire for something no mechanism was ever
+    going to catch.
+
+    Shared by `Health.status` (`bk status`) and `Reader.reader_status`
+    (`/api/status`) so both surfaces report the same headline for the same
+    installation, rather than each computing its own answer from a different
+    slice of the same report. `ReaderStatusMatchesCanonicalTest` in
+    `tests/test_fix_services.py` pins the two callers together by driving real
+    enforcement states through both and asserting they agree.
+    """
+
+    return all(
+        layer.get("active")
+        for layer in enforcement.get("layers", [])
+        if not layer.get("advisory")
+    )
 
 
 class Health:
@@ -176,18 +243,9 @@ class Health:
             # printed a green headline directly above three red enforcement
             # rows. A vault whose write gate is not running is not healthy just
             # because the pages it already has happen to lint; the headline sits
-            # above those rows and has to mean them too.
-            #
-            # Advisory layers (the CLAUDE.md block) are excluded deliberately:
-            # they inform, they do not enforce, and failing the headline on one
-            # would make it fire for something no mechanism was ever going to
-            # stop.
-            "healthy": lint_result["ok"]
-            and all(
-                layer.get("active")
-                for layer in enforcement.get("layers", [])
-                if not layer.get("advisory")
-            ),
+            # above those rows and has to mean them too. See `enforcement_ok`
+            # for why advisory layers are excluded from that half of the check.
+            "healthy": lint_result["ok"] and enforcement_ok(enforcement),
             "lint_errors": sum(
                 finding["severity"] == "error" for finding in lint_result["findings"]
             ),
@@ -278,16 +336,9 @@ class Health:
             text = self.vault.read_text(path)
             metadata, body = parse_frontmatter(text)
             freshness_entry = freshness.get("pages", {}).get(path)
-            is_system_page = metadata.get("type") == "system"
-            if not is_system_page and not isinstance(freshness_entry, dict):
-                findings.append(
-                    LintFinding(
-                        "wiki.outside_apply",
-                        "Wiki page is not tracked by the apply gate",
-                        path=path,
-                    )
-                )
-            elif isinstance(freshness_entry, dict):
+            if not isinstance(freshness_entry, dict):
+                findings.extend(self._untracked_page_findings(path, body))
+            else:
                 expected_hash = freshness_entry.get("content_hash")
                 wiki_observed_hash = self.vault.wiki_version(path)
                 if expected_hash and expected_hash != wiki_observed_hash:
@@ -382,15 +433,71 @@ class Health:
         for artifact, report in self._projection_report(freshness, records).items():
             if not report["stale"]:
                 continue
+            # `stale` now covers `malformed` too, and the two need different
+            # sentences: "built from a different set of wiki pages" is a lie
+            # about a file that is not JSON, and it sends a reader looking for a
+            # page that changed. The malformed report already carries the
+            # sentence that describes it, so the code takes it rather than
+            # restating it; the remedy is the same command either way.
+            reason = report.get("reason")
+            message = (
+                f"Derived {artifact} {reason}; run {PROJECTION_COMMANDS[artifact]}"
+                if isinstance(reason, str)
+                else f"Derived {artifact} was built from a different set of wiki "
+                f"pages; run {PROJECTION_COMMANDS[artifact]}"
+            )
             findings.append(
                 LintFinding(
                     PROJECTION_LINT_CODES[artifact],
-                    f"Derived {artifact} was built from a different set of wiki "
-                    f"pages; run {PROJECTION_COMMANDS[artifact]}",
+                    message,
                     severity="warning",
                 )
             )
         return findings
+
+    def _untracked_page_findings(self, path: str, body: str) -> list[LintFinding]:
+        """Report a `wiki/` page the freshness ledger has never heard of.
+
+        Every page under `wiki/` is one of three things, and only the first two
+        are legitimate: written by `bk apply`, which records a ledger entry;
+        seeded by `bk init`, which records nothing; or written by something else,
+        which is the bypass the write gate exists to stop.
+
+        The seeded pages used to be recognised by their `type: system`
+        frontmatter and skipped entirely. Both halves of that were wrong. Keying
+        on frontmatter meant the file being checked decided whether it would be
+        checked -- writing `type: "system"` into any path under `wiki/` bought
+        permanent silence -- and skipping meant the two pages `bk init` really
+        does write were never looked at either, so appending a fabricated claim
+        to `wiki/index.md` produced no finding at all while `bk gate check-write`
+        refused the same path. This is what the gate hook's header comment names
+        as the reason it may fail open, so it has to be true for every page the
+        gate covers, not for seven of nine.
+
+        A seeded page that later gains a ledger entry -- an apply naming
+        `wiki/index.md` in a proposal -- never reaches here: the caller's ledger
+        branch handles it, and the hash comparison there is strictly stronger.
+        So making these pages visible cannot make `bk apply` report findings
+        against its own output.
+        """
+
+        if path not in SEEDED_SYSTEM_PAGES:
+            return [
+                LintFinding(
+                    "wiki.outside_apply",
+                    "Wiki page is not tracked by the apply gate",
+                    path=path,
+                )
+            ]
+        if _is_seeded_shape(body):
+            return []
+        return [
+            LintFinding(
+                "wiki.outside_apply",
+                "Wiki page changed outside the apply gate",
+                path=path,
+            )
+        ]
 
     def _code_citation_findings(
         self, path: str, metadata: dict[str, Any], body: str
@@ -540,15 +647,43 @@ class Health:
     ) -> dict[str, Any]:
         """Compare every derived artefact against the inputs it was built from.
 
-        Three outcomes, and they are not the same thing:
+        Four outcomes, and they are not the same thing:
 
         - `missing` — the artefact is not on disk. Nothing derives from the
           vault yet, so nothing can be out of date. `bk graph` and `bk views`
           are on-demand, and a vault that never ran them is not in error.
-        - `stale` — the artefact exists but was built from different inputs, or
-          from an unrecorded set. A projection whose provenance is unknown is
-          treated as out of date rather than trusted.
+        - `malformed` — the artefact is on disk but is not the artefact. A
+          `graph/graph.json` that is not JSON, or whose nodes and edges cannot
+          be traversed; a `views/home.md` that no `bk views` wrote.
+        - `stale` — the artefact exists, is usable, and was built from different
+          inputs or from an unrecorded set. A projection whose provenance is
+          unknown is treated as out of date rather than trusted.
         - `fresh` — the recorded fingerprint matches the current inputs.
+
+        `malformed` exists because the other three answer a question the artefact
+        can pass while being worthless. The fingerprint lives in
+        `freshness.json`, so overwriting `graph/graph.json` with `{{{ not json
+        at all` left every input untouched and this reported `fresh` — the same
+        shape as a hook reported active from the existence of its file, and the
+        same fault `bk code status` was fixed for in 0.6.1. Freshness and
+        integrity are independent, so both are asked and integrity is asked
+        first: comparing the inputs of an artefact nothing can read answers
+        nothing whichever way it comes out.
+
+        The read costs no I/O the check was not already paying. Existence used
+        to be `wiki_version(anchor)`, which opens the file and hashes every byte
+        of it; this opens the same file once and looks at what it read.
+
+        `stale: True` on `malformed`, deliberately, and for the reason
+        `CodeGraph.staleness` gives: the boolean is what a caller too terse to
+        read `state` branches on, so the one answer it must never give for a
+        broken artefact is the reassuring one. It is set from an allowlist of
+        the states that mean "regenerate this", never from a denylist, so a
+        state added later cannot default into looking healthy.
+
+        Reported, never raised. `bk status` is the command you run when things
+        are already broken, so an unreadable or vanished artefact has to arrive
+        as a state.
 
         Each artefact is compared against its own inputs. A shared fingerprint
         would have to cover the union, so a change only one artefact renders
@@ -569,22 +704,60 @@ class Health:
             generated_at = entry.get("generated_at")
             if not isinstance(generated_at, str):
                 generated_at = None
-            if self.vault.wiki_version(anchor) is None:
+            detail: dict[str, Any] = {}
+            fault = self._artefact_fault(artifact, anchor)
+            if fault is _ARTEFACT_ABSENT:
                 state = "missing"
+            elif fault is not None:
+                state = "malformed"
+                detail = {
+                    **fault,
+                    # A fragment, not a sentence, and the same shape
+                    # `CodeGraph.staleness` reports: `lint` prefixes it with the
+                    # artefact it is about, and repeating the name there would
+                    # print it twice.
+                    "reason": (
+                        f"is not what {PROJECTION_COMMANDS[artifact]} writes, "
+                        "so it answers nothing"
+                    ),
+                    "command": PROJECTION_COMMANDS[artifact],
+                }
             elif entry.get("source_hash") != expected:
                 state = "stale"
             else:
                 state = "fresh"
             item: dict[str, Any] = {
                 "state": state,
-                "stale": state == "stale",
+                "stale": state in REGENERATE_STATES,
                 "generated_at": generated_at,
+                **detail,
             }
             age_days = _age_in_days(generated_at, now)
             if age_days is not None:
                 item["age_days"] = age_days
             report[artifact] = item
         return report
+
+    def _artefact_fault(self, artifact: str, anchor: str) -> dict[str, Any] | None:
+        """Open a projection's anchor and say what is wrong with it.
+
+        Three answers: `_ARTEFACT_ABSENT` for a file that is not there, a fault
+        dict for one that cannot be what the artefact is, and `None` for one
+        that can. A sentinel rather than a second return value because "absent"
+        is not a degree of "malformed" — one is a vault that has not generated
+        yet and is healthy, the other is a file to be replaced.
+
+        Every read failure is absence. A directory where the anchor should be,
+        a permission error, bytes that are not text: none of them is an artefact,
+        and the remedy for all of them is the one command that would have written
+        it. Nothing here may raise, so the guard is the broad one on purpose.
+        """
+
+        try:
+            text = self.vault.read_text(anchor)
+        except (OSError, ValueError):
+            return _ARTEFACT_ABSENT
+        return PROJECTION_INTEGRITY[artifact](text)
 
     def _record_projection(self, artifact: str) -> None:
         """Stamp a derived artefact with the inputs it was just built from.

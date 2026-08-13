@@ -28,6 +28,24 @@ Point `--path` at the brainskit vault itself for in-place Obsidian use. In that
 mode brainskit creates only the minimal `.obsidian/app.json` when absent and does
 not duplicate the knowledge files.
 
+**A relative `--path` is resolved against the vault, never against the directory
+you run from.** This is the rule `sources` and `code_root` already follow: where
+a vault mirrors itself to is a property of the vault, so it answers the same
+whether you type the command in the vault, in a sibling checkout, or from the
+`$HOME` that cron hands a scheduled job. Absolute paths — `~/Obsidian/MyVault`
+and the like — are the normal case and are used exactly as written.
+
+This matters more here than for a path that is only read: sync creates the
+destination. A relative path resolved against the current directory did not
+merely look in the wrong place, it built a whole Obsidian vault,
+`.obsidian/app.json` and all, wherever the process happened to start.
+
+If a relative destination was already synced somewhere else, sync refuses rather
+than quietly repointing — orphaning a real Obsidian vault would be worse than
+the ambiguity it replaces. The refusal names the existing mirror, and the remedy
+is to write an absolute path: the directory holding that mirror to keep it, or
+the new location to adopt it and remove the old one yourself.
+
 ## Neo4j
 
 Neo4j uses the official Python driver and writes `BrainskitNode` nodes plus
@@ -113,6 +131,28 @@ vault-local data directory, which is slow on macOS bind mounts, so the deadline
 is 300 seconds and can be raised per integration with
 `ready_timeout_seconds` in its stored options.
 
+### When `up` fails
+
+A managed integration that cannot start reports `not_configured`, not
+`validation_error`: Docker being absent, its daemon being stopped, or the
+container refusing to start are all facts about the machine, and no change to
+the command clears any of them. The refusal carries the daemon's own words in
+`details.response`, alongside the container name and the ports the policy asked
+for — `details.busy_ports` names any host port something else already answers
+on, which is the usual cause when Docker itself is healthy.
+
+```console
+$ bk --vault ./my-vault integration up postgres --json
+{"ok": false, "error": {"code": "not_configured",
+  "message": "Managed database container could not be created",
+  "details": {"integration": "postgres", "container": "brainskit-postgres-…",
+              "busy_ports": [], "reason": "Docker command failed",
+              "response": "Cannot connect to the Docker daemon …"}}}
+```
+
+The exit status is 2, the same as any other refusal; it is the `code` that says
+whether to retry, rewrite, or go fix something.
+
 ## Many vaults, one store
 
 `bk integration sync` syncs the one vault it was pointed at. When an operator
@@ -185,3 +225,8 @@ evidence unless `human` is named deliberately. Passing it to `--target
 obsidian`, `neo4j` or `postgres` is rejected rather than applied: those targets
 carry their own configured consumer, and silently overriding it could widen the
 boundary past what the integration was configured to permit.
+
+---
+<!-- doc-tracking -->
+- Created: 2026-08-13 14:50
+- Updated: 2026-08-13 15:18

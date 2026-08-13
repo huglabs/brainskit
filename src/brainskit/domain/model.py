@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from fnmatch import fnmatch
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -502,6 +502,67 @@ class EnrichmentEdge:
         )
 
 
+def _sources(raw: dict[str, Any]) -> list[str]:
+    """Read the watched source paths, rejecting what cannot be one.
+
+    `str()` coercion used to accept anything the JSON held, so
+    `{"type": "folder", "path": "../inbox"}` — a plausible guess at the
+    schema — became the literal path `"{'type': 'folder', 'path':
+    '../inbox'}"`, resolved to a directory that cannot exist and was skipped
+    in silence. A source that is not a string is a policy the operator has to
+    fix, so it is refused where every other malformed policy value is, rather
+    than surviving as a path nothing will ever match.
+    """
+
+    values: list[str] = []
+    for index, item in enumerate(raw["sources"]):
+        if not isinstance(item, str):
+            raise ValidationError(
+                "Every source must be a string path",
+                details={"index": index, "value": repr(item)},
+            )
+        if not item.strip():
+            raise ValidationError(
+                "A source path cannot be empty", details={"index": index}
+            )
+        values.append(item)
+    return values
+
+
+def resolve_vault_relative_path(vault_root: Path, value: str) -> Path:
+    """Where a path written into a vault's policy points.
+
+    **A relative value is relative to the vault, never to the process's
+    current directory.** `bk schedule` emits cron lines, and cron runs from
+    `$HOME` — so resolving against the cwd made the documented automation path
+    the one where a relative value silently means something different on every
+    run, while reporting success either way. The same policy gave a different
+    answer depending only on where the operator happened to be standing.
+
+    This is the rule `code_root` already follows, and the reason a vault can be
+    moved without rewriting its policy: what a vault watches, and where it
+    mirrors itself to, are properties of the vault.
+
+    `~` is expanded and an absolute value is returned unchanged — which is
+    where these paths and `code_root` part company. Watching `~/Downloads` and
+    syncing to `~/Obsidian/MyVault` are documented uses, so an absolute value
+    is legitimate here, while `code_root` refuses one outright.
+    """
+
+    return (vault_root / Path(value).expanduser()).resolve()
+
+
+def resolve_source_path(vault_root: Path, value: str) -> Path:
+    """Where a configured `sources` entry points.
+
+    One instance of the rule in `resolve_vault_relative_path`, named for the
+    caller so a `sources` entry and an integration destination cannot drift
+    into two conventions.
+    """
+
+    return resolve_vault_relative_path(vault_root, value)
+
+
 def _code_root(raw: dict[str, Any]) -> str | None:
     """Read an explicit code root, distinguishing absent from empty.
 
@@ -527,11 +588,25 @@ def _code_root(raw: dict[str, Any]) -> str | None:
 
 
 def _branch_policy(raw: Any, *, source: str) -> BranchPolicy:
-    """Attach the offending branch to a rejected policy."""
+    """Attach the offending branch to a rejected policy.
+
+    `type(exc)`, not `ValidationError`. This clause exists only to say *which*
+    branch was rejected, and naming the base class would have let it decide the
+    remedy as well: the four sharper classes subclass `ValidationError`, so
+    `NotConfiguredError` caught here would leave as a plain `validation_error`
+    and tell the operator to fix their request when the answer was to go
+    configure something.
+
+    `BranchPolicy.from_dict` raises only plain `ValidationError` today, so
+    nothing downgrades yet. That is precisely why it is worth fixing now — a
+    wrapper that quietly widens the remedy is invisible until the day something
+    it wraps learns to raise a sharper class, and the day it does, the
+    regression surfaces as a misleading error message rather than as a failure.
+    """
     try:
         return BranchPolicy.from_dict(raw)
     except ValidationError as exc:
-        raise ValidationError(
+        raise type(exc)(
             str(exc), details={"branch": source, **exc.details}
         ) from exc
 
@@ -860,7 +935,7 @@ class VaultConfig:
             branches=branches,
             providers=dict(raw["providers"]),
             job_models=dict(raw["job_models"]),
-            sources=[str(item) for item in raw["sources"]],
+            sources=_sources(raw),
             schedule={str(k): str(v) for k, v in raw["schedule"].items()},
             taxonomy_seed=[str(item) for item in raw["taxonomy_seed"]],
             novelty=NoveltyPolicy.from_dict(raw["novelty"]),

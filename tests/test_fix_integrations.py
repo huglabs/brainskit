@@ -1045,6 +1045,205 @@ class ObsidianExportBoundaryTest(VaultFixture):
         self.assertEqual(parameters, ["self", "policy", "graph"])
 
 
+class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
+    """The twin of the `sources` defect, on the one path that also writes.
+
+    A relative destination resolved against the process's current directory,
+    so `bk status` answered about the terminal it was typed into and
+    `bk integration sync` -- which `mkdir`s -- built a whole Obsidian vault
+    wherever the process happened to start. `bk schedule` emits cron lines and
+    cron runs from `$HOME`.
+
+    Every test here drives a *relative* destination, because an absolute one
+    was never ambiguous and must keep behaving exactly as it did.
+    """
+
+    def configure(self, destination: str, **options: object) -> None:
+        self.integrations.configure(
+            "obsidian",
+            enabled=True,
+            managed=False,
+            options={"path": destination, "subdirectory": "brainskit", **options},
+        )
+
+    def elsewhere(self) -> Path:
+        """A directory the operator never named, cleaned up after the test."""
+
+        directory = Path(tempfile.mkdtemp(prefix="agent-a-elsewhere-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        return directory
+
+    def stand_elsewhere(self) -> Path:
+        """Stand somewhere the operator never named; return what encloses it.
+
+        The chdir goes one level *below* the scratch directory, and that
+        nesting is load-bearing rather than tidiness. `tempfile` puts the
+        vault and every scratch directory in one shared parent, so standing
+        directly in a scratch directory makes `../mirror` resolve to the very
+        same place under both the old rule and the new one -- and every test
+        here would pass without discriminating between them. Returning the
+        enclosing directory also gives each test somewhere it fully owns to
+        assert that nothing was created.
+        """
+
+        enclosing = self.elsewhere()
+        workdir = enclosing / "workdir"
+        workdir.mkdir()
+        previous = Path.cwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(workdir)
+        return enclosing
+
+    def assert_untouched(self, enclosing: Path) -> None:
+        self.assertEqual(sorted(path.name for path in enclosing.iterdir()), ["workdir"])
+
+    def test_status_reads_the_same_from_any_directory(self) -> None:
+        """One vault, one policy, one answer."""
+
+        self.configure("MyObsidian")
+        observed = {}
+        for name in ("with-a-match", "without-one"):
+            enclosing = self.stand_elsewhere()
+            if name == "with-a-match":
+                (enclosing / "workdir" / "MyObsidian").mkdir()
+            observed[name] = self.integrations.status("obsidian")["integrations"][0][
+                "state"
+            ]
+        self.assertEqual(len(set(observed.values())), 1, observed)
+
+    def test_status_follows_the_destination_the_vault_names(self) -> None:
+        """Cwd-independence is not enough on its own: it must be *right*."""
+
+        self.configure("../mirror-beside-the-vault")
+        self.stand_elsewhere()
+        beside = (self.root.parent / "mirror-beside-the-vault").resolve()
+        self.addCleanup(shutil.rmtree, beside, True)
+        self.assertEqual(
+            self.integrations.status("obsidian")["integrations"][0]["state"],
+            "not-synced",
+        )
+        beside.mkdir()
+        self.assertEqual(
+            self.integrations.status("obsidian")["integrations"][0]["state"], "ready"
+        )
+
+    def test_an_enabled_integration_with_no_destination_is_not_ready(self) -> None:
+        """An empty value would otherwise resolve to the vault, which is a dir.
+
+        `_validate_policy` refuses to store this, but `status` reports on
+        whatever is on disk, and a hand-edited config reaches it.
+        """
+
+        self.integrations.configure(
+            "obsidian", enabled=True, managed=False,
+            options={"path": str(self.elsewhere())},
+        )
+        raw = self.vault.config().to_dict()
+        raw["integrations"]["obsidian"]["options"]["path"] = ""
+        self.vault.save_config(type(self.vault.config()).from_dict(raw))
+        self.assertEqual(
+            self.integrations.status("obsidian")["integrations"][0]["state"],
+            "not-synced",
+        )
+
+    def test_sync_never_builds_a_mirror_where_the_process_started(self) -> None:
+        """The serious half: this path creates directories."""
+
+        enclosing = self.stand_elsewhere()
+        self.configure("../mirror-beside-the-vault")
+        beside = (self.root.parent / "mirror-beside-the-vault").resolve()
+        self.addCleanup(shutil.rmtree, beside, True)
+        self.integrations.sync("obsidian", graph())
+        self.assert_untouched(enclosing)
+        self.assertTrue((beside / "brainskit" / "graph" / "graph.json").is_file())
+
+    def test_the_nesting_guard_answers_about_the_resolved_destination(self) -> None:
+        """The guard was checking a path nobody had named.
+
+        Standing anywhere but the vault, `inside` resolved outside the vault
+        and the guard waved through a mirror that, read as the vault reads it,
+        sits within the source it is copying.
+        """
+
+        self.stand_elsewhere()
+        self.configure("inside")
+        with self.assertRaises(ValidationError) as refused:
+            self.integrations.sync("obsidian", graph())
+        self.assertIn("nested inside the source vault", str(refused.exception))
+        self.assertFalse((self.root / "inside").exists())
+
+    def test_a_relocated_mirror_is_refused_rather_than_orphaned(self) -> None:
+        """The migration case, and the reason this is not a silent repoint.
+
+        An operator who always synced from one directory had a configuration
+        that worked by coincidence. Resolving it against the vault instead
+        would leave their real Obsidian vault on disk, still opening, while
+        every later sync updated a second copy nobody reads.
+        """
+
+        legacy = self.elsewhere() / "MyObsidian" / "brainskit"
+        legacy.mkdir(parents=True)
+        self.configure("MyObsidian")
+        self.integrations._record("obsidian", {"path": str(legacy)})
+        with self.assertRaises(BrainskitError) as refused:
+            self.integrations.sync("obsidian", graph())
+        details = refused.exception.details
+        self.assertEqual(refused.exception.code, "not_configured")
+        self.assertEqual(details["synced_at"], str(legacy))
+        self.assertEqual(details["resolved"], str((self.root / "MyObsidian").resolve()))
+        self.assertEqual(details["path"], "MyObsidian")
+        # Refusing has to cost nothing: no second mirror, no half-built one.
+        self.assertFalse((self.root / "MyObsidian").exists())
+
+    def test_a_destination_that_still_holds_the_mirror_keeps_syncing(self) -> None:
+        """The operator whose relative path was unambiguous sees no change.
+
+        They only ever synced from the vault, so the old resolution and the
+        new one already agree. A refusal here would be the migration note
+        delivered to everyone except the person it concerns.
+        """
+
+        self.configure("../mirror-beside-the-vault")
+        beside = (self.root.parent / "mirror-beside-the-vault").resolve()
+        self.addCleanup(shutil.rmtree, beside, True)
+        first = self.integrations.sync("obsidian", graph())
+        self.stand_elsewhere()
+        second = self.integrations.sync("obsidian", graph())
+        self.assertEqual(second["path"], first["path"])
+        self.assertEqual(second["state"], "ready")
+
+    def test_a_changed_subdirectory_is_not_read_as_a_relocation(self) -> None:
+        """It moves the mirror inside a destination the operator still names."""
+
+        self.configure("../mirror-beside-the-vault")
+        beside = (self.root.parent / "mirror-beside-the-vault").resolve()
+        self.addCleanup(shutil.rmtree, beside, True)
+        self.integrations.sync("obsidian", graph())
+        self.configure("../mirror-beside-the-vault", subdirectory="notes")
+        result = self.integrations.sync("obsidian", graph())
+        self.assertEqual(result["path"], str(beside / "notes"))
+
+    def test_an_absolute_destination_is_never_a_relocation(self) -> None:
+        """It was unambiguous before and after, so a move is a reconfiguration."""
+
+        first_target = self.elsewhere()
+        self.configure(str(first_target))
+        self.integrations.sync("obsidian", graph())
+        second_target = self.elsewhere()
+        self.configure(str(second_target))
+        result = self.integrations.sync("obsidian", graph())
+        self.assertEqual(result["path"], str((second_target / "brainskit").resolve()))
+
+    def test_a_first_sync_has_nothing_to_orphan(self) -> None:
+        enclosing = self.stand_elsewhere()
+        self.configure("../mirror-beside-the-vault")
+        beside = (self.root.parent / "mirror-beside-the-vault").resolve()
+        self.addCleanup(shutil.rmtree, beside, True)
+        result = self.integrations.sync("obsidian", graph())
+        self.assertEqual(result["path"], str(beside / "brainskit"))
+        self.assert_untouched(enclosing)
+
+
 class ReadinessProbeTest(unittest.TestCase):
     """A managed service is ready only when it stays ready."""
 

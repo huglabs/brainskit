@@ -24,6 +24,7 @@ from brainskit.application.services import BrainskitService
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.vault import FileVault
+from brainskit.interfaces import cli, console
 
 GATE = "brainskit-gate.sh"
 STATUS = "brainskit-status.sh"
@@ -447,6 +448,137 @@ class HooksPathResolverTest(unittest.TestCase):
 
     def test_a_missing_directory_returns_rather_than_raises(self) -> None:
         self.assertIsNone(redirected_git_hooks_path(self.root / "nope"))
+
+
+class StatusHeadlineSaysWhyTest(unittest.TestCase):
+    """The headline has to mean what `healthy` means.
+
+    `healthy` widened to "lint is clean *and* every enforcing layer is on"; the
+    headline stayed a lint-error count. A vault with clean pages and no git
+    repository therefore printed `0 lint error(s)` under a red cross -- a cross
+    above a zero -- and that is the default outcome of the documented quickstart,
+    because `bk init` outside a git repository can never make `commit_lint`
+    active.
+
+    These drive `_status_headline` on report shapes rather than on real vaults:
+    the shapes are what the renderer contracts with, and `Health` has its own
+    tests above for producing them.
+    """
+
+    def headline(self, **over: Any) -> str:
+        report: dict[str, Any] = {
+            "healthy": False,
+            "lint_errors": 0,
+            "enforcement": {"layers": [], "inactive": [], "gated": False},
+        }
+        report.update(over)
+        return cli._status_headline(report)
+
+    def layers(self, *specs: tuple[str, bool, bool]) -> dict[str, Any]:
+        return {
+            "layers": [
+                {"layer": name, "active": active, "advisory": advisory, "detail": "x"}
+                for name, active, advisory in specs
+            ]
+        }
+
+    def test_a_healthy_vault_says_so(self) -> None:
+        """Control: a vault that is genuinely fine must never print a fault."""
+
+        self.assertEqual("vault healthy", self.headline(healthy=True))
+
+    def test_clean_lint_with_a_layer_off_names_the_layer(self) -> None:
+        headline = self.headline(
+            lint_errors=0,
+            enforcement=self.layers(
+                ("write_gate", True, False), ("commit_lint", False, False)
+            ),
+        )
+        self.assertIn("commit_lint", headline)
+        self.assertNotIn("0 lint error(s)", headline)
+
+    def test_lint_errors_are_still_counted(self) -> None:
+        """Control: the case the old headline got right must keep working."""
+
+        self.assertEqual("2 lint error(s)", self.headline(lint_errors=2))
+
+    def test_both_faults_are_reported_together(self) -> None:
+        headline = self.headline(
+            lint_errors=2, enforcement=self.layers(("write_gate", False, False))
+        )
+        self.assertIn("2 lint error(s)", headline)
+        self.assertIn("write_gate", headline)
+
+    def test_an_inactive_advisory_layer_is_not_a_reason(self) -> None:
+        """`healthy` excludes advisory layers, so the headline must not name one.
+
+        Naming it would make the headline fire for something no mechanism was
+        ever going to stop -- and disagree with the flag it is rendering.
+        """
+
+        self.assertNotIn(
+            "instructions",
+            self.headline(enforcement=self.layers(("instructions", False, True))),
+        )
+
+    def test_an_unrecognised_reason_points_at_the_rows_instead_of_guessing(self) -> None:
+        """If `healthy` gains a third input, the headline must not invent one.
+
+        Restating `healthy` in terms of one of its inputs is exactly how this
+        broke; a headline that says "look below" is merely unhelpful.
+        """
+
+        headline = self.headline(healthy=False, lint_errors=0)
+        self.assertNotIn("0", headline)
+        self.assertIn("see the rows below", headline)
+
+
+class EnforcementRowsDistinguishAdvisoryTest(unittest.TestCase):
+    """An advisory layer must not render as a fourth guarantee.
+
+    `instructions` is advisory -- correctly excluded from `gated` and from
+    `healthy` -- but drew the same green tick as the three layers that actually
+    stop a write.
+    """
+
+    def rows(self, *specs: tuple[str, bool, bool]) -> list[list[str]]:
+        return cli._enforcement_rows(
+            [
+                {"layer": name, "active": active, "advisory": advisory, "detail": "d"}
+                for name, active, advisory in specs
+            ]
+        )
+
+    def test_an_advisory_row_says_so_in_text(self) -> None:
+        """In text, not only in colour: this output is usually read off a TTY."""
+
+        (row,) = self.rows(("instructions", True, True))
+        self.assertIn("advisory", row[0])
+
+    def test_an_enforcing_row_is_not_labelled_advisory(self) -> None:
+        """Control: the three real layers must keep their plain names."""
+
+        (row,) = self.rows(("write_gate", True, False))
+        self.assertEqual("write_gate", row[0])
+        self.assertNotIn("advisory", row[1])
+
+    def test_every_layer_still_gets_exactly_one_row(self) -> None:
+        rows = self.rows(
+            ("write_gate", True, False),
+            ("commit_lint", False, False),
+            ("instructions", True, True),
+        )
+        self.assertEqual(3, len(rows))
+        self.assertEqual(
+            ["write_gate", "commit_lint", "instructions (advisory)"],
+            [row[0] for row in rows],
+        )
+
+    def test_the_detail_survives_in_both_kinds_of_row(self) -> None:
+        for spec in (("write_gate", False, False), ("instructions", True, True)):
+            with self.subTest(layer=spec[0]):
+                (row,) = self.rows(spec)
+                self.assertIn("d", console.strip_ansi(row[1]))
 
 
 if __name__ == "__main__":

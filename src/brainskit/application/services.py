@@ -61,6 +61,7 @@ from brainskit.domain.model import (
     ValidationError,
     is_ignored,
     normalize_branch,
+    resolve_source_path,
     utc_now,
 )
 
@@ -149,17 +150,58 @@ class BrainskitService:
         Eligibility is a vault rule, not a caller's: `ignore` prunes whole
         trees, and the vault's own directory is always excluded so a watch
         pointed at a parent of the vault cannot re-capture `raw/` into itself.
+
+        **Where a source resolves is a vault rule too**, so a relative path is
+        read against the vault rather than the process's current directory —
+        see `resolve_source_path`.
+
+        A source that resolves to nothing is never passed over in silence,
+        because a watch that captures nothing looks exactly like a watch with
+        nothing to capture:
+
+        - **Every configured source missing** is a configuration the operator
+          has to fix, and no run can ever do anything until they do. It gets
+          the same refusal, and so the same exit status, as configuring no
+          sources at all — the state it amounts to.
+        - **Some sources missing** still leaves real work, and a capture
+          declined over a typo elsewhere in the policy would be worse than the
+          typo. Those are reported alongside the per-file failures and the
+          walk continues.
         """
 
         config = self.vault.config()
-        roots = [Path(value).expanduser().resolve() for value in config.sources]
-        if not roots:
+        if not config.sources:
             raise NotConfiguredError("No source folders/files are configured")
+        present: list[Path] = []
+        missing: list[tuple[str, Path]] = []
+        for value in config.sources:
+            root = resolve_source_path(self.vault.root, value)
+            if root.exists():
+                present.append(root)
+            else:
+                missing.append((value, root))
+        if not present:
+            raise NotConfiguredError(
+                "No configured source folder/file exists",
+                details={
+                    "sources": [_missing_source(value, root) for value, root in missing],
+                    "hint": (
+                        "A relative source is resolved against the vault. Point "
+                        "sources at paths that exist, or use absolute paths."
+                    ),
+                },
+            )
         created = 0
         duplicates = 0
         ignored = 0
-        failures: list[dict[str, str]] = []
-        for root in roots:
+        failures: list[dict[str, str]] = [
+            {
+                "path": str(root),
+                "error": _missing_source_error(_missing_source(value, root)),
+            }
+            for value, root in missing
+        ]
+        for root in present:
             for candidate, skipped in _walk_source(root, config.ignore, self.vault.root):
                 ignored += skipped
                 if candidate is None:
@@ -570,6 +612,40 @@ class BrainskitService:
 
 
 
+
+
+def _missing_source(value: str, root: Path) -> dict[str, str]:
+    """Describe a configured source that points at nothing.
+
+    The `found_at_cwd` case is the upgrade note, delivered to the one person
+    it concerns rather than to a changelog they may not read. A relative
+    source used to resolve against the process's current directory, so a
+    vault whose owner always ran `bk watch` from the same place had a
+    configuration that worked by coincidence — and repointing it silently
+    would be its own defect. When the old location still holds the folder,
+    the message names it, and the remedy is to write that path into `sources`.
+    """
+
+    detail = {"source": value, "resolved": str(root)}
+    from_cwd = Path(value).expanduser().resolve()
+    if from_cwd != root and from_cwd.exists():
+        detail["found_at_cwd"] = str(from_cwd)
+    return detail
+
+
+def _missing_source_error(detail: dict[str, str]) -> str:
+    """The same fact as prose, for the `failures` list a partial run returns."""
+
+    message = (
+        f"Configured source {detail['source']!r} resolves to "
+        f"{detail['resolved']}, relative to the vault, and nothing is there"
+    )
+    if "found_at_cwd" in detail:
+        message += (
+            f" — it does exist at {detail['found_at_cwd']}, where this path "
+            "resolved before sources became vault-relative"
+        )
+    return message
 
 
 def _walk_source(

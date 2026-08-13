@@ -1666,10 +1666,69 @@ INSTRUCTION_FILES = {
     "gemini": "GEMINI.md",
     "opencode": "AGENTS.md",
 }
-_MANAGED_BLOCK_RE = re.compile(
-    rf"{re.escape(INSTRUCTION_START)}.*?{re.escape(INSTRUCTION_END)}\n?",
-    re.DOTALL,
+#: The name this tool installs its artefacts under.
+#
+# Every artefact spells it identically -- `<brand>-gate.sh`, `# <brand>:
+# generated`, `<!-- <brand>:start -->`, `.claude/skills/<brand>/` -- which is
+# what lets one list of former names below cover all four classes at once.
+BRAND = "brainskit"
+
+#: Names this tool shipped under before. A rename has to *migrate* an install,
+#: not duplicate it.
+#
+# Every lookup in this module keys on the current name, so without this list a
+# pre-rename install survives the upgrade intact: its gate stays registered
+# beside the new one and keeps firing on every write against whatever vault it
+# was baked with, its scripts stay on disk beside the current ones, and the
+# instruction file ends up carrying two managed blocks that disagree about which
+# vault this workspace has. That is the state every pre-rename install lands in,
+# and this repository was the reference installation demonstrating it on itself.
+#
+# Hard-coded and finite deliberately. Deriving the set would mean guessing which
+# `*-gate.sh` in an operator's settings.json was once ours, and a wrong guess
+# deletes somebody else's hook -- the one failure worse than leaving debris.
+#
+# RENAMING AGAIN IS ONE ENTRY HERE. Append the name being retired and every
+# artefact class migrates, because they all spell the brand the same way.
+LEGACY_BRANDS: tuple[str, ...] = ("brainkit",)
+
+
+def _legacy_spellings(current: str) -> tuple[str, ...]:
+    """`current` as each former brand spelled it, for artefacts to migrate."""
+
+    return tuple(
+        current.replace(BRAND, legacy) for legacy in LEGACY_BRANDS if BRAND in current
+    )
+
+
+def _managed_block_re(start: str, end: str) -> re.Pattern[str]:
+    return re.compile(rf"{re.escape(start)}.*?{re.escape(end)}\n?", re.DOTALL)
+
+
+_MANAGED_BLOCK_RE = _managed_block_re(INSTRUCTION_START, INSTRUCTION_END)
+
+#: Each former brand's managed block: the start marker to look for, and the
+#: pattern that spans it. Built from the current markers so a brand added above
+#: needs nothing here.
+_LEGACY_MANAGED_BLOCKS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (
+        INSTRUCTION_START.replace(BRAND, legacy),
+        _managed_block_re(
+            INSTRUCTION_START.replace(BRAND, legacy),
+            INSTRUCTION_END.replace(BRAND, legacy),
+        ),
+    )
+    for legacy in LEGACY_BRANDS
 )
+
+#: Stands in for the new block while former blocks are being removed around it.
+#
+# Inserting the real block first and deleting afterwards would be correct only
+# while no former brand name is a substring of the current one; a future rename
+# where it is would have the deletion pass eat the block just written. A token
+# carrying NUL cannot occur in a file this module writes, so it is safe to plant
+# and is always swapped back out below.
+_BLOCK_ANCHOR = "\x00brainskit:managed-block\x00"
 
 
 class ClaudeHook(NamedTuple):
@@ -1759,12 +1818,18 @@ def _hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
 
 
 def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
-    """Install the Claude Code skill that teaches the vault contract."""
-    skill = root / ".claude" / "skills" / "brainskit" / "SKILL.md"
+    """Install the Claude Code skill that teaches the vault contract.
+
+    A former brand's skill directory is reported alongside — an already-current
+    install is exactly where that debris hides, so the report is attached to
+    every outcome rather than only to the one that writes.
+    """
+    skill = root / ".claude" / "skills" / BRAND / "SKILL.md"
     content = _agent_template("claude-skill", vault)
+    legacy = _legacy_skill_dirs(root)
     if skill.is_file() and not force:
         if skill.read_text(encoding="utf-8") == content:
-            return {"path": str(skill), "state": "current"}
+            return {"path": str(skill), "state": "current", **_legacy(legacy)}
         raise ValidationError(
             "A brainskit skill already exists; re-run with --force to replace it",
             details={"path": str(skill)},
@@ -1772,7 +1837,17 @@ def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
     updated = skill.is_file()
     skill.parent.mkdir(parents=True, exist_ok=True)
     skill.write_text(content, encoding="utf-8")
-    return {"path": str(skill), "state": "updated" if updated else "created"}
+    return {
+        "path": str(skill),
+        "state": "updated" if updated else "created",
+        **_legacy(legacy),
+    }
+
+
+def _legacy(found: list[str]) -> dict[str, Any]:
+    """`legacy` only when there is something to report, so callers can `in` it."""
+
+    return {"legacy": found} if found else {}
 
 
 def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]:
@@ -1780,6 +1855,13 @@ def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]
 
     The block is fenced by HTML comments so re-running never duplicates it and
     never disturbs instructions the operator wrote around it.
+
+    A block left by a former brand is retired here rather than appended beside.
+    Two managed blocks is a worse state than one stale block: they contradict
+    each other about which vault this workspace has, both are addressed to the
+    same agent, and nothing downstream can tell which one the operator meant.
+    The first one retired inherits the new block's position, so the contract
+    stays where it was last read instead of moving to the end of the file.
     """
     target = root / INSTRUCTION_FILES[agent]
     block = (
@@ -1788,18 +1870,38 @@ def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]
         f"{INSTRUCTION_END}\n"
     )
     existing = target.read_text(encoding="utf-8") if target.is_file() else ""
-    if INSTRUCTION_START in existing:
+    content = existing
+    migrated: list[str] = []
+    # Only when there is no current block: an install that already has one keeps
+    # it where it is, and the former block is then simply debris to drop.
+    adopt = INSTRUCTION_START not in content
+    for start, pattern in _LEGACY_MANAGED_BLOCKS:
+        if start not in content:
+            continue
+        migrated.append(start)
+        if adopt:
+            content = pattern.sub(lambda _: _BLOCK_ANCHOR, content, count=1)
+            adopt = False
+        content = pattern.sub("", content)
+
+    if _BLOCK_ANCHOR in content:
+        content = content.replace(_BLOCK_ANCHOR, block, 1)
+        state = "migrated"
+    elif INSTRUCTION_START in content:
         # Replace in place so instructions written after the block keep their
         # position; a lambda avoids re.sub interpreting escapes in the block.
-        content = _MANAGED_BLOCK_RE.sub(lambda _: block, existing, count=1)
+        content = _MANAGED_BLOCK_RE.sub(lambda _: block, content, count=1)
         state = "current" if existing == content else "updated"
     else:
-        stripped = existing.strip()
+        stripped = content.strip()
         content = f"{stripped}\n\n{block}" if stripped else block
         state = "appended" if stripped else "created"
     if content != existing:
         target.write_text(content, encoding="utf-8")
-    return {"path": str(target), "state": state}
+    result: dict[str, Any] = {"path": str(target), "state": state}
+    if migrated:
+        result["migrated"] = migrated
+    return result
 
 
 COMMIT_LINT_OFF = (
@@ -1917,22 +2019,107 @@ def _hook_command_registered(group: Sequence[Any], command: str) -> bool:
     return False
 
 
+def _hook_script_names(template: str) -> frozenset[str]:
+    """Every filename this hook has ever been installed as, current and former.
+
+    A former brand's filename belongs here because it identifies the same hook
+    on the same event: keying only on the current name is what let a pre-rename
+    gate stay registered beside the new one through a `--force` reinstall.
+    """
+
+    return frozenset(
+        f"{name}.sh" for name in (template, *_legacy_spellings(template))
+    )
+
+
 def _is_stale_hook_command(command: Any, template: str, current: str) -> bool:
     """Whether `command` is a brainskit `template` hook at some path other than `current`.
 
     Every install writes to `<root>/.claude/hooks/<template>.sh`, so the command
     this workspace should be running for a given template never has more than
-    one live value at a time. A registered command matching that name but not
-    equal to the one being installed now is not "unrelated tooling on the same
-    event" — the case this file otherwise takes care never to touch — it is a
-    previous install this one supersedes: a settings.json carried over from a
-    different `--root`, or copied wholesale from another project's `.claude/`.
+    one live value at a time. A registered command matching that name — under
+    this brand or one it used to have — but not equal to the one being installed
+    now is not "unrelated tooling on the same event", the case this file
+    otherwise takes care never to touch. It is a previous install this one
+    supersedes: a settings.json carried over from a different `--root`, copied
+    wholesale from another project's `.claude/`, or simply older than a rename.
     Left alone, it keeps firing every session against a vault or workspace this
     one no longer is.
     """
     if not isinstance(command, str) or command == current:
         return False
-    return Path(command).name == f"{template}.sh"
+    return Path(command).name in _hook_script_names(template)
+
+
+def _retire_legacy_hook_scripts(
+    root: Path, installed: Sequence[ClaudeHook]
+) -> list[dict[str, Any]]:
+    """Remove the hook scripts a former brand left, when they are still ours.
+
+    Unregistering alone leaves `<former>-gate.sh` sitting beside the current one:
+    inert, but indistinguishable at a glance from the hook that actually runs,
+    which is how a workspace gets debugged against the wrong file.
+
+    Ownership is decided exactly the way `_write_hook_script` decides it — by the
+    generated sentinel, spelled as that brand spelled it. A script still carrying
+    it is untouched output of an earlier install and safe to delete. One without
+    it has been edited, and deleting an edited file is a different act from
+    dropping a settings entry, so it is reported and left where it is.
+
+    `--force` is not consulted. Force decides whether to clobber an install that
+    is currently the right one; finishing a rename this tool itself performed is
+    not that question, and gating it would leave the default upgrade path — the
+    documented `bk hooks install` with no flags — silently running two gates.
+
+    Only hooks this run actually installed are retired. A hook whose current
+    script was skipped keeps its old registration, and deleting the file that
+    registration points at would turn debris into a broken command.
+    """
+
+    retired: list[dict[str, Any]] = []
+    hooks_dir = root / ".claude" / "hooks"
+    for legacy in LEGACY_BRANDS:
+        sentinel = HOOK_SENTINEL.replace(BRAND, legacy)
+        for hook in installed:
+            path = hooks_dir / f"{hook.template.replace(BRAND, legacy)}.sh"
+            if not path.is_file():
+                continue
+            try:
+                owned = sentinel in path.read_text(encoding="utf-8")
+                if owned:
+                    path.unlink()
+            except OSError as exc:
+                retired.append(
+                    {"path": str(path), "state": "kept", "reason": str(exc)}
+                )
+                continue
+            retired.append(
+                {"path": str(path), "state": "removed"}
+                if owned
+                else {
+                    "path": str(path),
+                    "state": "kept",
+                    "reason": (
+                        "edited since it was generated, so it is yours; "
+                        "it is no longer registered and can be deleted"
+                    ),
+                }
+            )
+    return retired
+
+
+def _legacy_skill_dirs(root: Path) -> list[str]:
+    """Skill directories a former brand installed and an agent still loads.
+
+    Reported, never removed. A hook script proves its provenance with the
+    generated sentinel; a skill is plain markdown carrying no such mark, so
+    nothing here distinguishes an earlier install's output from something the
+    operator wrote. Deleting on a guess is worse than the debris — and unlike a
+    stale hook, a stale skill is only read, never executed.
+    """
+
+    skills = root / ".claude" / "skills"
+    return [str(skills / legacy) for legacy in LEGACY_BRANDS if (skills / legacy).is_dir()]
 
 
 def _prune_stale_hook_entries(
@@ -2083,7 +2270,16 @@ def _install_claude_hook(
         scripts[hook.template] = outcome
         if outcome["state"] != "skipped":
             registrable.append((hook, str(outcome["path"])))
-    return {"scripts": scripts, "settings": _register_claude_hooks(root, registrable)}
+    # Registration first, so a former brand's command is gone from settings.json
+    # before its script leaves the disk. The reverse order has a window — and, if
+    # the unlink fails, a lasting state — where a registered hook points at a
+    # file that is not there.
+    settings = _register_claude_hooks(root, registrable)
+    retired = _retire_legacy_hook_scripts(root, [hook for hook, _ in registrable])
+    result: dict[str, Any] = {"scripts": scripts, "settings": settings}
+    if retired:
+        result["legacy"] = retired
+    return result
 
 
 def _enforcement_layer(
@@ -2198,6 +2394,41 @@ def _note_pruned_stale_hooks(claude_hook: dict[str, Any] | None) -> None:
     print("", file=sys.stderr)
 
 
+def _note_legacy_migration(result: dict[str, Any]) -> None:
+    """Say what a former brand left behind and what this install did about it.
+
+    Silence would repeat the failure the migration exists to fix: an upgrade
+    that reads like a clean install while a pre-rename hook is still on disk and
+    a pre-rename block is still in the instruction file. Files this run declined
+    to touch are named here too — that is the half an operator has to finish.
+    """
+
+    lines: list[str] = []
+    instructions = result.get("instructions") or {}
+    for marker in instructions.get("migrated", []):
+        lines.append(f"  - retired {marker} in {instructions['path']}")
+    hook = result.get("claude_hook")
+    if isinstance(hook, dict):
+        for item in hook.get("legacy", []):
+            verb = "removed" if item["state"] == "removed" else "left in place"
+            lines.append(f"  - {verb} {item['path']}")
+            if item.get("reason"):
+                lines.append(f"      {item['reason']}")
+    for path in (result.get("skill") or {}).get("legacy", []):
+        lines.append(f"  - left in place {path}")
+        lines.append(
+            "      A former brand's skill, which an agent still loads. Nothing "
+            "marks it as generated, so delete it yourself."
+        )
+    if not lines:
+        return
+    print("", file=sys.stderr)
+    print("bk: RENAME - artefacts of an install under a former name:", file=sys.stderr)
+    for line in lines:
+        print(line, file=sys.stderr)
+    print("", file=sys.stderr)
+
+
 def _resolve_workspace(vault: Path, root: str | None) -> Path:
     """Where the agent's configuration belongs, which is not always the vault.
 
@@ -2279,6 +2510,7 @@ def _install_hooks(
     result["code_graph"] = _bootstrap_code_graph(service, skip=skip_code_build)
     _warn_about_inactive_enforcement(result["enforcement"], advisory)
     _note_pruned_stale_hooks(result.get("claude_hook"))
+    _note_legacy_migration(result)
     _note_code_graph_bootstrap(result["code_graph"])
     return result
 
@@ -2780,9 +3012,70 @@ def _render_auto(value: Any) -> str:
     )
 
 
+def _status_headline(value: dict[str, Any]) -> str:
+    """Say why the vault is not healthy, in the terms `healthy` is computed in.
+
+    The headline used to restate `healthy` as a lint-error count, which was true
+    only while `healthy` meant lint alone. Once it also meant "every enforcement
+    layer that enforces is on", a vault with clean pages and no git repository
+    printed `0 lint error(s)` under a red cross -- a cross above a zero, and the
+    default outcome of the documented quickstart, because `bk init` outside a
+    git repository can never make `commit_lint` active.
+
+    So this names every input `healthy` has, and when it stops recognising one
+    it points at the rows rather than guessing. Inventing a reason is how this
+    broke the first time; a headline that says "look below" is merely unhelpful.
+
+    Advisory layers are skipped for the same reason `healthy` skips them: they
+    inform, they stop nothing, and failing the headline on one would fire it for
+    something no mechanism was ever going to prevent.
+    """
+
+    if value["healthy"]:
+        return "vault healthy"
+    faults: list[str] = []
+    if value["lint_errors"]:
+        faults.append(f"{value['lint_errors']} lint error(s)")
+    inactive = [
+        str(layer["layer"])
+        for layer in (value.get("enforcement") or {}).get("layers") or []
+        if not layer.get("active") and not layer.get("advisory")
+    ]
+    if inactive:
+        faults.append(f"enforcement off: {', '.join(inactive)}")
+    return "; ".join(faults) or "not healthy; see the rows below"
+
+
+def _enforcement_rows(layers: Sequence[dict[str, Any]]) -> list[list[str]]:
+    """The enforcement table, with advisory layers drawn as what they are.
+
+    An advisory layer rendered by `status_line` is a green tick identical to the
+    three layers that actually stop a write, which reads as a fourth guarantee
+    the vault does not have. It says so in the layer name rather than in colour
+    alone: most of this output is read through a pipe, a file or a test capture,
+    and colour is stripped in all three.
+    """
+
+    rows: list[list[str]] = []
+    for layer in layers:
+        name = str(layer["layer"])
+        detail = str(layer.get("detail", ""))
+        if layer.get("advisory"):
+            symbol = console.CHECK if layer["active"] else console.CROSS
+            rows.append(
+                [
+                    f"{name} (advisory)",
+                    console.style(f"{symbol} {detail}", console.MUTED),
+                ]
+            )
+        else:
+            rows.append([name, console.status_line(bool(layer["active"]), detail)])
+    return rows
+
+
 def _render_status(value: dict[str, Any]) -> str:
     healthy = value["healthy"]
-    headline = "vault healthy" if healthy else f"{value['lint_errors']} lint error(s)"
+    headline = _status_headline(value)
     parts = [
         console.status_line(healthy, headline),
         "",
@@ -2833,11 +3126,11 @@ def _render_status(value: dict[str, Any]) -> str:
         ]
     layers = (value.get("enforcement") or {}).get("layers") or []
     if layers:
-        rows = [
-            [layer["layer"], console.status_line(layer["active"], layer.get("detail", ""))]
-            for layer in layers
+        parts += [
+            "",
+            console.rule("enforcement"),
+            console.table(["layer", "status"], _enforcement_rows(layers)),
         ]
-        parts += ["", console.rule("enforcement"), console.table(["layer", "status"], rows)]
     return "\n".join(parts)
 
 
@@ -3206,6 +3499,30 @@ def _render_code_diff(value: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _doctor_headline(value: dict[str, Any]) -> str:
+    """The same rule `_status_headline` follows, for the same reason.
+
+    `bk doctor`'s `healthy` has two inputs -- every grammar present, *and* the
+    write-gate probe landing on a state compatible with an installation. The
+    headline restated only the first, so a machine with every grammar installed
+    and a gate that fails open printed `0 language(s) cannot be parsed` under a
+    red cross: a cross above a zero that never mentions the gate, on exactly the
+    run whose whole purpose is to exercise it.
+    """
+
+    if value.get("healthy"):
+        return "installation complete"
+    faults: list[str] = []
+    missing = (value.get("code") or {}).get("grammars_missing") or []
+    if missing:
+        faults.append(f"{len(missing)} language(s) cannot be parsed")
+    probe = (value.get("enforcement") or {}).get("write_gate_probe") or {}
+    state = probe.get("state")
+    if state not in {"enforcing", "absent", None}:
+        faults.append(f"write gate {state}")
+    return "; ".join(faults) or "installation incomplete; see the sections below"
+
+
 def _render_doctor(value: dict[str, Any]) -> str:
     environment = value.get("environment") or {}
     code = value.get("code") or {}
@@ -3213,12 +3530,7 @@ def _render_doctor(value: dict[str, Any]) -> str:
     installed = code.get("grammars_installed", 0)
     missing = code.get("grammars_missing") or []
     parts = [
-        console.status_line(
-            bool(value.get("healthy")),
-            "installation complete"
-            if value.get("healthy")
-            else f"{len(missing)} language(s) cannot be parsed",
-        ),
+        console.status_line(bool(value.get("healthy")), _doctor_headline(value)),
         "",
         console.kv_panel(
             [

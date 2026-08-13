@@ -10,8 +10,13 @@
 #   exit 0  everything else, including every way this script can break
 #
 # Failing open is deliberate. A knowledge gate that blocks the session on its
-# own breakage is worse than no gate, and `bk lint` still reports the bypass as
-# `wiki.outside_apply`. Only a decision that says `"allowed": false` may exit 2:
+# own breakage is worse than no gate, and every write this script lets through
+# is still reported afterwards: one under `wiki/` as `wiki.outside_apply` -- for
+# every page, including the two `bk init` seeds, which lint used to skip -- and
+# one under `raw/` as `registry.untracked_file` or `raw.content_modified`. That
+# backstop is the whole reason failing open is tolerable, so it has to hold for
+# everything the gate covers rather than for most of it.
+# Only a decision that says `"allowed": false` may exit 2:
 # `bk` uses exit 2 for its ordinary errors too, and argparse uses it for an
 # unknown subcommand, so the exit code alone is never proof of a denial.
 

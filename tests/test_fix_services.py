@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from typing import Any
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     DEFAULT_IGNORE_PATTERNS,
+    NotConfiguredError,
     PolicyError,
     ValidationError,
 )
@@ -751,6 +753,120 @@ class WatchIgnoreTest(unittest.TestCase):
         self.assertEqual(service.watch_once()["created"], 2)
 
 
+class WatchSourceResolutionTest(unittest.TestCase):
+    """What a vault watches is a property of the vault, not of the caller.
+
+    A relative source was resolved against the process's current directory, so
+    the same vault captured a file or dropped it depending only on where the
+    operator was standing — and `bk schedule` writes cron lines, which run from
+    `$HOME`. The documented automation path was therefore the one where a
+    relative source captures nothing, forever, reporting `created 0` and
+    exiting 0.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.work = Path(self.temporary.name).resolve()
+        self.inbox = self.work / "inbox"
+        self.inbox.mkdir()
+        (self.inbox / "dropped.md").write_text("durable evidence", encoding="utf-8")
+        self.elsewhere = self.work / "elsewhere" / "deep"
+        self.elsewhere.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def service(self, name: str, sources: list[Any]) -> BrainskitService:
+        raw = policy()
+        raw["sources"] = sources
+        vault = FileVault.initialize(self.work / name, raw)
+        return BrainskitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+
+    def captured(self, service: BrainskitService) -> list[str]:
+        return sorted(
+            record.original_name for record in service.vault.registry().values()
+        )
+
+    def test_a_relative_source_is_read_against_the_vault_not_the_cwd(self) -> None:
+        service = self.service("vault", ["../inbox"])
+        with contextlib.chdir(self.elsewhere):
+            result = service.watch_once()
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(self.captured(service), ["dropped.md"])
+
+    def test_the_same_vault_captures_the_same_files_from_any_directory(self) -> None:
+        # The defect in one assertion: the answer must not depend on the cwd.
+        seen = []
+        for index, where in enumerate((self.elsewhere, self.work, self.inbox)):
+            service = self.service(f"vault-{index}", ["../inbox"])
+            with contextlib.chdir(where):
+                seen.append(service.watch_once()["created"])
+        self.assertEqual(seen, [1, 1, 1])
+
+    def test_an_absolute_source_is_unaffected(self) -> None:
+        # The compatibility guarantee: absolute sources never depended on the
+        # cwd, so the fix must leave them exactly as they were.
+        service = self.service("vault-absolute", [str(self.inbox)])
+        with contextlib.chdir(self.elsewhere):
+            self.assertEqual(service.watch_once()["created"], 1)
+
+    def test_every_source_missing_is_refused_rather_than_reported_as_success(
+        self,
+    ) -> None:
+        # A run that can never capture anything is the state "no sources are
+        # configured" with extra steps, and gets the same refusal -- which is
+        # what reaches the operator, because cron mails a non-zero exit.
+        service = self.service("vault-gone", ["../typo-inbox"])
+        with contextlib.chdir(self.elsewhere), self.assertRaises(
+            NotConfiguredError
+        ) as caught:
+            service.watch_once()
+        self.assertEqual(caught.exception.code, "not_configured")
+        self.assertEqual(
+            [entry["source"] for entry in caught.exception.details["sources"]],
+            ["../typo-inbox"],
+        )
+        self.assertEqual(
+            caught.exception.details["sources"][0]["resolved"],
+            str(self.work / "typo-inbox"),
+        )
+
+    def test_a_partly_missing_source_list_reports_it_and_keeps_going(self) -> None:
+        # Declining every capture over a typo elsewhere in the policy would be
+        # worse than the typo, so this is reported rather than raised.
+        service = self.service("vault-partial", ["../inbox", "../typo-inbox"])
+        with contextlib.chdir(self.elsewhere):
+            result = service.watch_once()
+        self.assertEqual(result["created"], 1)
+        self.assertEqual([entry["path"] for entry in result["failures"]],
+                         [str(self.work / "typo-inbox")])
+        self.assertIn("nothing is there", result["failures"][0]["error"])
+
+    def test_the_old_location_is_named_when_it_still_holds_the_folder(self) -> None:
+        # The upgrade note, delivered to the one operator it concerns: a
+        # configuration that worked by coincidence is repointed, and says so.
+        legacy = self.work / "elsewhere" / "inbox-legacy"
+        legacy.mkdir()
+        (legacy / "note.md").write_text("evidence", encoding="utf-8")
+        service = self.service("vault-legacy", ["./inbox-legacy"])
+        with contextlib.chdir(self.work / "elsewhere"), self.assertRaises(
+            NotConfiguredError
+        ) as caught:
+            service.watch_once()
+        self.assertEqual(
+            caught.exception.details["sources"][0]["found_at_cwd"], str(legacy)
+        )
+
+    def test_a_source_that_is_not_a_string_is_refused_at_policy_load(self) -> None:
+        # `str()` coercion turned this plausible guess at the schema into a
+        # path that cannot exist, and the walk skipped it without a word.
+        with self.assertRaises(ValidationError) as caught:
+            self.service("vault-malformed", [{"type": "folder", "path": "../inbox"}])
+        self.assertEqual(caught.exception.details["index"], 0)
+
+
 class ObsidianSyncFiltersFilesTest(ServiceFixture):
     """Obsidian sync filtered the graph object and copied everything else.
 
@@ -1231,6 +1347,172 @@ class UnresolvableProvenanceFailsClosedTest(ServiceFixture):
         self.upsert_page("nota-publica", "Nota publica", "Publico. ", public_hash)
         result = self.service.search("publico", consumer="cloud")
         self.assertGreaterEqual(result["count"], 1)
+
+
+class ReaderStatusMatchesCanonicalTest(ServiceFixture):
+    """`/api/status` used the pre-widening definition of `healthy`.
+
+    `Health.status` was widened to `lint_ok and every non-advisory enforcement
+    layer active`; `Reader.reader_status` kept computing lint alone for a named
+    consumer, and it is `Reader` that answers `/api/status`. So the web viewer
+    printed "healthy" for a vault whose write gate was not running -- the same
+    divergence `bk status` was fixed for, on the one surface with no enforcement
+    rows below the headline to contradict it.
+
+    The predicate now lives once, as `health.enforcement_ok`, imported by
+    `Reader.reader_status` rather than re-derived -- it was written twice
+    before this, one copy per surface, which is exactly the drift that
+    produced the bug this test class pins down. These tests stay: they drive
+    real enforcement states through both callers and assert the answers agree,
+    which a single shared function cannot guarantee on its own if a future
+    edit routes one caller around it.
+    """
+
+    FILTERED = ("local", "cloud")
+
+    def install(self, *, gate: bool, session: bool, commit: bool) -> None:
+        """Put the workspace in a named enforcement state, on disk.
+
+        Writes the files and the registration `_enforcement_state` actually
+        reads, rather than patching it: a test that stubs the reader proves the
+        two surfaces agree about a stub.
+        """
+
+        hooks = self.root / ".claude" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        registered: dict[str, Any] = {}
+        for name, event, wanted in (
+            ("brainskit-gate.sh", "PreToolUse", gate),
+            ("brainskit-status.sh", "SessionStart", session),
+        ):
+            script = hooks / name
+            script.unlink(missing_ok=True)
+            if wanted:
+                script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                registered[event] = [{"hooks": [{"command": str(script)}]}]
+        (self.root / ".claude" / "settings.json").write_text(
+            json.dumps({"hooks": registered}), encoding="utf-8"
+        )
+        git_hooks = self.root / ".git" / "hooks"
+        git_hooks.mkdir(parents=True, exist_ok=True)
+        pre_commit = git_hooks / "pre-commit"
+        pre_commit.unlink(missing_ok=True)
+        if commit:
+            pre_commit.write_text("#!/bin/sh\nbk lint --changed\n", encoding="utf-8")
+
+    def test_every_consumer_agrees_with_bk_status_on_healthy(self) -> None:
+        states = [
+            {"gate": True, "session": True, "commit": True},
+            {"gate": False, "session": True, "commit": True},
+            {"gate": True, "session": False, "commit": True},
+            {"gate": True, "session": True, "commit": False},
+            {"gate": False, "session": False, "commit": False},
+        ]
+        for state in states:
+            with self.subTest(**state):
+                self.install(**state)
+                canonical = self.service.status()["healthy"]
+                self.assertEqual(canonical, all(state.values()))
+                for consumer in ("human", *self.FILTERED):
+                    value = self.service.reader_status(consumer=consumer)
+                    self.assertEqual(value["healthy"], canonical)
+                    self.assertEqual(value["lint_errors"], 0)
+
+    def test_the_write_gate_being_off_is_enough_to_sink_it(self) -> None:
+        """The headline case, isolated: everything else installed, gate absent.
+
+        Reported healthy before the fix, with `lint_errors: 0` beside it, on a
+        vault a Write tool could walk straight into.
+        """
+
+        self.install(gate=False, session=True, commit=True)
+        for consumer in self.FILTERED:
+            with self.subTest(consumer=consumer):
+                value = self.service.reader_status(consumer=consumer)
+                self.assertFalse(value["healthy"])
+                self.assertEqual(value["lint_errors"], 0)
+                self.assertFalse(value["enforcement"]["gated"])
+                self.assertIn("write_gate", value["enforcement"]["inactive"])
+
+    def test_an_advisory_layer_alone_does_not_sink_it(self) -> None:
+        """Excluded for the reason `Health.status` excludes it.
+
+        The CLAUDE.md block informs; it stops nothing. A headline that fired on
+        it would fire for something no mechanism was ever going to catch, and a
+        headline that always reads red is one nobody reads.
+        """
+
+        self.install(gate=True, session=True, commit=True)
+        for consumer in self.FILTERED:
+            with self.subTest(consumer=consumer):
+                value = self.service.reader_status(consumer=consumer)
+                self.assertTrue(value["healthy"])
+                self.assertIn("instructions", value["enforcement"]["inactive"])
+
+    def test_enforcement_carries_no_machine_paths(self) -> None:
+        """What the layer is, never where it lives.
+
+        `detail` interpolates the workspace root and the redirected hooks
+        directory; `script` is an absolute path added for `bk doctor`, which
+        opens the file. The viewer only has to name the layer that is off, and a
+        hook path names a local filesystem layout.
+        """
+
+        self.install(gate=True, session=True, commit=True)
+        for consumer in self.FILTERED:
+            with self.subTest(consumer=consumer):
+                enforcement = self.service.reader_status(consumer=consumer)[
+                    "enforcement"
+                ]
+                blob = json.dumps(enforcement)
+                self.assertNotIn(str(self.root), blob)
+                self.assertNotIn(".claude/hooks", blob)
+                for layer in enforcement["layers"]:
+                    self.assertNotIn("detail", layer)
+                    self.assertNotIn("script", layer)
+                    self.assertIn("layer", layer)
+                    self.assertIn("active", layer)
+
+    def test_a_redacted_pages_lint_error_stays_out_of_a_filtered_headline(
+        self,
+    ) -> None:
+        """The asymmetry between the two halves, stated as a test.
+
+        Enforcement is not evidence, so it is reported the same to everyone.
+        Findings are: an error on a page a consumer may not see must not flip
+        that consumer's headline, or restricted content decides an answer it is
+        not allowed to reach -- and `lint_errors` would read 0 right beside it.
+
+        Filed into `20-research`, which is `local-only`, so the one page splits
+        the two consumers: `local` sees the finding and goes red, `cloud` sees
+        neither the page nor the finding and stays green. A `never-ingest`
+        branch would be hidden from both and prove only half of it.
+        """
+
+        self.install(gate=True, session=True, commit=True)
+        secret_hash = self.capture_into(
+            "20-research", text="Plano confidencial.", title="segredo"
+        )
+        path = self.upsert_page("segredo", "Segredo", "Confidencial. ", secret_hash)
+        # Appending to a tracked page outside `bk apply` is what
+        # `wiki.outside_apply` reports, at severity error.
+        with (self.root / path).open("a", encoding="utf-8") as handle:
+            handle.write("\nReescrito fora do portao.\n")
+        findings = self.service.lint()["findings"]
+        self.assertTrue(
+            any(
+                item["severity"] == "error" and item.get("path") == path
+                for item in findings
+            ),
+            findings,
+        )
+        self.assertFalse(self.service.status()["healthy"])
+        cloud = self.service.reader_status(consumer="cloud")
+        self.assertEqual(cloud["lint_errors"], 0)
+        self.assertTrue(cloud["healthy"])
+        local = self.service.reader_status(consumer="local")
+        self.assertEqual(local["lint_errors"], 1)
+        self.assertFalse(local["healthy"])
 
 
 if __name__ == "__main__":

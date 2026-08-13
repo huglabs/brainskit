@@ -9,6 +9,188 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-08-13
+
+### Changed — before you upgrade: two paths in your config resolve somewhere else
+
+Both entries change what an existing, working `.brain/config.json` does. Neither
+is opt-in, and a configuration that was correct under the old rule can be wrong
+under the new one without anything about it changing.
+
+- **A relative `sources` entry is now resolved against the vault root instead of
+  the directory `bk` happens to be run from, so a vault that was capturing files
+  may capture none after this upgrade — and now says so instead of reporting
+  success.** Under the old rule the same policy meant a different folder
+  depending on where the operator was standing, and the documented automation
+  path is the one where that always went wrong: `bk schedule` hands you a cron
+  expression and a command to register, and cron runs jobs from `$HOME`. A
+  source root that does not exist was walked in silence — the walker returns
+  immediately on anything that is not a directory — so a scheduled watch
+  reported `created 0` and exit 0 forever, and neither `bk status` nor `bk lint`
+  mentioned it.
+
+  When **no** configured source resolves, `bk watch` now refuses with
+  `not_configured` and exit 2, because that is a configuration nobody can work
+  around and amounts to the "no sources configured" state that was already
+  refused. The refusal names each source, the path it resolved to, and — when
+  the folder is still sitting where the old rule would have found it —
+  `found_at_cwd`, so the fix is a path you can paste back into `sources`. When
+  **some** sources resolve there is still real work to do, so the walk runs, the
+  command still succeeds, and each missing source is reported in `failures[]`
+  with the same sentence. Absolute paths are unaffected, and `~` is still
+  expanded.
+
+  A `sources` entry that is not a string, or is blank, is now rejected as
+  `validation_error` when the policy is read, naming the offending index.
+  `str()` coercion used to accept anything: `{"type": "folder", "path":
+  "../inbox"}` — a reasonable guess at the schema — became the literal filename
+  `"{'type': 'folder', 'path': '../inbox'}"`, which cannot exist and was skipped
+  without a word.
+
+- **The Obsidian integration's `path` option is resolved against the vault too,
+  and unlike `sources` this one writes.** A relative destination that has been
+  syncing to one directory will sync to another after this upgrade. The old code
+  resolved against the current directory and then called `mkdir(parents=True)`,
+  so a sync started from anywhere else did not merely look in the wrong place —
+  it built a complete Obsidian vault, `.obsidian/app.json` and all, wherever the
+  process started. The guard that refuses a target nested inside the source
+  vault was validating that same unnamed location, so it was answering about a
+  directory the operator had never chosen either.
+
+  Where the recorded manifest shows this vault already mirrored somewhere that
+  is not under the new target, sync **refuses** with `not_configured` and names
+  both locations rather than silently starting a second copy — an orphaned
+  Obsidian vault keeps opening for its owner while every later sync updates a
+  mirror nobody reads. Three cases pass through untouched: an absolute
+  destination, which was never ambiguous; a first sync, which has orphaned
+  nothing; and a mirror already inside the new target, which is the operator
+  whose relative path was unambiguous all along. `bk integration status
+  obsidian` resolves the same way, so it stops reporting `ready` or `not-synced`
+  for one unchanged vault according to which directory the question was asked
+  from, and an enabled integration with an empty `path` reports `not-synced`
+  rather than resolving to the vault itself and reporting `ready` forever. See
+  [Obsidian](docs/integrations.md#obsidian).
+
+### Changed
+
+- **An HTTP failure from a provider is coded by its status, which changes the
+  `error.code` an agent branches on.** Every status used to be
+  `validation_error` — *"the request is malformed, fix it and send it again"* —
+  which is true of a 400 and false of everything else a provider returns. The
+  split is one question: is the failure about the bytes we sent? A **400** says
+  yes and stays `validation_error`. **401** (the credential was rejected),
+  **403** (it authenticated but is not entitled to this model or endpoint),
+  **404** (the provider does not know this endpoint or model id), **429** (the
+  quota outlasted all three attempts, `Retry-After` honoured) and **5xx** (the
+  provider accepted the request and failed to answer it on all three) are now
+  `not_configured`, because no request an agent can construct clears any of
+  them. Each refusal names its next step: the environment variable holding the
+  rejected key for a 401 and a 403, and `job_models` in `.brain/config.json`
+  plus the model the job was routed to for a 404. `details` now carries the
+  provider, the model and a `hint` alongside the status and the response body.
+  A status not in that table keeps `validation_error` deliberately, so nothing
+  changes meaning as a side effect of the table existing.
+
+- **A wrapper can no longer downgrade a narrowed error.** `bk integration up
+  postgres` caught the `NotConfiguredError` that the Docker probe raises, added
+  context, and re-raised it as a plain `ValidationError` — so the same stopped
+  daemon reported `not_configured` when reached directly and `validation_error`
+  through the command an operator actually runs, telling an agent to rewrite a
+  request against a machine where Docker was not running. Both container
+  clauses now rebuild the class from the instance they caught, leaving the
+  remedy the decision of whoever diagnosed the failure. The branch-policy reader
+  in `domain/model.py` had the identical clause and was fixed with it; nothing
+  downgrades there today, which is exactly why it was worth closing — a wrapper
+  that widens the remedy is invisible until the day something it wraps learns to
+  raise a sharper class.
+
+### Fixed
+
+- **`bk status`'s headline names the layer that is off.** It restated `healthy`
+  as a lint-error count, which was true only while `healthy` meant lint alone;
+  since 0.6.0 it also means every enforcement layer that enforces is running. So
+  a vault with clean pages and no gate printed `✗ 0 lint error(s)` — a red cross
+  above a zero — and that was the permanent, default outcome of the documented
+  quickstart, because `bk init` outside a git repository can never make
+  `commit_lint` active. It now reads `✗ enforcement off: commit_lint`, names
+  every input `healthy` has, and falls back to `not healthy; see the rows below`
+  rather than inventing a reason it cannot name. The enforcement table draws the
+  advisory layer as `instructions (advisory)` and mutes it, so its tick stops
+  reading as a fourth guarantee the vault does not have — said in the layer name
+  rather than in colour, because this output is usually read through a pipe.
+- **`bk doctor` had the identical defect and now says `✗ write gate
+  not_enforcing`.** With every grammar installed and a gate failing open it
+  printed `✗ 0 language(s) cannot be parsed`, never mentioning the gate, on the
+  one run whose whole purpose is to exercise it.
+- **`/api/status` and the web viewer use the same definition of `healthy` as the
+  CLI**, computed by one shared predicate rather than by each surface taking its
+  own slice of the same report. The viewer said `healthy` while the write gate
+  was off — the divergence `bk status` was fixed for in 0.6.0, on the one
+  surface with no enforcement rows underneath to contradict it. `/api/status`
+  now carries an `enforcement` object (`gated`, `inactive`, and per-layer
+  `layer`, `mechanism`, `active`, `advisory`), and the viewer's header names the
+  reason: *needs attention: 2 lint errors; write_gate not active*. The `detail`
+  and `script` fields are withheld, for minimality rather than privacy — they
+  interpolate local filesystem layout a viewer has no use for. Lint findings
+  stay consumer-scoped and enforcement state does not, deliberately: a finding
+  on a redacted page must not flip a filtered consumer's headline while
+  `lint_errors` reads 0 beside it, whereas a hook is installed or it is not,
+  identically for whoever asks.
+- **`graph/graph.json` and `views/` report `malformed` instead of `fresh` when
+  the artefact is unusable.** The fingerprint lives in `freshness.json`, so
+  overwriting `graph/graph.json` with `{{{ not json at all` left every input
+  untouched and the comparison — which never opens the file — answered `fresh`.
+  Integrity is now asked first and separately: the graph is checked with the
+  same detector the code graph uses, since both are node/edge documents whose
+  readers subscript `id`, `source`, `target` and `type` directly, and `views/` is
+  checked for the generated marker on the first line of `views/home.md`, matched
+  by shape so a marker written before the 0.5.0 rename still counts as generated.
+  `bk lint` reports *Derived graph/graph.json is not what bk graph writes, so it
+  answers nothing; run bk graph*. The `stale` boolean is set from an allowlist of
+  the states that mean "regenerate this", so a state added later cannot default
+  into looking healthy, and `bk status` renders `malformed` in red — the state
+  colours were a denylist with a calm fallback, which drew both `malformed` and
+  `partial` in the same grey as `missing`.
+- **`bk lint` covers `wiki/index.md` and `wiki/log.md`, and no page can exempt
+  itself from `wiki.outside_apply` any more.** The exemption keyed on a page's
+  own `type: "system"` frontmatter, so the file being checked decided whether it
+  would be checked: writing four words into any header under `wiki/` bought
+  permanent silence, and the two pages `bk init` genuinely does seed were never
+  looked at either — appending a fabricated claim to `wiki/index.md` produced no
+  finding at all while `bk gate check-write` refused the same path. The two
+  seeded pages are now named in a constant, and one still holding nothing but
+  its heading passes; anything appended reports *Wiki page changed outside the
+  apply gate*. The gate hook may fail open only because lint reports the bypass
+  afterwards — its own header comment says so — which has to hold for every page
+  the gate covers rather than for seven of nine.
+- **The apply gate's duplicate-detection catalog no longer skips `type:
+  "system"` pages either.** A page hand-written under `wiki/` with that type and
+  a stolen title vanished from the catalog entirely, so `duplicate_identity`
+  never fired against it. The seeded pages are *not* exempt here, unlike in the
+  lint check, because the two lists answer different questions that only happen
+  to agree today: `wiki/index.md` genuinely occupies the title *Brainskit index*
+  and the slug `index`, so a proposal claiming either is a duplicate and refusing
+  it is the check working.
+- **`bk hooks install` migrates a pre-rename install instead of leaving it
+  registered beside the new one.** If you installed the agent contract before
+  the 0.5.0 rename, this is the release that finishes it: every lookup keyed on
+  the current name, so the old `brainkit-gate` stayed registered and kept firing
+  every session against whatever vault it was baked with, the old scripts stayed
+  on disk beside the current ones, and the instruction file ended up with **two**
+  managed blocks disagreeing about which vault the workspace has. `--force` did
+  not help, because it decides whether to clobber an install that is currently
+  the right one — so migration now runs without it, or the default upgrade path
+  would keep silently running two gates. A legacy hook command is unregistered;
+  its script is deleted when it still carries the sentinel proving an earlier
+  install generated it, and otherwise unregistered and **left on disk with the
+  reason**, because deleting a file the operator edited is a different act from
+  dropping a settings entry. A legacy `.claude/skills/` directory is reported and
+  never removed — markdown carries no such proof, and deleting on a guess is
+  worse than the debris. A legacy managed block is retired from the instruction
+  file, and the first one retired inherits the new block's position, so the
+  contract stays where it was last read. Every action, including each file left
+  in place and why, prints to stderr under `bk: RENAME`.
+
 ## [0.6.1] — 2026-08-13
 
 A four-track review of the published 0.6.0 — a fresh install from PyPI, an
@@ -268,7 +450,8 @@ First tagged release: the M0–M3 local walking skeleton.
 - Delivery gated on the shipped wheel — built from the sdist, installed in a
   throwaway environment and driven through the real CLI contract.
 
-[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/huglabs/brainskit/releases/tag/v0.6.2
 [0.6.1]: https://github.com/huglabs/brainskit/releases/tag/v0.6.1
 [0.6.0]: https://github.com/huglabs/brainskit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/huglabs/brainskit/releases/tag/v0.5.0

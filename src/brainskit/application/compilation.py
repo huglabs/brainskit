@@ -362,12 +362,41 @@ class ApplyGate:
         return failures
 
     def _wiki_catalog(self) -> list[dict[str, Any]]:
+        """Every page under `wiki/`, as the identities and bodies it occupies.
+
+        There is no exemption, and that is the point. This used to skip any page
+        whose own frontmatter said `type: "system"`, which let a page opt itself
+        out of the duplicate check by writing four words into its own header --
+        the same fault `wiki.outside_apply` was fixed for, where the file being
+        checked decided whether it would be checked. A page hand-written under
+        `wiki/` with `type: "system"` and a stolen title vanished from the
+        catalog entirely, so `duplicate_identity` never fired against it.
+
+        The seeded pages `bk init` writes are *not* exempted here, unlike in
+        `SEEDED_SYSTEM_PAGES`, because the two lists answer different questions
+        that only coincidentally agree today. That constant answers "which pages
+        may exist with no entry in the freshness ledger" -- a provenance
+        question, where init's pages are a genuine special case. This asks "which
+        titles, aliases and bodies are already taken", and `wiki/index.md`
+        genuinely takes the title "Brainskit index" and the slug `index`. A
+        proposal claiming either is a duplicate, and refusing it is the check
+        working rather than a false positive. Sharing one constant would couple
+        them, so that seeding a third page would silently grant it a dedupe
+        exemption nobody argued for -- which is this defect again, one release
+        later.
+
+        `_validate_novelty` still compares bodies only within a kind. That reads
+        `type` off the page too, but it is a domain rule rather than an
+        exemption: a `source` page and a `concept` page about the same evidence
+        are different artefacts and comparing their prose means nothing. For a
+        page `bk apply` wrote, that field is what apply itself wrote; for one it
+        did not, `wiki.outside_apply` is the finding that says so.
+        """
+
         catalog: list[dict[str, Any]] = []
         for path in self.vault.wiki_pages():
             content = self.vault.read_text(path)
             metadata, body = parse_frontmatter(content)
-            if metadata.get("type") == "system":
-                continue
             catalog.append(
                 {
                     "path": path,

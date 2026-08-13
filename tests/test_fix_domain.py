@@ -880,6 +880,79 @@ class BranchPolicyDetailTest(unittest.TestCase):
         config = VaultConfig.from_dict(policy())
         self.assertIn("20-research", config.branches)
 
+    def test_a_rejected_branch_still_reads_as_a_bad_request(self) -> None:
+        """`BranchPolicy.from_dict` raises plain `ValidationError`, so this must.
+
+        The invariant below says a wrapper preserves what it caught. This says
+        what it catches today, so preserving it cannot quietly become a
+        sharpening nobody asked for.
+        """
+
+        def mutate(raw: dict) -> None:
+            raw["branches"]["20-research"]["privacy"] = "cloud-ok"
+
+        with self.assertRaises(ValidationError) as rejected:
+            VaultConfig.from_dict(self.config_with(mutate))
+        self.assertIs(type(rejected.exception), ValidationError)
+        self.assertEqual(rejected.exception.code, "validation_error")
+
+
+class ContextWrappersNeverWidenTheRemedyTest(unittest.TestCase):
+    """The dormant twin of S2-5, stated as the invariant rather than the case.
+
+    `_branch_policy` exists only to say *which* branch was rejected. Naming
+    `ValidationError` in its `raise` made it decide the remedy as well: the
+    four sharper classes subclass `ValidationError`, so a `NotConfiguredError`
+    passing through would have left as a plain `validation_error` -- telling
+    the operator to fix their request when the answer was to go configure
+    something.
+
+    Nothing raises a sharper class through here today, which is exactly why
+    the test is written against the *invariant* and not against a live path.
+    A wrapper that widens the remedy is invisible until the day the thing it
+    wraps learns a new class, and then it surfaces as a misleading message
+    rather than as a failure. Pinned against all five so the next subclass
+    added to the taxonomy is covered without anyone remembering this clause
+    exists.
+    """
+
+    def test_a_wrapper_never_widens_the_remedy_it_was_handed(self) -> None:
+        from brainskit.domain import model as module
+
+        for error_class in (
+            ValidationError,
+            NotConfiguredError,
+            ConflictError,
+            RefusalError,
+            ModelResponseError,
+        ):
+            with self.subTest(error_class.__name__):
+                with mock.patch.object(
+                    module.BranchPolicy,
+                    "from_dict",
+                    side_effect=error_class("policy said no", details={"field": "x"}),
+                ):
+                    with self.assertRaises(ValidationError) as raised:
+                        module._branch_policy({}, source="20-research")
+                self.assertIs(type(raised.exception), error_class)
+                self.assertEqual(raised.exception.code, error_class.code)
+
+    def test_the_wrapper_still_attaches_the_context_it_exists_for(self) -> None:
+        """Preserving the class must not cost the diagnosis it was added for."""
+
+        from brainskit.domain import model as module
+
+        with mock.patch.object(
+            module.BranchPolicy,
+            "from_dict",
+            side_effect=NotConfiguredError("policy said no", details={"field": "x"}),
+        ):
+            with self.assertRaises(ValidationError) as raised:
+                module._branch_policy({}, source="20-research")
+        self.assertEqual(raised.exception.details["branch"], "20-research")
+        self.assertEqual(raised.exception.details["field"], "x")
+        self.assertEqual(str(raised.exception), "policy said no")
+
 
 class ValidatorCompilationTest(unittest.TestCase):
     """Compiling a JSON Schema is the expensive half of validating against it."""

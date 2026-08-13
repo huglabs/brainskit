@@ -173,11 +173,31 @@ def link(text: str, url: str, *, stream: IO[str] | None = None) -> str:
     return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
 
 
+#: Every projection/freshness state, mapped to what it means for the reader.
+#
+# `missing` is the one quiet state and it is quiet on purpose: a vault that has
+# not generated an artefact yet is healthy, and nothing needs doing. Every other
+# named state is a fault of some degree -- `stale` and `partial` say regenerate,
+# `malformed` says the file cannot be what it claims to be.
+#
+# The default is WARN, never MUTED. `malformed` and `partial` both spent their
+# first release rendering in the same grey as `missing` because the map was a
+# denylist with a calm fallback, so a state nobody had thought about read as the
+# healthy one. An unrecognised state is at minimum "this renderer does not know
+# what that is", which is not a thing to draw quietly.
+_STATE_COLORS = {
+    "fresh": OK,
+    "stale": WARN,
+    "partial": WARN,
+    "malformed": ERR,
+    "missing": MUTED,
+}
+
+
 def state_tag(state: str, *, stream: IO[str] | None = None) -> str:
     """Color a projection/freshness state word consistently everywhere."""
 
-    color = {"fresh": OK, "stale": WARN, "missing": MUTED}.get(state, MUTED)
-    return style(state, color, stream=stream)
+    return style(state, _STATE_COLORS.get(state, WARN), stream=stream)
 
 
 def status_line(ok: bool, message: str, *, stream: IO[str] | None = None) -> str:
