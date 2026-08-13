@@ -9,6 +9,82 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+Remediation of a five-agent field audit of 0.5.0. The defects clustered in one
+place: the mechanisms meant to *refuse*, and the surfaces reporting on them. A
+check verified that a thing existed rather than that it worked, or resolved an
+unknown to the permissive answer instead of the safe one.
+
+### Fixed — the privacy boundary
+
+- A wiki page whose cited sources no longer resolve is treated as
+  **`never-ingest`**, not `cloud`. Unresolvable hashes were dropped and the
+  empty remainder answered `cloud`, so forgetting a `never-ingest` source did
+  not redact the pages built from it — it published them, stamped
+  `"privacy": "cloud"`.
+- **Obsidian sync filters `wiki/` and `raw/`**, not only the graph object. Files
+  were chosen by walking the filesystem, so a compiled page leaked under default
+  options and raw `never-ingest` bytes leaked under `--include-raw`, into what is
+  usually an iCloud- or Dropbox-backed directory.
+- `bk graph` writes inside a consumer boundary (default `local`) and stamps which
+  one. It previously wrote an unfiltered artifact carrying `never-ingest` hashes,
+  filenames and branch names.
+- `strictest_privacy` requires an explicit `on_empty`. The old `cloud` default
+  was justified by a docstring asserting every caller checked provenance first;
+  one did not.
+
+### Fixed — surfaces that reported what they had not checked
+
+- The SessionStart hook renders `enforcement.layers[]` from the status document
+  it already holds, instead of recomputing it as `[ -x gate.sh ]` and
+  `[ -f .git/hooks/pre-commit ]` — which announced "active" in exactly the two
+  cases `bk status` had learned to catch.
+- `bk status`'s `healthy` headline means enforcement as well as lint. It printed
+  green above three red enforcement rows.
+- `bk gate check-write` resolves a relative path against the current directory,
+  like every other command. The same file spelled two ways got opposite verdicts.
+- Every `bk code` traversal carries a staleness signal. `hubs` cited files
+  deleted months earlier, with line numbers and no caveat.
+- The graph counts citations it could not resolve, agreeing with `bk lint`
+  instead of dropping them silently.
+
+### Fixed — correctness
+
+- An unconfigured branch raises `PolicyError` instead of a bare `KeyError` that
+  escaped four read paths after the documented `bk reconcile`, bypassing the JSON
+  error envelope entirely.
+- `search(limit=N)` returns N. It returned N+1 for N below 4.
+- Provider outages report `not_configured` rather than `validation_error`, which
+  told an agent to rewrite a well-formed request against a provider that was down.
+- Duplicate slugs across page kinds are refused at apply and reported by
+  `bk lint`. Two pages with one stem meant every `[[link]]` resolved to whichever
+  directory sorted later.
+- `bk --version` reports the distribution version. It said `0.4.0` against a
+  `0.5.0` release, through a gate built to catch exactly that.
+
+### Added
+
+- `bk init --print-config [--preset …]` — a complete, schema-valid policy on
+  stdout, so a vault can be created without a terminal. This unblocks CI,
+  containers and agent-driven setup, none of which could initialise a vault at
+  all before.
+- `taxonomy_seed` has a reader: it marks the vault's declared branches for the
+  filing proposal. It was a required key with no readers.
+- `bk capture` has a human renderer naming the hash and the next command.
+- Help text for 61 options and 17 positionals; every leaf command's help now
+  names `--vault` and `--json`.
+
+### Changed
+
+- `cycles` and `diff` are computed on brainskit's own graph. They delegated to
+  `graphify.analyze`, which loaded 2,487 lines of vendored builder and networkx
+  to reach a thirteen-line helper — so both now answer with no optional
+  dependency installed. `analyze.py`, `build.py` and `validate.py` are removed
+  from the vendored tree, declared in its `NOTICE`.
+- The jsonschema engine moved out of `domain/`, which now imports nothing beyond
+  the standard library.
+- The web API is documented as what it is: eleven read endpoints and four that
+  write, guarded by `--consumer human`.
+
 ## [0.5.0] — 2026-08-12
 
 ### Added
