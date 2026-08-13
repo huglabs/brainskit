@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 from brainskit.application.pages import parse_frontmatter
 from brainskit.domain.model import (
+    PolicyError,
     PrivacyMode,
     SourceRecord,
     ValidationError,
@@ -74,8 +75,37 @@ def _context_branches(context: dict[str, Any]) -> list[str]:
 
 def _privacy_for_record(config: Any, record: SourceRecord) -> PrivacyMode:
     branch = _record_branch(record)
-    policy = config.inbox_policy if branch == "_inbox" else config.branches[branch]
-    return PrivacyMode(policy.privacy)
+    return PrivacyMode(_branch_policy(config, branch).privacy)
+
+
+def _branch_policy(config: Any, branch: str) -> Any:
+    """The policy governing `branch`, or a refusal naming it.
+
+    This was `config.branches[branch]`, a direct subscript, where
+    `infrastructure/llm.py` already used `.get()` and raised `PolicyError` for
+    the identical question. A file dropped into a directory that is not a
+    configured branch -- then registered by the *documented* `bk reconcile` --
+    made `search`, `browse_sources`, `graph_data` and `export` raise a bare
+    `KeyError`. Not being a `BrainskitError`, it bypassed the JSON envelope and
+    the exit codes: an unhandled traceback on the CLI, a 500 in the viewer.
+    """
+
+    if branch == "_inbox":
+        return config.inbox_policy
+    policy = config.branches.get(branch)
+    if policy is None:
+        raise PolicyError(
+            "No privacy policy exists for this branch",
+            details={
+                "branch": branch,
+                "configured": sorted(config.branches),
+                "hint": (
+                    "Move the source into a configured branch with bk file, "
+                    "or add the branch to the vault policy"
+                ),
+            },
+        )
+    return policy
 
 
 def _evidence_privacy(
@@ -90,16 +120,41 @@ def _evidence_privacy(
     metadata, _ = parse_frontmatter(content)
     source_hashes = metadata.get("sources", [])
     if not isinstance(source_hashes, list):
+        # `sources` present but not a list: the page declares provenance we
+        # cannot read. Same epistemic state as one that does not resolve.
+        return PrivacyMode.NEVER_INGEST
+    if not source_hashes:
+        # Declares no provenance at all -- a system page, legitimately cloud.
+        # This is the case a blanket "unknown means never-ingest" would break.
         return PrivacyMode.CLOUD
-    return strictest_privacy(
-        _privacy_for_record(config, records[content_hash])
+    resolved = [
+        records[content_hash]
         for content_hash in source_hashes
         if content_hash in records
+    ]
+    if len(resolved) != len(source_hashes):
+        # Declares provenance that does not resolve. Dropping the unresolvable
+        # hashes and asking `strictest_privacy` for the remainder answered CLOUD
+        # on an empty set, so forgetting a never-ingest source *declassified*
+        # every page built from it instead of redacting them.
+        #
+        # A partial resolution is still unknown provenance: the hash that went
+        # missing could have been the restricted one, and there is no way left
+        # to tell. `Enrichment.privacy_of` already answers this identically.
+        return PrivacyMode.NEVER_INGEST
+    return strictest_privacy(
+        (_privacy_for_record(config, record) for record in resolved),
+        # Unreachable: `resolved` is non-empty and fully resolved by here. Stated
+        # anyway, because the parameter exists precisely so that no call site can
+        # leave the question implicit.
+        on_empty=PrivacyMode.NEVER_INGEST,
     )
 
 
-def strictest_privacy(modes: Iterable[PrivacyMode]) -> PrivacyMode:
-    """The most restrictive policy in `modes`, defaulting to the most open.
+def strictest_privacy(
+    modes: Iterable[PrivacyMode], *, on_empty: PrivacyMode
+) -> PrivacyMode:
+    """The most restrictive policy in `modes`.
 
     Named and shared rather than repeated: derived evidence and model-inferred
     enrichment both answer "what may this be shown to" by taking the strictest
@@ -107,13 +162,19 @@ def strictest_privacy(modes: Iterable[PrivacyMode]) -> PrivacyMode:
     judgment router applies when evidence spans branches. Two copies of a
     privacy rule is one copy too many -- the second is where they drift.
 
-    An empty `modes` means nothing classifiable contributed. `CLOUD` is the
-    honest answer there only because every caller checks provenance resolves
-    *first*: `Enrichment.apply` refuses an edge whose sources are unknown, so
-    "no contributing source" never reaches this function from that path.
+    `on_empty` is required, and that is the whole point. This function used to
+    default an empty `modes` to `CLOUD`, justified by a docstring asserting that
+    *every* caller checks provenance resolves first. `_evidence_privacy` was a
+    caller that did not, so forgetting a `never-ingest` source declassified every
+    page built from it. An invariant that is asserted rather than enforced is
+    documentation of a bug that has not happened yet; making the answer a
+    required argument means the next caller cannot omit the decision by
+    accident.
     """
 
     collected = set(modes)
+    if not collected:
+        return on_empty
     if PrivacyMode.NEVER_INGEST in collected:
         return PrivacyMode.NEVER_INGEST
     if PrivacyMode.LOCAL_ONLY in collected:

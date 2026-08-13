@@ -306,9 +306,11 @@ class BrainskitService:
         """Structural change between the stored graph and a second one."""
         return self.code_graph.diff(against, consumer=consumer)
 
-    def graph(self, *, html: bool = False) -> dict[str, Any]:
+    def graph(
+        self, *, consumer: str = "local", html: bool = False
+    ) -> dict[str, Any]:
         """Regenerate the knowledge graph. See `Projections`."""
-        return self.projections.graph(html=html)
+        return self.projections.graph(consumer=consumer, html=html)
 
     def graph_data(
         self,

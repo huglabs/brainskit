@@ -181,8 +181,14 @@ class Enrichment:
         if not hashes:
             return PrivacyMode.NEVER_INGEST
         return strictest_privacy(
-            _privacy_for_record(config, records[content_hash])
-            for content_hash in hashes
+            (
+                _privacy_for_record(config, records[content_hash])
+                for content_hash in hashes
+            ),
+            # `hashes` is non-empty here -- the guard above returns first. The
+            # answer is stated rather than defaulted so this call site cannot
+            # drift into the failure `_evidence_privacy` had.
+            on_empty=PrivacyMode.NEVER_INGEST,
         )
 
     def orphaned(self) -> list[dict[str, Any]]:

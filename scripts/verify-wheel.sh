@@ -65,6 +65,24 @@ if missing:
 print(f"    ok: {sum(len(v) for v in expected.values())} resources")
 PY
 
+echo "==> version agreement"
+# Asserted against the INSTALLED wheel, not the working tree: the drift that
+# shipped as 0.5.0-with-bk-0.4.0 was invisible to every repo-level check,
+# because `release.yml` compared the tag to `[project].version` and nothing
+# ever asked the artifact what it thought it was.
+INSTALLED="$("$PY" -c 'import brainskit; print(brainskit.__version__)')"
+REPORTED="$("$BK" --version | awk '{print $NF}')"
+METADATA="$("$PY" -c 'from importlib.metadata import version; print(version("brainskit"))')"
+for pair in "__version__:$INSTALLED" "bk --version:$REPORTED" "dist metadata:$METADATA"; do
+    label="${pair%%:*}"
+    value="${pair#*:}"
+    if [ "$value" != "$VERSION" ]; then
+        echo "    $label reports $value, expected $VERSION"
+        exit 1
+    fi
+done
+echo "    ok: __version__, bk --version and metadata all report $VERSION"
+
 echo "==> CLI contract"
 "$PY" - "$ROOT/tests" "$WORK/policy.json" <<'PY'
 import json

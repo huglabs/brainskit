@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -458,6 +461,105 @@ class GateServiceDelegationTest(GateFixture):
             self.service().gate_check_write(target),
             check_write(self.root, target).to_dict(),
         )
+
+
+class GateCliPathBaseTest(GateFixture):
+    """`bk gate check-write` must answer the same for one file, spelled two ways.
+
+    `check_write` resolves a relative target against the *vault root*, which is
+    deliberate and correct for the installed hook -- it always passes absolute
+    paths. But it is the opposite of every other command, and it was stated in
+    neither `--help` nor `docs/commands.md`, so:
+
+        bk gate check-write docs/brain/wiki/concepts/x.md   -> allowed, exit 0
+        bk gate check-write $PWD/docs/brain/wiki/concepts/x.md -> gated, exit 2
+
+    Same file, same command, opposite answers. Production enforcement was never
+    at risk; what was at risk is the command a human or an agent runs to verify
+    the gate by hand, which returned a confident wrong answer with exit 0.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A real vault, not just the directory shape. `bk` exits 2 with "Not a
+        # brainskit vault" otherwise -- the same exit code the gate uses to deny,
+        # so every assertion here would pass without the gate running at all.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_engine import policy as engine_policy
+
+        from brainskit.infrastructure.vault import FileVault
+
+        FileVault.initialize(self.root, engine_policy())
+
+    def run_cli(self, argv: list[str], cwd: Path) -> tuple[int, str]:
+        from brainskit.interfaces import cli
+
+        previous = os.getcwd()
+        buffer = io.StringIO()
+        os.chdir(cwd)
+        try:
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+                code = cli.main(argv)
+        finally:
+            os.chdir(previous)
+        output = buffer.getvalue()
+        # Any of these means the CLI failed before the gate ran, and every
+        # assertion below would then be comparing two identical errors rather
+        # than two verdicts. A NameError in the resolver did exactly that once.
+        for vacuous in ("Not a brainskit vault", "unhandled internal error", "Traceback"):
+            self.assertNotIn(
+                vacuous,
+                output,
+                msg=f"the CLI never reached the gate ({vacuous}); assertion vacuous",
+            )
+        return code, output
+
+    def test_a_relative_path_from_cwd_agrees_with_its_absolute_spelling(self) -> None:
+        gated = self.root / "wiki" / "entities" / "thing.md"
+        parent = self.root.parent
+        relative = os.path.relpath(gated, parent)
+
+        absolute_code, _ = self.run_cli(
+            ["--vault", str(self.root), "gate", "check-write", str(gated)], parent
+        )
+        relative_code, _ = self.run_cli(
+            ["--vault", str(self.root), "gate", "check-write", relative], parent
+        )
+        self.assertEqual(
+            relative_code,
+            absolute_code,
+            msg="the same file got opposite verdicts depending on how it was spelled",
+        )
+        self.assertEqual(absolute_code, 2)
+
+    def test_a_path_outside_the_vault_is_still_allowed(self) -> None:
+        """Control: the gate governs the vault, not the filesystem."""
+
+        outside = self.outside / "note.md"
+        code, _ = self.run_cli(
+            ["--vault", str(self.root), "gate", "check-write", str(outside)],
+            self.outside,
+        )
+        self.assertEqual(code, 0)
+
+    def test_a_relative_path_from_inside_the_vault_is_still_gated(self) -> None:
+        """The installed hook's spelling must keep working unchanged."""
+
+        code, _ = self.run_cli(
+            ["--vault", str(self.root), "gate", "check-write", "wiki/entities/x.md"],
+            self.root,
+        )
+        self.assertEqual(code, 2)
+
+    def test_the_help_states_which_base_a_relative_path_resolves_against(self) -> None:
+        """The silence was the defect, so the disclosure is part of the fix."""
+
+        from brainskit.interfaces import cli
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), self.assertRaises(SystemExit):
+            cli.main(["gate", "check-write", "--help"])
+        self.assertIn("current directory", buffer.getvalue().lower())
 
 
 if __name__ == "__main__":

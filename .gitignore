@@ -32,8 +32,13 @@ env/
 # Vault working directories produced by running bk from the repo root.
 # A vault's own disposables (.brain/index.db and its -shm/-wal siblings) are
 # covered by the .gitignore that `bk init` writes into the vault itself.
-work/
-outputs/
+#
+# Anchored: an unanchored `work/` matches a directory of that name at ANY depth,
+# which silently swallowed `docs/work/` -- the lifecycle folder CLAUDE.md tells
+# people to write PRDs, specs and reviews into. Nothing under it was ever
+# tracked, not even its README and _TEMPLATE.
+/work/
+/outputs/
 # The comparison graph an external graphify run leaves behind: ~17 MB of
 # regenerated JSON/HTML, derived from this tree and never an input to it.
 graphify-out/

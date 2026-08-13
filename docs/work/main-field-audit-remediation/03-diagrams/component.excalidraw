@@ -1,0 +1,127 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "huglabs-diagram-skill",
+  "elements": [
+    {
+      "id": "frame-feature",
+      "type": "frame",
+      "x": 50,
+      "y": 50,
+      "width": 600,
+      "height": 250,
+      "name": "Feature Module",
+      "strokeColor": "#868e96",
+      "backgroundColor": "transparent"
+    },
+    {
+      "id": "box-component-a",
+      "type": "rectangle",
+      "x": 100,
+      "y": 120,
+      "width": 140,
+      "height": 100,
+      "strokeColor": "#1971c2",
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "roundness": { "type": 3 }
+    },
+    {
+      "id": "text-component-a",
+      "type": "text",
+      "x": 120,
+      "y": 160,
+      "width": 100,
+      "height": 25,
+      "text": "Component A",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "textAlign": "center"
+    },
+    {
+      "id": "box-component-b",
+      "type": "rectangle",
+      "x": 300,
+      "y": 120,
+      "width": 140,
+      "height": 100,
+      "strokeColor": "#1971c2",
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "roundness": { "type": 3 }
+    },
+    {
+      "id": "text-component-b",
+      "type": "text",
+      "x": 320,
+      "y": 160,
+      "width": 100,
+      "height": 25,
+      "text": "Component B",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "textAlign": "center"
+    },
+    {
+      "id": "box-component-c",
+      "type": "rectangle",
+      "x": 500,
+      "y": 120,
+      "width": 140,
+      "height": 100,
+      "strokeColor": "#1971c2",
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "roundness": { "type": 3 }
+    },
+    {
+      "id": "text-component-c",
+      "type": "text",
+      "x": 520,
+      "y": 160,
+      "width": 100,
+      "height": 25,
+      "text": "Component C",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "textAlign": "center"
+    },
+    {
+      "id": "arrow-a-b",
+      "type": "arrow",
+      "x": 240,
+      "y": 170,
+      "width": 60,
+      "height": 0,
+      "points": [[0, 0], [60, 0]],
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "startArrowhead": null,
+      "endArrowhead": "arrow"
+    },
+    {
+      "id": "arrow-b-c",
+      "type": "arrow",
+      "x": 440,
+      "y": 170,
+      "width": 60,
+      "height": 0,
+      "points": [[0, 0], [60, 0]],
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "startArrowhead": null,
+      "endArrowhead": "arrow"
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff",
+    "gridSize": 20
+  },
+  "files": {}
+}

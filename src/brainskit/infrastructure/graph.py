@@ -24,6 +24,7 @@ class MarkdownGraph:
                 "path": record.path,
             }
         slug_nodes: dict[str, str] = {}
+        unresolved = 0
         page_content: dict[str, str] = {}
         for path in vault.wiki_pages():
             content = vault.read_text(path)
@@ -44,6 +45,16 @@ class MarkdownGraph:
                     raw_id = f"raw:{content_hash}"
                     if raw_id in nodes:
                         edges.add((node_id, raw_id, "sourced_from"))
+                    else:
+                        # The edge is still dropped -- this graph promises no
+                        # dangling edges, and inventing a node for a hash that
+                        # no longer resolves would be worse. But it is counted,
+                        # because `health.py` reports this exact condition as
+                        # `wiki.unknown_source` and the two must not disagree
+                        # about whether a citation resolves. Silence here made
+                        # the provenance artifact the one place that would not
+                        # tell you provenance had broken.
+                        unresolved += 1
         for node_id, content in page_content.items():
             for raw_link in WIKI_LINK_RE.findall(content):
                 target = slug_nodes.get(PurePosixPath(raw_link.strip()).name)
@@ -51,6 +62,7 @@ class MarkdownGraph:
                     edges.add((node_id, target, "links_to"))
         return {
             "version": 1,
+            "unresolved_sources": unresolved,
             "nodes": sorted(nodes.values(), key=lambda item: item["id"]),
             "edges": [
                 {"source": source, "target": target, "type": kind}

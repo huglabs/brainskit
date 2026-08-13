@@ -76,7 +76,15 @@ class Retrieval:
         direct_limit = max(1, limit - target_graph) if target_graph else limit
         hits = ranked[:direct_limit]
         reserve = limit - len(hits)
-        expanded_candidates = self._expand_link_neighbors(hits, 100)
+        # A limit below 4 reserves no room for graph expansion, so there is
+        # nothing to expand into. Without this guard the loop below appended a
+        # neighbour *before* testing `len(expanded) >= reserve`, so a reserve of
+        # zero still admitted exactly one -- and `search(limit=N)` returned N+1
+        # for N in 1, 2, 3. It propagates into `context`, where `limit` is the
+        # caller's bound on how much evidence reaches a model.
+        expanded_candidates = (
+            self._expand_link_neighbors(hits, 100) if reserve > 0 else []
+        )
         expanded = []
         for hit in expanded_candidates:
             content = self.vault.read_text(hit.path)

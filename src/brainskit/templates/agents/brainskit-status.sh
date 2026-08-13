@@ -18,11 +18,13 @@
 set -u
 
 VAULT={{vault}}
-# Where the agent's configuration was installed, which is not always the vault:
-# the hooks, the instruction file and the git repository that tracks the vault
-# all belong to the workspace. Checking the vault for them reports a live layer
-# as OFF, which is the exact failure this script exists to surface.
-WORKSPACE={{workspace}}
+# There is deliberately no WORKSPACE here any more. The agent's configuration
+# lives outside the vault -- hooks, the instruction file, the git repository
+# that tracks it -- and this script used to locate that itself in order to
+# decide whether the commit hook was live. `bk status` already resolves the
+# enclosing repository, and knows the two things a `[ -f ]` cannot: that
+# `core.hooksPath` sends git elsewhere, and that a script on disk may be
+# registered nowhere. Asking it once beats re-deriving it badly here.
 
 note() {
     printf 'brainskit-status: %s\n' "$*" >&2
@@ -80,26 +82,17 @@ CODE_JSON=$(bk --vault "$VAULT" code status --json 2>/dev/null)
 [ -n "$LINT_JSON" ] || LINT_JSON=null
 [ -n "$CODE_JSON" ] || CODE_JSON=null
 
-HOOK_DIR=$(dirname "$0")
-if [ -x "$HOOK_DIR/brainskit-gate.sh" ]; then
-    WRITE_GATE=active
-else
-    WRITE_GATE='OFF (brainskit-gate.sh is missing; re-run bk hooks install)'
-fi
-
-if [ ! -d "$WORKSPACE/.git" ]; then
-    COMMIT_LINT='OFF (the workspace is not a git repository)'
-elif [ ! -f "$WORKSPACE/.git/hooks/pre-commit" ]; then
-    COMMIT_LINT='OFF (no pre-commit hook is installed)'
-else
-    COMMIT_LINT=active
-fi
+# Enforcement is NOT recomputed here. `$STATUS_JSON` already carries
+# `enforcement.layers[]` with `active`, `detail` and `script`, and `bk status`
+# knows things this shell cannot cheaply learn: that `core.hooksPath` sends git
+# somewhere other than `.git/hooks`, and that a script on disk is registered
+# nowhere. Re-deriving it as `[ -x gate.sh ]` and `[ -f pre-commit ]` announced
+# both of those as active -- in the block an agent reads to decide what it
+# walked into.
 
 printf '%s\n%s\n%s\n%s\n' "$STATUS_JSON" "$PROPOSALS_JSON" "$LINT_JSON" "$CODE_JSON" | python3 -c '
 import json
 import sys
-
-write_gate, commit_lint = sys.argv[1], sys.argv[2]
 
 
 def documents(raw):
@@ -196,9 +189,33 @@ elif code_state == "stale":
 elif code_state == "fresh":
     lines.append("  code graph fresh ({} files indexed)".format(code.get("files", 0)))
 
-lines.append("  enforcement write gate {} - commit lint {}".format(write_gate, commit_lint))
+# Rendered from the document, not re-derived. An advisory layer (CLAUDE.md) is
+# not enforcement, so it is not claimed as such; a layer that is off repeats the
+# reason `bk status` gave rather than inventing a second wording for it.
+LABELS = {
+    "write_gate": "write gate",
+    "session_status": "session status",
+    "commit_lint": "commit lint",
+}
+enforcement = status.get("enforcement")
+reported = enforcement.get("layers") if isinstance(enforcement, dict) else None
+parts = []
+for entry in reported if isinstance(reported, list) else []:
+    if not isinstance(entry, dict) or entry.get("advisory"):
+        continue
+    label = LABELS.get(entry.get("layer"))
+    if label is None:
+        continue
+    if entry.get("active"):
+        parts.append("{} active".format(label))
+    else:
+        parts.append("{} OFF ({})".format(label, entry.get("detail") or "not installed"))
+if parts:
+    lines.append("  enforcement " + " - ".join(parts))
+else:
+    lines.append("  enforcement not reported by this bk")
 lines.append("  evidence: bk context \"QUERY\" --consumer local --json - writes: bk apply")
 print("\n".join(lines))
-' "$WRITE_GATE" "$COMMIT_LINT"
+'
 
 exit 0

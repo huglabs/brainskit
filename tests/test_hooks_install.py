@@ -742,7 +742,15 @@ class GateCommandTest(VaultCase):
             ["gate", "check-write", "x.md", "--agent", "codex"], ALLOW_DECISION
         )
         self.assertEqual(self.stub.call_args.kwargs["agent"], "codex")
-        self.assertEqual(self.stub.call_args.args, ("x.md",))
+        # A relative target is absolutised against the caller's directory before
+        # it reaches the service: `check_write` resolves relative paths against
+        # the *vault root*, so `bk gate check-write wiki/x.md` from anywhere
+        # else answered about a different file than the one named -- with
+        # exit 0. The installed hook always passes absolute paths and is
+        # unaffected. See `GateCliPathBaseTest`.
+        self.assertEqual(
+            self.stub.call_args.args, (str(Path.cwd() / "x.md"),)
+        )
 
     def test_a_decision_without_a_verdict_is_an_internal_error_not_a_denial(
         self,
@@ -1305,8 +1313,14 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
             if line.startswith(("VAULT=", "WORKSPACE="))
         }
         self.assertEqual(assigned["VAULT"], shlex.quote(str(self.root)))
-        self.assertEqual(assigned["WORKSPACE"], shlex.quote(str(self.project)))
-        self.assertIn('"$WORKSPACE/.git"', script)
+        # The hook no longer locates the workspace or inspects git itself. It
+        # used to, and answered "commit lint active" for a Husky repository and
+        # for hooks that nothing registers -- the two cases `bk status` had
+        # already learned to catch. The workspace question is now asked once, of
+        # `bk status`, and `NestedVaultEnforcementReportingTest` pins that it
+        # names the enclosing repository rather than the vault.
+        self.assertNotIn("WORKSPACE", assigned)
+        self.assertNotIn(".git/hooks/pre-commit", script)
         self.assertNotIn('"$VAULT/.git"', script)
 
     def test_no_template_placeholder_survives_rendering(self) -> None:

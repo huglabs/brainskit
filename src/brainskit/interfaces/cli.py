@@ -61,6 +61,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", help="Complete policy JSON path, or - for standard input"
     )
     init.add_argument(
+        "--print-config",
+        action="store_true",
+        help=(
+            "Print a complete, schema-valid policy on stdout and exit without "
+            "creating anything -- the non-interactive path for CI, containers "
+            "and agents. Pipe it back in with --config"
+        ),
+    )
+    init.add_argument(
+        "--preset",
+        default="work",
+        help="Branch layout for --print-config (default: work)",
+    )
+    init.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -134,7 +148,15 @@ def build_parser() -> argparse.ArgumentParser:
     gate_check = gate_sub.add_parser(
         "check-write", help="Exit 0 when a direct write is allowed, 2 when denied"
     )
-    gate_check.add_argument("path", metavar="PATH", help="Path a tool wants to write")
+    gate_check.add_argument(
+        "path",
+        metavar="PATH",
+        help=(
+            "Path a tool wants to write. A relative path resolves against the "
+            "current directory, like every other command; the installed hook "
+            "passes absolute paths and is unaffected"
+        ),
+    )
     gate_check.add_argument(
         "--agent", default="claude", help="Policy adapter to consult"
     )
@@ -158,6 +180,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("views", help="Regenerate Obsidian views")
     graph = commands.add_parser("graph", help="Regenerate the knowledge graph")
     graph.add_argument("--html", action="store_true")
+    # A file target, so it defaults to `local` like every other one: the written
+    # artifact used to carry never-ingest hashes, filenames and branch names
+    # with nothing on it saying which boundary it was built under.
+    graph.add_argument(
+        "--consumer",
+        choices=["human", "local", "cloud"],
+        help="Privacy boundary the written graph is built inside (default: local)",
+    )
 
     # `build` extracts in-process (the vendored Graphify closure, gated on the
     # `code` extra); `import` accepts a graph produced any other way. Both
@@ -1046,6 +1076,26 @@ def _did_you_mean(unknown: str, parser: argparse.ArgumentParser) -> str:
     return "\n".join(lines)
 
 
+def _gate_target(value: str) -> str:
+    """A relative gate target means "relative to where I am standing".
+
+    `check_write` resolves a relative target against the *vault root*, which is
+    right for the installed hook -- it always passes absolute paths -- but it is
+    the opposite of every other command, and it was documented nowhere. So
+    `bk gate check-write docs/brain/wiki/x.md` answered "allowed" with exit 0
+    while the absolute spelling of the same file was correctly gated.
+
+    That is the command a human or an agent runs to verify the central claim by
+    hand, so a confident wrong answer there is worse than not shipping it. The
+    application-layer contract is unchanged; only this interface, where a user's
+    shell context exists, applies it.
+    """
+
+    if Path(value).expanduser().is_absolute():
+        return value
+    return str(Path.cwd() / value)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     effective_argv = list(argv if argv is not None else sys.argv[1:])
     effective_argv, global_values = _extract_global_options(effective_argv)
@@ -1072,6 +1122,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     effective_argv = _fill_missing_arguments(parser, effective_argv, global_values)
     args = parser.parse_args(effective_argv)
+    if getattr(args, "print_config", False):
+        # Raw policy on stdout, never the `{"ok": ..., "result": ...}` envelope
+        # and never a human rendering: the documented use is
+        # `bk init --print-config > policy.json && bk init . --config policy.json`,
+        # and that only works if what comes out is exactly what --config expects.
+        print(
+            json.dumps(
+                onboarding.default_policy(
+                    Path(global_values["vault"] or args.path), args.preset
+                ),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
     if global_values["vault"] is not None:
         args.vault = global_values["vault"]
     if global_values["json"]:
@@ -1231,6 +1296,10 @@ def _service_for_web(args: argparse.Namespace) -> BrainskitService:
 def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "init":
         target = Path(args.vault or args.path)
+        if args.print_config:
+            # Deliberately before any filesystem work: this prints a policy, it
+            # does not create a vault, so it is safe to run anywhere.
+            return onboarding.default_policy(target, args.preset)
         outcome = (
             onboarding.Outcome(policy=_read_json(args.config))
             if args.config
@@ -1282,7 +1351,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "apply":
         return service.apply(_read_json(args.proposal))
     if args.command == "gate":
-        return service.gate_check_write(args.path, agent=args.agent)
+        return service.gate_check_write(_gate_target(args.path), agent=args.agent)
     if args.command == "enrich":
         if args.enrich_command == "apply":
             return service.enrich_apply(_read_json(args.proposal))
@@ -1293,7 +1362,9 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if args.command == "views":
         return service.views()
     if args.command == "graph":
-        return service.graph(html=args.html)
+        return service.graph(
+            consumer=args.consumer or "local", html=args.html
+        )
     if args.command == "code":
         if args.code_command == "build":
             paths = args.paths or None
@@ -1491,7 +1562,14 @@ def _guided_init(target: Path) -> onboarding.Outcome:
 
     if not sys.stdin.isatty():
         raise ValidationError(
-            "Interactive init needs a terminal; use --config with a complete policy"
+            "Interactive init needs a terminal",
+            details={
+                "hint": (
+                    "bk init --print-config > policy.json "
+                    "&& bk init <path> --config policy.json"
+                ),
+                "presets": list(onboarding.PRESET_KEYS),
+            },
         )
     return onboarding.run(target)
 

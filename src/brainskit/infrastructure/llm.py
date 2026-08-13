@@ -614,7 +614,11 @@ def _post_json(
             )
             time.sleep(delay)
         except urllib.error.URLError as exc:
-            last_error = ValidationError(
+            # `not_configured`, not `validation_error`: the request is fine and
+            # the provider is not answering. An agent told "fix the request and
+            # send it again" will rewrite a well-formed body forever against a
+            # provider that is simply not running.
+            last_error = NotConfiguredError(
                 "Provider is unreachable", details={"reason": str(exc.reason)}
             )
             if attempt == 2:
