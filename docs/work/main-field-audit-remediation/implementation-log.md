@@ -142,7 +142,7 @@ should unregister, or `initialize` should take a `register=False` for throwaways
 
 ---
 
-## Phase 3 — 7 of 8 · Phase 4 — 5 of 6
+## Phase 3 — complete · Phase 4 — 5 of 6
 
 Suite 977 → **996**. `ruff check` clean.
 
@@ -440,3 +440,28 @@ a workspace rather than on every directory.
 - **3.7** — scoped-build pruning, blocked on the `code_hash` path-base question.
 - **4.6** — publish `0.6.0`. Blocked on a PyPI *pending* Trusted Publisher, which
   is an account action rather than a code change.
+
+
+---
+
+## 3.7 — reinstated, and the path-base question answered
+
+Reverted earlier because its own control failed: a file that was merely out of
+scope got pruned. The cause was the fixture, not the fix. `code_root()` for a
+policy that does not name one **is the vault root**, and the first fixture put
+its files beside the vault instead of inside it — so `code_hash` returned `None`
+for every file and all of them read as deleted.
+
+The base is shared by construction, not by coincidence: `_write` builds the
+recorded `files` map with `self.vault.code_hash(path)` over these same node
+paths, and `staleness()` re-reads it with the identical call. A prune that
+decided "gone" any other way would be a second opinion; this one is the same
+one. A test asserts the two agree — a file `code status` calls removed cannot
+survive the merge.
+
+That is what makes reverting the right call the first time and reinstating the
+right call now: nothing about the implementation changed, only the evidence
+that it was correct.
+
+**Every task in the plan is now complete except 4.6**, which needs a PyPI
+Trusted Publisher — an account action, not a code change.

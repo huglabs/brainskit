@@ -282,10 +282,30 @@ class CodeGraph:
                 path == root or path.startswith(f"{root}/") for root in scope_roots
             )
 
+        def still_on_disk(path: str) -> bool:
+            """A deleted file keeps no nodes, in scope or out.
+
+            `_merge_scoped` kept every stored node whose path fell outside the
+            current scope, so a deleted file's nodes survived indefinitely
+            unless someone ran a whole-root build. The failure read: rebuild one
+            file, `status` truthfully says stale, and every query answers with
+            phantoms -- symbols at line numbers in files that are gone.
+
+            "Gone" is decided exactly as `staleness()` decides it: `code_hash`
+            returning `None`. That is not a second opinion -- `_write` builds
+            the recorded `files` map with the same call over these same node
+            paths, so the path base is shared by construction rather than by
+            two places agreeing.
+            """
+
+            return bool(path) and self.vault.code_hash(path) is not None
+
         merged_nodes = {
             str(node["id"]): node
             for node in stored.get("nodes", [])
-            if isinstance(node, dict) and not in_scope(str(node.get("path", "")))
+            if isinstance(node, dict)
+            and not in_scope(str(node.get("path", "")))
+            and still_on_disk(str(node.get("path", "")))
         }
         merged_nodes.update(nodes)
 
@@ -294,7 +314,9 @@ class CodeGraph:
             *(
                 edge
                 for edge in stored.get("edges", [])
-                if isinstance(edge, dict) and not in_scope(str(edge.get("path", "")))
+                if isinstance(edge, dict)
+                and not in_scope(str(edge.get("path", "")))
+                and still_on_disk(str(edge.get("path", "")))
             ),
         ]
         seen: set[tuple[str, str, str]] = set()
