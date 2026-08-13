@@ -14,6 +14,10 @@ from typing import ClassVar
 from unittest import mock
 
 from brainskit.application.judgment import JudgmentRunner
+from brainskit.application.schema import (
+    _compiled_validator,
+    validate_schema,
+)
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
@@ -28,8 +32,6 @@ from brainskit.domain.model import (
     RefusalError,
     ValidationError,
     VaultConfig,
-    _compiled_validator,
-    validate_schema,
 )
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex, _iter_documents

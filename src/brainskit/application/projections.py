@@ -140,10 +140,24 @@ class Projections:
         self.health._record_projection(VIEWS_PROJECTION)
         return {"written": written}
 
-    def graph(self, *, html: bool = False) -> dict[str, Any]:
+    def graph(
+        self, *, consumer: str = "local", html: bool = False
+    ) -> dict[str, Any]:
+        """Write `graph/graph.json` inside a consumer's boundary.
+
+        This used to build the graph and write it straight to disk while every
+        sibling path -- `graph_data`, `export`, the integrations -- filtered
+        first. A never-ingest source contributed its hash, its *filename* and
+        its *branch name* to the artifact, each of which is disclosure on its
+        own. `graph/` being gitignored bounded the damage; it did not make the
+        file correct, and nothing written in it said which boundary it carried.
+
+        Defaults to `local`, matching every other file target.
+        """
+
         if not self.graph_port:
             raise NotConfiguredError("Graph adapter is not configured")
-        graph = self.graph_port.build(self.vault)
+        graph = self.graph_data(consumer=consumer, limit=0)
         self.vault.write_generated(
             "graph/graph.json", json.dumps(graph, indent=2, ensure_ascii=False) + "\n"
         )
@@ -155,8 +169,11 @@ class Projections:
             written.append("graph/graph.html")
         self.health._record_projection(GRAPH_PROJECTION)
         return {
+            "consumer": consumer,
             "nodes": len(graph["nodes"]),
             "edges": len(graph["edges"]),
+            "redacted_nodes": graph.get("redacted_nodes", 0),
+            "unresolved_sources": graph.get("unresolved_sources", 0),
             "written": written,
         }
 

@@ -41,6 +41,7 @@ from ..domain.model import (
     INTEGRATION_NAMES,
     FilingMode,
     PrivacyMode,
+    ValidationError,
 )
 from ..infrastructure.vault import workspace_repos
 from . import console, prompt
@@ -238,6 +239,35 @@ def probe_ollama(base_url: str = DEFAULT_OLLAMA_URL) -> OllamaProbe:
         )
     models = [m for m in models if m.name]
     return OllamaProbe(base_url=base_url, reachable=True, models=tuple(models))
+
+
+PRESET_KEYS = tuple(preset.key for preset in PRESETS)
+
+
+def default_policy(vault: Path, preset: str = "work") -> dict[str, Any]:
+    """A complete, schema-valid policy without asking anyone anything.
+
+    The wizard could already assemble one; there was simply no way to get it
+    out without a terminal. So `bk init` off a TTY refused, the here-doc the
+    quickstart documented refused identically, and `--config` with an empty
+    object listed nine missing keys with no shapes, no template and no next
+    command. The only complete specimen in the repository was the project's
+    own vault, which a user never receives.
+
+    That blocked CI, containers, agent-driven setup and any non-interactive
+    shell -- precisely the audiences a local-first agent tool has.
+
+    Built from the same `_assemble` the wizard uses, so the printed policy
+    cannot drift from the one a human would have produced.
+    """
+
+    chosen = next((item for item in PRESETS if item.key == preset), None)
+    if chosen is None:
+        raise ValidationError(
+            "Unknown preset",
+            details={"preset": preset, "choices": list(PRESET_KEYS)},
+        )
+    return _assemble(detect(vault), probe_ollama(), chosen.branches, None, [])
 
 
 def run(vault: Path) -> Outcome:

@@ -1,0 +1,20 @@
+{
+  "agent": "claude",
+  "version": 2,
+  "workspace": "/Users/raulmata/Projetos/tools/brainkit",
+  "gate": {
+    "deny_prefixes": [
+      "wiki/",
+      "raw/"
+    ],
+    "remediation": {
+      "wiki/": "Wiki pages are written only by the apply gate. Use: bk apply",
+      "raw/": "Sources are immutable and hash-identified. Use: bk capture"
+    }
+  },
+  "rules": [
+    "Read evidence with bk context --json --consumer local",
+    "Write wiki pages only with bk apply",
+    "Never edit raw content"
+  ]
+}

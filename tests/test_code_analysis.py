@@ -282,10 +282,17 @@ class DiffTest(AnalysisFixture):
 
 
 class MissingNetworkxTest(AnalysisFixture):
-    """`networkx` gates all three commands; each must fail with a brainskit
-    error naming the fix, not a bare `ImportError` — the same property
-    `test_code_graph.py`'s `MissingDependencyTest` establishes for
-    tree-sitter and `build()`.
+    """`networkx` gates community detection, and nothing else any more.
+
+    It used to gate all three commands, because `cycles` and `diff` were
+    delegated to `graphify.analyze` -- which reaches `graphify.build`, and that
+    imports networkx at module load. Both analyses operate on brainskit's own
+    normalised `code.json`, so they are now implemented against it directly and
+    answer with no optional dependency installed at all.
+
+    `communities` still delegates to `graphify.cluster`, which is genuine
+    graph-theory work, and must still fail with a brainskit error naming the
+    fix rather than a bare `ImportError`.
     """
 
     def setUp(self) -> None:
@@ -311,23 +318,24 @@ class MissingNetworkxTest(AnalysisFixture):
         self.assertIn("brainskit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
-    def test_cycles_without_networkx_is_a_clear_error(self) -> None:
-        self._reset_analysis_cache()
-        with self._blocked():
-            with self.assertRaises(ValidationError) as caught:
-                self.service.code_cycles()
-        self._reset_analysis_cache()
-        self.assertIn("brainskit[code]", caught.exception.details["needs"])
-        self.assertNotIsInstance(caught.exception, ImportError)
+    def test_cycles_works_without_networkx(self) -> None:
+        """The dependency is gone, so the refusal must be gone with it."""
 
-    def test_diff_without_networkx_is_a_clear_error(self) -> None:
         self._reset_analysis_cache()
         with self._blocked():
-            with self.assertRaises(ValidationError) as caught:
-                self.service.code_diff(clustered_payload())
+            result = self.service.code_cycles()
         self._reset_analysis_cache()
-        self.assertIn("brainskit[code]", caught.exception.details["needs"])
-        self.assertNotIsInstance(caught.exception, ImportError)
+        self.assertIn("cycles", result)
+        self.assertEqual(result["count"], len(result["cycles"]))
+
+    def test_diff_works_without_networkx(self) -> None:
+        """Same: a set difference over two dicts needs no graph library."""
+
+        self._reset_analysis_cache()
+        with self._blocked():
+            result = self.service.code_diff(against=clustered_payload())
+        self._reset_analysis_cache()
+        self.assertEqual(result["summary"], "no changes")
 
     def test_the_refusal_is_checked_before_the_privacy_boundary(self) -> None:
         # Either order would be defensible; what matters is that a caller
@@ -343,15 +351,19 @@ class MissingNetworkxTest(AnalysisFixture):
 
 class VendoredAnalysisImportTest(unittest.TestCase):
     """The alias `infrastructure/codeanalysis/__init__.py` installs, exercised
-    for the two analysis modules this file's commands depend on — the
-    counterpart to `test_code_graph.py`'s `VendoredImportTest`, which covers
-    the extraction closure.
+    for the one analysis module still vendored — the counterpart to
+    `test_code_graph.py`'s `VendoredImportTest`, which covers the extraction
+    closure.
+
+    `graphify.analyze` used to be checked here too. It is gone: `cycles` and
+    `diff` are computed on brainskit's own graph, so `analyze.py` and the
+    `build.py` chain it pulled were removed from the tree entirely.
     """
 
     @unittest.skipUnless(_HAS_NETWORKX, "requires the `code` extra (networkx)")
-    def test_cluster_and_analyze_import_without_tree_sitter(self) -> None:
-        # Community detection and cycle/diff analysis touch no parser at
-        # all; blocking tree-sitter has to leave them unaffected. Run in a
+    def test_cluster_imports_without_tree_sitter(self) -> None:
+        # Community detection touches no parser at all; blocking tree-sitter
+        # has to leave it unaffected. Run in a
         # fresh interpreter for the same reason `test_code_graph.py` does:
         # once anything has imported the vendored closure in this process,
         # `sys.modules` keeps serving it regardless of what gets blocked
@@ -361,7 +373,6 @@ class VendoredAnalysisImportTest(unittest.TestCase):
             "sys.modules['tree_sitter'] = None\n"
             "from brainskit.infrastructure import codeanalysis\n"
             "import graphify.cluster\n"
-            "import graphify.analyze\n"
             "print('ok')\n"
         )
         completed = subprocess.run(

@@ -1,7 +1,7 @@
 # Architecture
 
 ```text
-interfaces (CLI, MCP, read-only web API/viewer)
+interfaces (CLI, MCP, web API/viewer — reads always, writes only at --consumer human)
         ↓
 application (use cases and ports)
         ↓

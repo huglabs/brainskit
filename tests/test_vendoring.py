@@ -40,6 +40,12 @@ DECLARED_MODIFICATIONS = frozenset(
     {"extract.py", "detect.py", "google_workspace.py"}
 )
 
+#: Files removed from the vendored tree rather than edited. Declared for the
+#: same reason and pinned the same way: a removal is a departure from
+#: byte-identity too, and an undeclared one would let the tree drift from
+#: upstream silently in the direction nobody checks.
+DECLARED_REMOVALS = frozenset({"analyze.py", "build.py", "validate.py"})
+
 
 class VendoredModificationTest(unittest.TestCase):
     def test_notice_declares_exactly_the_modified_files(self) -> None:
@@ -132,3 +138,83 @@ class InstallHintTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VendoredAnalysisIsUnreachableTest(unittest.TestCase):
+    """`graphify.analyze` and `graphify.build` are no longer imported.
+
+    `analyze.py` did a module-level `from graphify.build import edge_data`, so
+    reaching `find_import_cycles` or `graph_diff` loaded 1,643 lines of builder
+    plus `validate.py` plus networkx, for a thirteen-line helper. Both analyses
+    operate on brainskit's own `code.json` and are now implemented against it,
+    which puts 2,487 lines of vendored source out of the import graph.
+
+    `graphify.cluster` is deliberately still reachable: community detection is
+    genuine graph-theory work and imports only networkx.
+    """
+
+    def first_party(self) -> dict[str, str]:
+        root = Path(__file__).resolve().parents[1] / "src" / "brainskit"
+        return {
+            str(path.relative_to(root)): path.read_text(encoding="utf-8")
+            for path in root.rglob("*.py")
+            if "codeanalysis" not in path.parts
+        }
+
+    def test_no_first_party_module_imports_the_vendored_analysis(self) -> None:
+        offenders = [
+            name
+            for name, text in self.first_party().items()
+            if "from graphify import analyze" in text
+            or "graphify.analyze\"" in text
+            or "import graphify.analyze" in text
+        ]
+        self.assertEqual(offenders, [], msg="the build.py chain is reachable again")
+
+    def test_cluster_is_still_the_one_delegation(self) -> None:
+        """Control: the test must not pass by nothing importing graphify at all."""
+
+        importers = [
+            name
+            for name, text in self.first_party().items()
+            if "from graphify import cluster" in text
+        ]
+        self.assertEqual(importers, ["application/codegraph.py"])
+
+
+class VendoredRemovalTest(unittest.TestCase):
+    """A removal is a departure from upstream and has to be declared too."""
+
+    def tree(self) -> Path:
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "brainskit" / "infrastructure" / "codeanalysis"
+        )
+
+    def test_the_declared_removals_are_actually_gone(self) -> None:
+        for name in sorted(DECLARED_REMOVALS):
+            with self.subTest(file=name):
+                self.assertFalse((self.tree() / name).exists())
+
+    def test_notice_declares_every_removal(self) -> None:
+        text = (self.tree() / "NOTICE").read_text(encoding="utf-8")
+        _, _, section = text.partition("REMOVED")
+        self.assertTrue(section, "NOTICE lost its REMOVED section")
+        for name in sorted(DECLARED_REMOVALS):
+            with self.subTest(file=name):
+                self.assertIn(name, section)
+
+    def test_nothing_in_the_tree_imports_a_removed_module(self) -> None:
+        """Control: a removal that broke the tree would fail here, not at runtime."""
+
+        stems = {name.removesuffix(".py") for name in DECLARED_REMOVALS}
+        offenders = []
+        for path in self.tree().rglob("*.py"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped.startswith(("import ", "from ")):
+                    continue
+                for stem in stems:
+                    if f"graphify.{stem}" in stripped:
+                        offenders.append(f"{path.name}: {stripped}")
+        self.assertEqual(offenders, [])

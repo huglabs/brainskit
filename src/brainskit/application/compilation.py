@@ -25,6 +25,7 @@ from brainskit.application.pages import (
     render_page,
 )
 from brainskit.application.ports import SearchIndexPort, VaultPort
+from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     CITATION_RE,
     CODE_CITATION_RE,
@@ -33,7 +34,6 @@ from brainskit.domain.model import (
     PageOperation,
     ValidationError,
     utc_now,
-    validate_schema,
 )
 
 
@@ -128,6 +128,50 @@ class ApplyGate:
         failures, _, _, _ = self._prepare_apply(proposal)
         return failures
 
+
+    def _validate_slug_uniqueness(
+        self, operation: Any, proposal: Any
+    ) -> list[dict[str, Any]]:
+        """A slug may exist under one page kind only.
+
+        Pages live at `wiki/{kind}/{slug}.md`, and the graph resolves
+        `[[link]]` by *stem alone* -- `slug_nodes[slug] = node_id`, last writer
+        wins. So `concept:widget` and `entity:widget` produce two files with one
+        stem, and every `[[widget]]` in the vault silently resolves to whichever
+        directory sorts later. Deterministic, but arbitrary: adding a page-kind
+        directory that sorts after the current ones would flip every such edge
+        at once, and the losing page shows zero inbound links while its author
+        believes it is connected.
+
+        Refused at apply, because renaming is the remedy and the caller has the
+        proposal in hand. Vaults already carrying a collision are reported by
+        `bk lint` instead, so an existing one can be repaired rather than
+        blocking every subsequent write.
+        """
+
+        target = operation.relative_path
+        clashes = sorted(
+            path
+            for path in self.vault.wiki_pages()
+            if PurePosixPath(path).stem == operation.slug and path != target
+        )
+        clashes += sorted(
+            other.relative_path
+            for other in proposal.operations
+            if other.slug == operation.slug and other.relative_path != target
+        )
+        if not clashes:
+            return []
+        return [
+            {
+                "path": target,
+                "code": "duplicate_slug",
+                "slug": operation.slug,
+                "conflicts_with": clashes,
+                "hint": "Rename the slug; wiki links resolve by slug alone",
+            }
+        ]
+
     def _prepare_apply(
         self, proposal: ApplyProposal
     ) -> tuple[
@@ -152,6 +196,7 @@ class ApplyGate:
                 )
             )
             failures.extend(self._validate_novelty(operation, catalog))
+            failures.extend(self._validate_slug_uniqueness(operation, proposal))
             failures.extend(
                 validate_schema(page_metadata(operation), self.vault.schema())
             )
@@ -162,6 +207,13 @@ class ApplyGate:
                         "path": operation.relative_path,
                         "code": "missing_base_hash",
                         "observed": observed_version,
+                        # `observed` *is* the value to send back, and the
+                        # refusal never said so -- leaving a caller holding the
+                        # answer without knowing it was the answer.
+                        "hint": (
+                            "Set base_hash to the observed value above and "
+                            "retry; it is this page's current version"
+                        ),
                     }
                 )
             elif operation.base_hash != observed_version:
@@ -171,6 +223,11 @@ class ApplyGate:
                         "code": "stale_page",
                         "expected": operation.base_hash,
                         "observed": observed_version,
+                        "hint": (
+                            "The page moved on since base_hash was read. "
+                            "Re-read it with bk context, then retry with the "
+                            "observed value"
+                        ),
                     }
                 )
             expected_versions[operation.relative_path] = operation.base_hash

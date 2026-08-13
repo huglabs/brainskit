@@ -1,0 +1,25 @@
+# Binds this feature/bug to its external context. Fill in when copying _TEMPLATE.
+clickup_id: ""            # raw ClickUp task id, e.g. abc123
+session_id: ""            # Hermes session id
+branch: ""                # git branch this work lives on
+feature_name: ""          # human-readable name
+type: feature             # feature | bug
+
+# --- lifecycle state --------------------------------------------------------
+# THE authoritative state of this work. .claude/scripts/work-archive.sh reads
+# these two fields to decide whether the folder may be archived; nothing else
+# in the harness gets to have an opinion. Do not introduce a second status
+# field anywhere (an implementation log, a review header, a spec preamble) —
+# every past archiving bug came from two vocabularies disagreeing in silence.
+#
+#   planned        copied from _TEMPLATE; nothing built yet
+#   in-progress    actively being implemented
+#   blocked        waiting on something outside this folder
+#   code-complete  built, but not yet deployed/verified in its target env
+#   done           finished — the only state that archives without --force
+status: planned
+completed_at: null        # ISO-8601 UTC, stamped when status becomes 'done'
+
+stage: 00-user-story      # current stage: 00-user-story|00-bug-report → 01-prd → 02-spec → 03-diagrams → 04-review → 05-retro
+created_at: <DATE>
+links: []                 # durable cross-feature docs (ADRs, patterns, domain, product, vault) — linked, not copied

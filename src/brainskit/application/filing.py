@@ -20,7 +20,7 @@ from typing import Any
 from brainskit.application.compilation import ApplyGate
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import _record_branch
+from brainskit.application.privacy import _branch_policy, _record_branch
 from brainskit.application.retrieval import Retrieval
 from brainskit.domain.model import (
     ApplyProposal,
@@ -96,7 +96,9 @@ class Filing:
                 validator=self._apply_payload_failures,
             )
             apply_payload.setdefault("proposal_id", f"wiki-{uuid.uuid4().hex}")
-            filing_policy = self.vault.config().branches[destination].filing
+            filing_policy = _branch_policy(
+                self.vault.config(), destination
+            ).filing
             filing_proposal = FilingProposal(
                 proposal_id=f"filing-{uuid.uuid4().hex}",
                 source_hash=record.content_hash,
@@ -282,15 +284,29 @@ class Filing:
             branches=["_inbox"],
             variables={
                 "context": json.dumps(context, ensure_ascii=False),
+                # `taxonomy_seed` is the operator's declared shape for this
+                # vault, written by the onboarding wizard as `sorted(branches)`.
+                # It had five write and parse sites and no readers at all: a
+                # required policy key that changed nothing, while being one of
+                # the nine fields blocking a hand-written config.
+                #
+                # This is its reader. A seed branch is marked so the filing
+                # proposal can prefer the declared taxonomy when the evidence
+                # fits two branches equally well, rather than treating a branch
+                # someone added for one stray document as an equal candidate.
                 "branches": json.dumps(
                     {
                         branch: {
                             "privacy": policy.privacy.value,
                             "filing": policy.filing.value,
+                            "seed": branch in set(config.taxonomy_seed),
                         }
                         for branch, policy in config.branches.items()
                     },
                     ensure_ascii=False,
+                ),
+                "taxonomy_seed": json.dumps(
+                    sorted(config.taxonomy_seed), ensure_ascii=False
                 ),
             },
         )

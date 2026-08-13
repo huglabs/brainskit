@@ -206,6 +206,45 @@ class EnforcementStatusTest(unittest.TestCase):
             self.assertIn(key, report)
 
 
+class HealthyHeadlineMeansEnforcementTooTest(EnforcementStatusTest):
+    """`bk status` printed a green headline above three red enforcement rows.
+
+    `healthy` was `lint_result["ok"]` alone, so a vault whose write gate was not
+    running still announced itself healthy as long as the pages it already had
+    happened to lint. The headline sits directly above those rows.
+    """
+
+    def test_a_vault_with_no_enforcement_is_not_healthy(self) -> None:
+        self.assertFalse(self.service.status()["healthy"])
+
+    def test_lint_alone_does_not_make_it_healthy(self) -> None:
+        """Control: lint really is clean in this fixture, and that is not enough."""
+
+        self.assertTrue(self.service.lint()["ok"])
+        self.assertFalse(self.service.status()["healthy"])
+
+    def test_a_fully_gated_vault_is_healthy(self) -> None:
+        """Control: the headline must still be reachable."""
+
+        self.register("brainskit-gate.sh", "PreToolUse")
+        self.register("brainskit-status.sh", "SessionStart")
+        hooks = self.root / ".git" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        (hooks / "pre-commit").write_text(
+            "#!/bin/sh\nbk lint --changed\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True)
+        report = self.service.status()
+        inactive = [
+            layer["layer"]
+            for layer in report["enforcement"]["layers"]
+            if not layer.get("active") and not layer.get("advisory")
+        ]
+        if inactive:
+            self.skipTest(f"fixture could not activate: {inactive}")
+        self.assertTrue(report["healthy"])
+
+
 class NestedVaultEnforcementReportingTest(unittest.TestCase):
     """A vault nested inside its own project's git repo, before `hooks
     install` has ever run there -- the exact directory `_project_root_for`

@@ -1,0 +1,32 @@
+# Binds this feature/bug to its external context. Fill in when copying _TEMPLATE.
+clickup_id: ""            # none — planning driven by the field audit artifact
+session_id: "e8a1122a-e1bb-4644-978a-4ab994b5b31d"
+branch: "fix/field-audit-remediation"
+feature_name: "Field audit remediation → brainskit 0.6.0"
+type: bug                 # a remediation programme; every item is a defect
+
+# --- lifecycle state --------------------------------------------------------
+# THE authoritative state of this work. .claude/scripts/work-archive.sh reads
+# these two fields to decide whether the folder may be archived; nothing else
+# in the harness gets to have an opinion.
+status: in-progress
+completed_at: null
+
+stage: 02-spec
+created_at: 2026-08-12
+links:
+  - docs/product/roadmap/now.md
+  - docs/product/roadmap/next.md
+  - docs/product/roadmap/later.md
+  - docs/work/main-field-audit-remediation/03-diagrams/architecture.md
+  - docs/work/main-field-audit-remediation/03-diagrams/components.md
+
+# --- evidence ---------------------------------------------------------------
+# Source of every finding in 01-prd.md. Published artifact, owned by the user.
+evidence:
+  artifact: "https://claude.ai/code/artifact/6d5de80a-c222-4c63-ac52-6244f1e56b4b"
+  title: "brainskit Field Audit"
+  method: "5 parallel read-only agents; graph + usability agents worked against throwaway vaults"
+  audited_head: "8216766"
+  audited_version: "0.5.0"
+  audited_at: "2026-08-12"

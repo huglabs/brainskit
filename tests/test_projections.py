@@ -232,7 +232,12 @@ class StaleAfterApplyTest(ProjectionFixture):
         }
         self.assertEqual(severities, {"warning"})
         self.assertTrue(self.service.lint()["ok"])
-        self.assertTrue(self.service.status()["healthy"])
+        # Asserted on `lint_errors`, not on `healthy`. This test is about a
+        # stale projection being a warning rather than an error, and `healthy`
+        # now also means "every non-advisory enforcement layer is live" -- true
+        # of a real vault, not of a bare temp directory. Using the composite
+        # headline as a stand-in for "lint is clean" is what made it fail here.
+        self.assertEqual(self.service.status()["lint_errors"], 0)
 
     def test_rebuilding_the_graph_clears_only_the_graph_finding(self) -> None:
         self.service.graph()

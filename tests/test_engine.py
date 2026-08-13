@@ -17,12 +17,12 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     PolicyError,
     ValidationError,
     VaultConfig,
-    validate_schema,
 )
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex

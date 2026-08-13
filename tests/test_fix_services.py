@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from brainskit.application.services import BrainskitService
-from brainskit.domain.model import DEFAULT_IGNORE_PATTERNS, ValidationError
+from brainskit.domain.model import (
+    DEFAULT_IGNORE_PATTERNS,
+    PolicyError,
+    ValidationError,
+)
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.integrations import NativeIntegrations
@@ -745,6 +749,488 @@ class WatchIgnoreTest(unittest.TestCase):
             vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
         )
         self.assertEqual(service.watch_once()["created"], 2)
+
+
+class ObsidianSyncFiltersFilesTest(ServiceFixture):
+    """Obsidian sync filtered the graph object and copied everything else.
+
+    `sync` builds `source_paths` by walking the filesystem --
+    `rglob("*.md")` over `wiki/` and `views/`, plus all of `raw/` under
+    `include_raw` -- so the consumer never reached the file selection.
+
+    `views/` is safe only by accident: `ProjectionService.integration_sync`
+    regenerates it filtered just before the copy. Nothing regenerates `wiki/`
+    or `raw/`, so the compiled page leaks under *default* options and raw
+    never-ingest bytes leak under `--include-raw`. Sync targets are typically
+    iCloud- or Dropbox-backed.
+
+    The four consumer tests that existed asserted only that `"clod"` was
+    rejected and `"cloud"` was stored -- all four pass with the filtering
+    deleted. These assert on the bytes that land in the target.
+    """
+
+    SECRET = "SEGREDO-DA-AQUISICAO"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.secret_hash = self.capture_into(
+            "10-work", text=f"Plano confidencial. {self.SECRET}.", title="segredo"
+        )
+        self.public_hash = self.capture_into(
+            "30-public", text="Nota publica sobre o produto.", title="publico"
+        )
+        # The step the pre-existing fixture never took: compile a wiki page out
+        # of never-ingest evidence. Without a page, `wiki/` is empty and the
+        # unfiltered rglob has nothing to leak.
+        self.secret_page = self.upsert_page(
+            "board-memo",
+            "Board memo",
+            f"O plano da aquisicao: {self.SECRET}. ",
+            self.secret_hash,
+        )
+        self.public_page = self.upsert_page(
+            "nota-publica", "Nota publica", "Detalhe publico. ", self.public_hash
+        )
+
+    def sync_to(self, destination: str, **options: object) -> Path:
+        self.service.integration_configure(
+            "obsidian",
+            enabled=True,
+            managed=False,
+            options={"path": destination, "subdirectory": "brainskit", **options},
+        )
+        self.service.integration_sync("obsidian")
+        return Path(destination) / "brainskit"
+
+    def leaked_files(self, exported: Path) -> list[str]:
+        return sorted(
+            str(path.relative_to(exported))
+            for path in exported.rglob("*")
+            if path.is_file()
+            and self.SECRET in path.read_text(encoding="utf-8", errors="replace")
+        )
+
+    def test_default_options_do_not_copy_a_never_ingest_page(self) -> None:
+        with tempfile.TemporaryDirectory() as destination:
+            exported = self.sync_to(destination, consumer="cloud")
+            self.assertEqual(self.leaked_files(exported), [])
+
+    def test_include_raw_does_not_copy_never_ingest_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as destination:
+            exported = self.sync_to(destination, consumer="cloud", include_raw=True)
+            self.assertEqual(self.leaked_files(exported), [])
+
+    def test_local_also_redacts_never_ingest_as_the_docs_promise(self) -> None:
+        """`docs/integrations.md` promises `local` 'always redacts never-ingest'."""
+
+        with tempfile.TemporaryDirectory() as destination:
+            exported = self.sync_to(destination, consumer="local", include_raw=True)
+            self.assertEqual(self.leaked_files(exported), [])
+
+    def test_the_public_page_is_still_synced(self) -> None:
+        """Control: filtering must not degrade into copying nothing."""
+
+        with tempfile.TemporaryDirectory() as destination:
+            exported = self.sync_to(destination, consumer="cloud")
+            self.assertTrue((exported / self.public_page).is_file())
+
+    def test_human_still_receives_everything(self) -> None:
+        """Control: the consumer must actually be the thing deciding."""
+
+        with tempfile.TemporaryDirectory() as destination:
+            exported = self.sync_to(destination, consumer="human", include_raw=True)
+            self.assertNotEqual(self.leaked_files(exported), [])
+
+    def test_narrowing_removes_a_page_a_wider_sync_already_wrote(self) -> None:
+        """A previously-synced page must be swept, not left behind."""
+
+        with tempfile.TemporaryDirectory() as destination:
+            self.sync_to(destination, consumer="human")
+            exported = self.sync_to(destination, consumer="cloud")
+            self.assertEqual(self.leaked_files(exported), [])
+            self.assertFalse((exported / self.secret_page).exists())
+
+
+class UnconfiguredBranchRaisesPolicyErrorTest(ServiceFixture):
+    """A bare `KeyError` escaped four read paths after the documented healing.
+
+    `_privacy_for_record` subscripted `config.branches[branch]` directly, where
+    `infrastructure/llm.py` uses `.get()` + `PolicyError` for the identical
+    question. Drop a file into a directory that is not a configured branch, run
+    the *documented* `bk reconcile`, and `search`, `browse_sources`,
+    `graph_data` and `export` all raised `KeyError('personal')`.
+
+    A bare `KeyError` is not a `BrainskitError`, so it bypasses the JSON error
+    envelope and the exit-code machinery entirely: an unhandled traceback on the
+    CLI and a 500 in the web viewer. `bk status` stays green throughout, because
+    `health.py` has an "unknown" fallback.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        stray = self.root / "raw" / "personal" / "note.md"
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_text("Uma nota pessoal.\n", encoding="utf-8")
+        self.service.reconcile()
+
+    def test_reconcile_itself_still_succeeds(self) -> None:
+        """Control: the healing command is what puts the vault in this state."""
+
+        self.assertGreaterEqual(self.service.reconcile()["scanned"], 1)
+
+    def test_every_read_path_raises_policy_error_not_key_error(self) -> None:
+        paths = {
+            "search": lambda: self.service.search("nota", consumer="human"),
+            "browse_sources": lambda: self.service.browse_sources(consumer="human"),
+            "graph_data": lambda: self.service.graph_data(consumer="local"),
+            "export": lambda: self.service.export("json"),
+        }
+        for name, call in paths.items():
+            with self.subTest(path=name):
+                try:
+                    call()
+                except PolicyError as policy_error:
+                    self.assertIn("personal", json.dumps(policy_error.details))
+                except KeyError as leaked:  # pragma: no cover - the defect
+                    self.fail(f"{name} leaked a bare KeyError: {leaked!r}")
+
+    def test_the_error_is_a_brainskit_error_so_the_envelope_holds(self) -> None:
+        """The point of the fix: it must reach the JSON envelope and exit codes."""
+
+        from brainskit.domain.model import BrainskitError
+
+        try:
+            self.service.export("json")
+        except BrainskitError:
+            return
+        except KeyError as leaked:  # pragma: no cover - the defect
+            self.fail(f"export leaked a bare KeyError: {leaked!r}")
+
+    def test_filing_reads_the_same_branch_the_same_way(self) -> None:
+        """The twin the audit did not name: `filing.py` had the same subscript."""
+
+        import inspect
+
+        from brainskit.application import filing
+
+        self.assertNotIn(
+            "config().branches[",
+            inspect.getsource(filing),
+            msg="filing.py still subscripts branches directly",
+        )
+
+
+class StrictestPrivacyRefusesToGuessTest(ServiceFixture):
+    """`strictest_privacy` must not answer CLOUD for "nothing contributed".
+
+    Its docstring justified the CLOUD default by asserting that *every* caller
+    checks provenance resolves first. `_evidence_privacy` was a caller that did
+    not, and the assertion is what made the leak invisible. Task 1.1 made the
+    claim true; this makes it enforced, so the next caller cannot reintroduce it
+    by simply forgetting.
+    """
+
+    def test_an_empty_iterable_requires_an_explicit_answer(self) -> None:
+        from brainskit.application.privacy import strictest_privacy
+
+        with self.assertRaises(TypeError):
+            strictest_privacy(iter(()))  # type: ignore[call-arg]
+
+    def test_the_explicit_answer_is_honoured(self) -> None:
+        from brainskit.application.privacy import strictest_privacy
+        from brainskit.domain.model import PrivacyMode
+
+        self.assertEqual(
+            strictest_privacy(iter(()), on_empty=PrivacyMode.NEVER_INGEST),
+            PrivacyMode.NEVER_INGEST,
+        )
+
+    def test_a_non_empty_iterable_still_takes_the_strictest(self) -> None:
+        """Control: the actual rule must be unchanged."""
+
+        from brainskit.application.privacy import strictest_privacy
+        from brainskit.domain.model import PrivacyMode
+
+        self.assertEqual(
+            strictest_privacy(
+                iter((PrivacyMode.CLOUD, PrivacyMode.NEVER_INGEST)),
+                on_empty=PrivacyMode.CLOUD,
+            ),
+            PrivacyMode.NEVER_INGEST,
+        )
+
+
+class SearchHonoursItsLimitTest(ServiceFixture):
+    """`search(limit=N)` returned N+1 for N < 4.
+
+        target_graph = max(1, limit // 4) if limit >= 4 else 0   # 0 when N < 4
+        direct_limit = max(1, limit - target_graph) if target_graph else limit
+        hits         = ranked[:direct_limit]                     # == N
+        reserve      = limit - len(hits)                         # == 0
+        ...
+            expanded.append(hit)          # appends BEFORE the bound check
+            if len(expanded) >= reserve:  # 1 >= 0 -> break, one already added
+                break
+
+    So exactly one link-neighbour was always appended. It propagates into
+    `context`, where `limit` is the caller's bound on how much evidence reaches
+    a model -- the one number a caller uses to control cost.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        source = self.capture_into(
+            "30-public", text="Nota publica sobre o produto.", title="publico"
+        )
+        # Enough pages that graph expansion has something to offer. The bodies
+        # have to differ substantially: the novelty gate rejects a near-copy at
+        # similarity 1.0, which is correct behaviour and not this test's subject.
+        bodies = [
+            "O produto atende equipes pequenas com faturamento mensal. ",
+            "Integracao do produto com sistemas de pagamento externos. ",
+            "Roteiro de adocao do produto para clientes corporativos. ",
+            "Politica de suporte e prazos de resposta deste produto. ",
+            "Comparativo entre planos do produto e limites de uso. ",
+            "Historico de versoes do produto e mudancas relevantes. ",
+        ]
+        # The defect lives in the *graph expansion* pass, which only runs when a
+        # hit has link neighbours. Created linked from the start: without the
+        # links the loop has nothing to append and every assertion below would
+        # pass against the bug.
+        for index, body in enumerate(bodies):
+            links = [] if index == 0 else ["produto-0"]
+            tail = "" if index == 0 else "Veja tambem [[produto-0]]. "
+            self.service.apply(
+                {
+                    "operations": [
+                        {
+                            "action": "upsert",
+                            "kind": "concept",
+                            "slug": f"produto-{index}",
+                            "title": f"Produto {index}",
+                            "aliases": [],
+                            "source_hashes": [source],
+                            "body": f"{body}{tail}[^source:{source}]",
+                            "links": links,
+                        }
+                    ]
+                }
+            )
+
+    def test_small_limits_return_exactly_what_was_asked_for(self) -> None:
+        for limit in (1, 2, 3):
+            with self.subTest(limit=limit):
+                result = self.service.search("produto", limit, consumer="human")
+                self.assertEqual(result["count"], limit)
+                self.assertEqual(len(result["hits"]), limit)
+
+    def test_a_larger_limit_still_leaves_room_for_graph_expansion(self) -> None:
+        """Control: the fix must bound the expansion, not delete it."""
+
+        result = self.service.search("produto", 6, consumer="human")
+        self.assertLessEqual(result["count"], 6)
+
+
+class GraphArtifactCarriesItsBoundaryTest(ServiceFixture):
+    """`bk graph` wrote an unfiltered artifact with no consumer stamp.
+
+    Every sibling path filters -- `graph_data`, `export`, the integrations --
+    and this one built the graph and wrote it straight to disk. The impact is
+    bounded because `graph/` is gitignored, but it means two files called "the
+    graph" carried different boundaries and nothing on either said which.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.secret_hash = self.capture_into(
+            "10-work", text="Plano confidencial da aquisicao.", title="segredo"
+        )
+        self.public_hash = self.capture_into(
+            "30-public", text="Nota publica sobre o produto.", title="publico"
+        )
+
+    def artifact(self) -> str:
+        return (self.root / "graph" / "graph.json").read_text(encoding="utf-8")
+
+    def test_the_default_artifact_drops_never_ingest_evidence(self) -> None:
+        self.service.graph()
+        written = self.artifact()
+        self.assertNotIn(self.secret_hash, written)
+        self.assertNotIn("segredo", written)
+
+    def test_the_artifact_names_the_consumer_it_was_written_for(self) -> None:
+        self.service.graph()
+        self.assertEqual(json.loads(self.artifact())["consumer"], "local")
+
+    def test_public_evidence_survives(self) -> None:
+        """Control: filtering must not degrade into writing an empty graph."""
+
+        self.service.graph()
+        self.assertIn(self.public_hash, self.artifact())
+
+    def test_a_wider_consumer_is_honoured_when_asked_for(self) -> None:
+        self.service.graph(consumer="human")
+        written = self.artifact()
+        self.assertEqual(json.loads(written)["consumer"], "human")
+        self.assertIn(self.secret_hash, written)
+
+
+class GraphAndLintAgreeOnUnknownSourcesTest(ServiceFixture):
+    """Two code paths, two answers about one fact.
+
+    `infrastructure/graph.py` guarded the `sourced_from` edge with
+    `if raw_id in nodes:` and dropped it in silence. `health.py` reports the
+    same condition as `wiki.unknown_source`. In the artifact whose entire
+    purpose is to make provenance structural, a citation that does not resolve
+    was the one thing the graph would not tell you about.
+
+    Dropping the edge stays correct -- the graph promises no dangling edges --
+    but it must be *counted*, not silent.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.secret_hash = self.capture_into(
+            "10-work", text="Plano confidencial da aquisicao.", title="segredo"
+        )
+        self.page = self.upsert_page(
+            "board-memo", "Board memo", "O plano. ", self.secret_hash
+        )
+        self.service.forget(self.secret_hash, force=True)
+
+    def test_lint_reports_the_unresolvable_citation(self) -> None:
+        """Control: the condition genuinely exists in this fixture."""
+
+        codes = [f["code"] for f in self.service.lint()["findings"]]
+        self.assertIn("wiki.unknown_source", codes)
+
+    def test_the_graph_counts_what_it_dropped(self) -> None:
+        result = self.service.graph(consumer="human")
+        self.assertGreaterEqual(result.get("unresolved_sources", 0), 1)
+
+    def test_a_vault_with_resolvable_provenance_counts_zero(self) -> None:
+        """Control: the counter must not fire on a healthy vault."""
+
+        public_hash = self.capture_into(
+            "30-public", text="Nota publica sobre o produto.", title="publico"
+        )
+        clean = ServiceFixture()
+        clean.setUp()
+        try:
+            source = clean.capture_into(
+                "30-public", text="Outra nota publica distinta.", title="outra"
+            )
+            clean.upsert_page("nota", "Nota", "Conteudo publico. ", source)
+            self.assertEqual(
+                clean.service.graph(consumer="human").get("unresolved_sources", 0), 0
+            )
+        finally:
+            clean.tearDown()
+        self.assertTrue(public_hash)
+
+
+class UnresolvableProvenanceFailsClosedTest(ServiceFixture):
+    """A page whose sources no longer resolve must not be declassified.
+
+    `_evidence_privacy` dropped unresolvable hashes with `if content_hash in
+    records` and handed the empty remainder to `strictest_privacy`, which
+    answers CLOUD. So forgetting a `never-ingest` source did not redact the
+    pages built from it -- it published them, and stamped them `privacy:
+    cloud`, an active false claim.
+
+    `Enrichment.privacy_of` already answers this exact question correctly and
+    is pinned by a test. This is the parallel classifier for wiki pages, which
+    had no such test. The one high-value invariant the suite left unpinned is
+    the one that broke.
+    """
+
+    SECRET = "SEGREDO-DA-AQUISICAO"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.secret_hash = self.capture_into(
+            "10-work", text=f"Plano confidencial. {self.SECRET}.", title="segredo"
+        )
+        # The page body carries the sensitive substance, because that is what a
+        # page compiled from never-ingest evidence actually looks like. A body
+        # that merely cites the source would let `read_resource` pass this test
+        # while still serving the page.
+        self.page = self.upsert_page(
+            "board-memo",
+            "Board memo",
+            f"O plano da aquisicao: {self.SECRET}. ",
+            self.secret_hash,
+        )
+
+    def cloud_search(self) -> dict:
+        return self.service.search("plano", consumer="cloud")
+
+    def test_while_the_source_resolves_the_page_is_redacted(self) -> None:
+        """Control. If this ever fails, the fixture stopped exercising anything."""
+
+        result = self.cloud_search()
+        self.assertEqual(result["count"], 0)
+        self.assertGreaterEqual(result["redacted"], 1)
+
+    def test_forgetting_the_source_does_not_declassify_the_page(self) -> None:
+        forgotten = self.service.forget(self.secret_hash, force=True)
+        # bk forget already knows the page is orphaned, and proceeds anyway.
+        self.assertIn(self.page, forgotten["still_cited_by"])
+
+        result = self.cloud_search()
+        self.assertEqual(result["count"], 0, msg="orphaned page served to cloud")
+        self.assertGreaterEqual(result["redacted"], 1)
+
+    def test_the_secret_never_appears_in_a_cloud_payload(self) -> None:
+        self.service.forget(self.secret_hash, force=True)
+        self.assertNotIn(self.SECRET, json.dumps(self.cloud_search()))
+
+    def test_the_page_is_not_stamped_cloud(self) -> None:
+        """The leak was not merely un-redacted: it asserted `privacy: cloud`."""
+
+        self.service.forget(self.secret_hash, force=True)
+        privacies = [hit.get("privacy") for hit in self.cloud_search()["hits"]]
+        self.assertNotIn("cloud", privacies)
+
+    def test_read_resource_refuses_the_orphaned_page_for_cloud(self) -> None:
+        """`read_resource` serves the full page body, so it is the worst path."""
+
+        self.service.forget(self.secret_hash, force=True)
+        with self.assertRaises(PolicyError) as refused:
+            self.service.read_resource(self.page, consumer="cloud")
+        self.assertEqual(refused.exception.details["privacy"], "never-ingest")
+
+    def test_a_human_consumer_still_reaches_the_orphaned_page(self) -> None:
+        """`human` applies no restriction, so the page must remain readable.
+
+        Without this, every assertion above would also pass if the fix simply
+        made orphaned pages unreachable to everyone.
+        """
+
+        self.service.forget(self.secret_hash, force=True)
+        payload = self.service.read_resource(self.page, consumer="human")
+        self.assertIn(self.SECRET, json.dumps(payload))
+
+    def test_browse_pages_does_not_list_the_orphaned_page_for_cloud(self) -> None:
+        self.service.forget(self.secret_hash, force=True)
+        listed = json.dumps(self.service.browse_pages(consumer="cloud"))
+        self.assertNotIn("board-memo", listed)
+
+    def test_a_page_that_declares_no_sources_stays_cloud_visible(self) -> None:
+        """The other half of the rule, and the one a blanket fix would break.
+
+        'Declares no provenance' is a system page and is legitimately cloud.
+        Only 'declares provenance that does not resolve' is unknown. Without
+        this control, returning NEVER_INGEST unconditionally would pass every
+        test above while making the vault useless.
+        """
+
+        public_hash = self.capture_into(
+            "30-public", text="Nota publica sobre o produto.", title="publico"
+        )
+        self.upsert_page("nota-publica", "Nota publica", "Publico. ", public_hash)
+        result = self.service.search("publico", consumer="cloud")
+        self.assertGreaterEqual(result["count"], 1)
 
 
 if __name__ == "__main__":

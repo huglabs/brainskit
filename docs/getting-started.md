@@ -25,11 +25,13 @@ you can walk back into before anything is written. If ollama is down or has no
 models, `init` says so and still produces a valid vault — the jobs simply stay
 idle until a provider is up.
 
-Arrow keys drive the selections; off a terminal every prompt degrades to
-numbered input, so a here-doc can answer it. For automation, skip the questions
-entirely and pass a complete config file:
+Arrow keys drive the selections. Off a terminal `init` refuses rather than
+answering its own questions from defaults nobody saw, so automation takes the
+config path instead — print a complete policy, edit it if you want, and feed it
+back:
 
 ```bash
+bk init --print-config > policy.json          # add --preset personal|research
 bk init ./my-vault --config policy.json --json
 bk --vault ./my-vault capture notes.md --json
 bk --vault ./my-vault reindex --json
@@ -122,3 +124,7 @@ state: change it by running a command, not with a text editor.
 
 Next: the [command reference](./commands.md), or
 [the privacy boundary](./privacy.md) before you point anything at a cloud model.
+
+---
+<!-- doc-tracking -->
+- Created: 2026-08-12 14:47

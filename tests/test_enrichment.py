@@ -60,7 +60,11 @@ class EnrichmentTestCase(unittest.TestCase):
         )
         self.open_hash = self._capture("A public note.", "open", "10-open")
         self.private_hash = self._capture("Confidential.", "secret", "90-private")
-        self.service.graph()
+        # `graph()` writes inside a consumer boundary and defaults to `local`,
+        # which redacts the never-ingest branch. This fixture needs both raw
+        # nodes in order to build an edge between them, so it asks for the
+        # unrestricted graph deliberately.
+        self.service.graph(consumer="human")
         self.nodes = [
             str(node["id"])
             for node in json.loads(
