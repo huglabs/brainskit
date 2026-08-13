@@ -36,6 +36,7 @@ from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
 from brainskit.application.privacy import _context_branches
 from brainskit.application.retrieval import Retrieval
+from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     CITATION_RE,
     CODE_CITATION_RE,
@@ -45,7 +46,6 @@ from brainskit.domain.model import (
     SourceRecord,
     ValidationError,
     utc_now,
-    validate_schema,
 )
 
 #: Where git reads hooks from when `core.hooksPath` says nothing.
@@ -227,6 +227,7 @@ class Health:
     def _mechanical_lint(self) -> list[LintFinding]:
         findings: list[LintFinding] = []
         self._lint_enrichment(findings)
+        findings.extend(self._duplicate_slug_findings(self.vault.wiki_pages()))
         freshness = self._refresh_staleness()
         records = self.vault.registry()
         raw_files = set(self.vault.raw_files())
@@ -455,6 +456,28 @@ class Health:
                     path=path,
                 )
             )
+        return findings
+
+    def _duplicate_slug_findings(self, pages: list[str]) -> list[LintFinding]:
+        """Pages sharing a stem across kinds, which mis-route every wiki link."""
+
+        by_slug: dict[str, list[str]] = defaultdict(list)
+        for path in pages:
+            by_slug[PurePosixPath(path).stem].append(path)
+        findings: list[LintFinding] = []
+        for slug, paths in sorted(by_slug.items()):
+            if len(paths) < 2:
+                continue
+            for path in sorted(paths):
+                findings.append(
+                    LintFinding(
+                        "wiki.duplicate_slug",
+                        f"Slug {slug!r} is used by {len(paths)} pages, so "
+                        f"[[{slug}]] resolves to only one of them: "
+                        + ", ".join(sorted(paths)),
+                        path=path,
+                    )
+                )
         return findings
 
     def _review_drifted_code_citations(self, findings: list[LintFinding]) -> None:

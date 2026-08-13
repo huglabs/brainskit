@@ -15,6 +15,7 @@ side effects and lets it run without the optional extras installed.
 from __future__ import annotations
 
 import ast
+import sys
 import unittest
 from pathlib import Path
 from typing import ClassVar
@@ -31,7 +32,13 @@ VENDORED = "codeanalysis"
 ALLOWED: dict[str, frozenset[str]] = {
     "domain": frozenset({"domain"}),
     "application": frozenset({"application", "domain"}),
-    "infrastructure": frozenset({"infrastructure", "application", "domain"}),
+    # Narrowed from the whole of `application`. The port pattern is the
+    # architecture -- an adapter implements an interface the application
+    # defines -- so `application.ports` is allowed structurally below. Anything
+    # else an adapter reaches for is a concrete service, and has to be argued
+    # for in DOCUMENTED_EXCEPTIONS rather than waved through by a rule broad
+    # enough to hide it.
+    "infrastructure": frozenset({"infrastructure", "domain"}),
     "interfaces": frozenset({"interfaces", "application", "infrastructure", "domain"}),
 }
 
@@ -46,8 +53,30 @@ ALLOWED: dict[str, frozenset[str]] = {
 #: *second* such import has to be argued for in this file rather than appearing
 #: unnoticed -- which is exactly what happened to the first one.
 DOCUMENTED_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset(
-    {("application.codegraph", "infrastructure.codeanalysis")}
+    {
+        ("application.codegraph", "infrastructure.codeanalysis"),
+        # Two adapters reaching *up* for a concrete application function rather
+        # than a port. Both were invisible while `ALLOWED` let infrastructure
+        # import all of `application`; naming them is what turns a silent
+        # allowance into a decision someone has to defend.
+        #
+        # `parse_frontmatter` is a pure parser over bytes the adapter already
+        # holds, with no port to answer to -- the same argument as
+        # `normalize_id` above.
+        ("infrastructure.graph", "application.pages"),
+        # The privacy rule deciding which files may leave the vault. This one
+        # is real debt: the decision belongs in the application layer and
+        # should be handed to the adapter as a predicate. Attempted and
+        # reverted -- threading a callable through the graph dict that also
+        # feeds the Neo4j and Postgres adapters broke five tests. Left here,
+        # named, rather than left invisible.
+        ("infrastructure.integrations", "application.privacy"),
+    }
 )
+
+#: The one application module every adapter may import: the port pattern is the
+#: architecture, not an exception to it.
+STRUCTURAL_PORTS: frozenset[str] = frozenset({"application.ports"})
 
 
 def _module_name(path: Path) -> str:
@@ -77,7 +106,14 @@ def _imports(path: Path, module: str) -> set[str]:
     # clean -- an enforcement gap disguised as a pass.
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if node.value.startswith("brainskit.") and "codeanalysis" in node.value:
+            # Any `brainskit.` module string, not only the one dynamic import
+            # that was already known. Filtering on `"codeanalysis" in ...`
+            # identified the hole and then closed exactly the instance already
+            # covered by the exception list -- so a *second* dynamic import,
+            # anywhere else, would have passed unseen. That is the shape of an
+            # enforcement gap disguised as a pass, which is the thing this file
+            # exists to prevent.
+            if node.value.startswith("brainskit."):
                 found.add(node.value[len("brainskit.") :])
     return {name for name in found if name}
 
@@ -112,6 +148,8 @@ class LayeringTests(unittest.TestCase):
                 if target_layer in permitted or target_layer not in ALLOWED:
                     continue
                 trimmed = ".".join(target.split(".")[:2])
+                if trimmed in STRUCTURAL_PORTS:
+                    continue
                 if (module, trimmed) in DOCUMENTED_EXCEPTIONS:
                     continue
                 violations.append(f"{module} -> {target}")
@@ -196,3 +234,35 @@ class ConstantsHaveOneOwnerTest(unittest.TestCase):
             if '("wiki/", "raw/")' in text
         ]
         self.assertEqual(owners, ["gate.py"], msg=f"copied into {owners}")
+
+
+class DomainHasNoThirdPartyImportsTest(unittest.TestCase):
+    """The domain layer must depend on the standard library and nothing else.
+
+    `jsonschema` was its only third-party dependency, imported for one
+    validation engine whose every caller already lived in `application/`. A
+    domain layer that reaches for a vendor library to answer a question its own
+    callers ask is a boundary that exists on paper only.
+
+    This is the assertion that keeps the move from being quietly undone.
+    """
+
+    def test_no_domain_module_imports_a_third_party_package(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src" / "brainskit"
+        stdlib = set(sys.stdlib_module_names)
+        offenders: list[str] = []
+        for path in (root / "domain").rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""] if node.level == 0 else []
+                else:
+                    continue
+                for name in names:
+                    top = name.split(".")[0]
+                    if not top or top in stdlib or top == "brainskit":
+                        continue
+                    offenders.append(f"{path.name}: {name}")
+        self.assertEqual(offenders, [], msg="domain reaches outside the stdlib")

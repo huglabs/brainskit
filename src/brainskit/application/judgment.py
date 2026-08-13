@@ -17,10 +17,10 @@ from collections.abc import Callable
 from typing import Any
 
 from brainskit.application.ports import JobSpecPort, JudgmentPort
+from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     ModelResponseError,
     NotConfiguredError,
-    validate_schema,
 )
 
 
