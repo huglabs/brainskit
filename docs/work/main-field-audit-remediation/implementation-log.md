@@ -142,7 +142,7 @@ should unregister, or `initialize` should take a `register=False` for throwaways
 
 ---
 
-## Phase 3 — 4 of 8
+## Phase 3 — 5 of 8
 
 Suite 977 → **996**. `ruff check` clean.
 
@@ -199,10 +199,38 @@ confirm, not on a hash lookup with a different root.
 This is the second time a control caught a change that all its sibling
 assertions were happy with.
 
+### 3.1 — native cycles and diff
+
+Done, and equivalence-verified: five captured outputs from the *previous*
+implementation (three cycle shapes, two diffs) reproduce byte-identically. The
+fixture was captured before a line changed, which is the only thing that makes
+"equivalent" a claim rather than a hope.
+
+`cycles` and `diff` now run against brainskit's own normalised `code.json`:
+bounded elementary-cycle enumeration rooted at each cycle's smallest member --
+which deduplicates rotations by construction rather than afterwards -- and a
+set difference over two dicts. Together about 130 lines.
+
+That severs the `graphify.analyze` import, which did a module-level
+`from graphify.build import edge_data` to reach a thirteen-line helper.
+**2,487 lines** of vendored source (`analyze.py` 749 + `build.py` 1,643 +
+`validate.py` 95) are now outside the import graph, pinned by a test.
+`graphify.cluster` remains the one delegation: community detection is genuine
+graph-theory work and imports only networkx.
+
+**A second audit premise was wrong.** The finding said this bought "a mandatory
+networkx pin". `networkx` was already in the `code` extra -- brainskit's only
+*required* dependency is `jsonschema`, and after 3.2 even that no longer touches
+the domain layer. What the change actually buys is that `cycles` and `diff` now
+answer with **no optional dependency installed at all**, where they previously
+refused. Two tests asserting they must refuse were inverted to assert they work.
+
+Unblocks 4.5 (removing the dead vendored regions), which was waiting on this.
+
 ### Remaining in Phase 3
 
-3.1 (native cycles/diff, drop the networkx pin) · 3.7 (scoped-build pruning,
-with the path-base question resolved) · 3.8 (BrainskitNode rename + migration)
+3.7 (scoped-build pruning, with the path-base question resolved) ·
+3.8 (BrainskitNode rename + migration)
 
 ---
 

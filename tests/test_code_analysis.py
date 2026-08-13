@@ -282,10 +282,17 @@ class DiffTest(AnalysisFixture):
 
 
 class MissingNetworkxTest(AnalysisFixture):
-    """`networkx` gates all three commands; each must fail with a brainskit
-    error naming the fix, not a bare `ImportError` — the same property
-    `test_code_graph.py`'s `MissingDependencyTest` establishes for
-    tree-sitter and `build()`.
+    """`networkx` gates community detection, and nothing else any more.
+
+    It used to gate all three commands, because `cycles` and `diff` were
+    delegated to `graphify.analyze` -- which reaches `graphify.build`, and that
+    imports networkx at module load. Both analyses operate on brainskit's own
+    normalised `code.json`, so they are now implemented against it directly and
+    answer with no optional dependency installed at all.
+
+    `communities` still delegates to `graphify.cluster`, which is genuine
+    graph-theory work, and must still fail with a brainskit error naming the
+    fix rather than a bare `ImportError`.
     """
 
     def setUp(self) -> None:
@@ -311,23 +318,24 @@ class MissingNetworkxTest(AnalysisFixture):
         self.assertIn("brainskit[code]", caught.exception.details["needs"])
         self.assertNotIsInstance(caught.exception, ImportError)
 
-    def test_cycles_without_networkx_is_a_clear_error(self) -> None:
-        self._reset_analysis_cache()
-        with self._blocked():
-            with self.assertRaises(ValidationError) as caught:
-                self.service.code_cycles()
-        self._reset_analysis_cache()
-        self.assertIn("brainskit[code]", caught.exception.details["needs"])
-        self.assertNotIsInstance(caught.exception, ImportError)
+    def test_cycles_works_without_networkx(self) -> None:
+        """The dependency is gone, so the refusal must be gone with it."""
 
-    def test_diff_without_networkx_is_a_clear_error(self) -> None:
         self._reset_analysis_cache()
         with self._blocked():
-            with self.assertRaises(ValidationError) as caught:
-                self.service.code_diff(clustered_payload())
+            result = self.service.code_cycles()
         self._reset_analysis_cache()
-        self.assertIn("brainskit[code]", caught.exception.details["needs"])
-        self.assertNotIsInstance(caught.exception, ImportError)
+        self.assertIn("cycles", result)
+        self.assertEqual(result["count"], len(result["cycles"]))
+
+    def test_diff_works_without_networkx(self) -> None:
+        """Same: a set difference over two dicts needs no graph library."""
+
+        self._reset_analysis_cache()
+        with self._blocked():
+            result = self.service.code_diff(against=clustered_payload())
+        self._reset_analysis_cache()
+        self.assertEqual(result["summary"], "no changes")
 
     def test_the_refusal_is_checked_before_the_privacy_boundary(self) -> None:
         # Either order would be defensible; what matters is that a caller

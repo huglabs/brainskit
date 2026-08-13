@@ -797,7 +797,7 @@ class CodeGraph:
         have to keep matching.
         """
 
-        cluster_mod, _ = _load_analysis()
+        cluster_mod = _load_analysis()
         graph = self._read(consumer)
         G = _networkx_graph(graph)
         communities = cluster_mod.cluster(G, resolution=resolution)
@@ -827,20 +827,24 @@ class CodeGraph:
         """Import cycles among files.
 
         A cycle is a property of the file graph the symbol-level edges
-        imply, not of one symbol's neighbourhood — `affected` stops at
-        "reachable", never "reachable and back again" — so this is the other
-        question brainskit's own traversal has no way to ask. Collapsing to
-        file level and enumerating the cycles is
-        `graphify.analyze.find_import_cycles`'s job; brainskit's contribution
-        is only the boundary this reads under.
+        imply, not of one symbol's neighbourhood -- `affected` stops at
+        "reachable", never "reachable and back again".
+
+        Computed here, on brainskit's own normalised graph. It used to delegate
+        to `graphify.analyze.find_import_cycles`, which meant loading
+        `graphify.build` -- 1,643 lines plus `validate.py`, plus networkx at
+        module scope -- to reach a thirteen-line helper. Collapsing symbol edges
+        to files and enumerating bounded elementary cycles is a dozen lines
+        against a dict of sets, and it answers with no optional dependency
+        installed at all.
         """
 
-        _, analyze_mod = _load_analysis()
         graph = self._read(consumer)
-        G = _networkx_graph(graph)
-        cycles = analyze_mod.find_import_cycles(
-            G, max_cycle_length=max_length, top_n=top
-        )
+        found = _elementary_cycles(_file_dependencies(graph), max_length)[:top]
+        cycles = [
+            {"cycle": cycle, "length": len(cycle), "why": "circular dependency"}
+            for cycle in found
+        ]
         return self._answer(
             {"consumer": consumer, "count": len(cycles), "cycles": cycles}
         )
@@ -860,7 +864,6 @@ class CodeGraph:
         never replaces it.
         """
 
-        _, analyze_mod = _load_analysis()
         old_graph = self._read(consumer)
 
         if against is not None:
@@ -883,11 +886,9 @@ class CodeGraph:
             new_nodes, _dropped = self._nodes(payload)
             new_edges = self._edges(payload, known=set(new_nodes))
 
-        old_G = _networkx_graph(old_graph)
-        new_G = _networkx_graph(
-            {"nodes": list(new_nodes.values()), "edges": new_edges}
+        result = _graph_difference(
+            old_graph, {"nodes": list(new_nodes.values()), "edges": new_edges}
         )
-        result = analyze_mod.graph_diff(old_G, new_G)
         return {"consumer": consumer, **result}
 
     # ------------------------------------------------------------------ shared
@@ -1023,18 +1024,24 @@ def _fingerprint(files: dict[str, str]) -> str:
     ).hexdigest()
 
 
-_ANALYSIS_MODULES: tuple[Any, Any] | None = None
+_ANALYSIS_MODULES: Any | None = None
 
 
-def _load_analysis() -> tuple[Any, Any]:
-    """Import the vendored community/cycle/diff analysis, once.
+def _load_analysis() -> Any:
+    """Import the vendored community detection, once.
 
-    Deferred for the same reason `infrastructure/extractor.py` defers
-    `graphify.extract`: `graphify.cluster` and `graphify.analyze` both
-    import `graphify.build`, which imports networkx at module load, and
-    every caller of `CodeGraph` — not just the three methods below — would
-    otherwise pay that import, or fail outright where the `code` extra is
-    not installed and no one asked for `communities`/`cycles`/`diff`.
+    Only `graphify.cluster` now. `graphify.analyze` was imported alongside it
+    for `find_import_cycles` and `graph_diff`, and it does a module-level
+    `from graphify.build import edge_data` -- 1,643 lines of builder plus
+    `validate.py`, plus networkx at load, reached for a thirteen-line helper.
+    Both of those analyses operate on brainskit's own normalised `code.json`
+    and are now implemented against it directly, so the chain is gone.
+
+    Still deferred, for the same reason `infrastructure/extractor.py` defers
+    `graphify.extract`: `cluster` imports networkx at module load, and every
+    caller of `CodeGraph` -- not just `communities` -- would otherwise pay that
+    import, or fail outright where the `code` extra is not installed and no one
+    asked for a community breakdown.
 
     `find_spec` rather than a real `import networkx`, for the same reason
     `GraphifyExtractor.available()` gives that reasoning for tree-sitter: a
@@ -1056,10 +1063,152 @@ def _load_analysis() -> tuple[Any, Any]:
         # break the alias that import depends on.
         importlib.import_module("brainskit.infrastructure.codeanalysis")
 
-        from graphify import analyze, cluster  # type: ignore[import-not-found]
+        from graphify import cluster  # type: ignore[import-not-found]
 
-        _ANALYSIS_MODULES = (cluster, analyze)
+        _ANALYSIS_MODULES = cluster
     return _ANALYSIS_MODULES
+
+
+
+#: Edge relations that make a file depend on another file at load time. A
+#: deferred `import(...)` is a real dependency but not a hard cycle, which is
+#: why it is excluded below.
+_IMPORT_RELATIONS = frozenset({"imports_from", "re_exports"})
+
+
+def _file_dependencies(graph: dict[str, Any]) -> dict[str, set[str]]:
+    """The file-level dependency graph the symbol edges imply.
+
+    Endpoints resolve through each node's own `path`, never through its label
+    or id: a symbol called `db` in `app.ts` must not be mistaken for `db.ts`.
+    """
+
+    file_of = {str(node["id"]): str(node.get("path", "")) for node in graph["nodes"]}
+    edges: dict[str, set[str]] = {}
+    for edge in graph["edges"]:
+        if edge.get("type", "") not in _IMPORT_RELATIONS or edge.get("deferred"):
+            continue
+        source_file = str(edge.get("path", ""))
+        if not source_file:
+            continue
+        head = file_of.get(str(edge["source"]), "")
+        tail = file_of.get(str(edge["target"]), "")
+        if head == source_file:
+            target = tail
+        elif tail == source_file:
+            target = head
+        else:
+            target = tail if tail and tail != source_file else head
+        if not target:
+            continue
+        edges.setdefault(source_file, set()).add(target)
+        edges.setdefault(target, set())
+    return edges
+
+
+def _elementary_cycles(edges: dict[str, set[str]], max_length: int) -> list[list[str]]:
+    """Every elementary cycle up to `max_length`, each reported once.
+
+    Rooted at its own smallest member and explored only through members that
+    sort at or after that root, so a cycle is enumerated exactly once rather
+    than once per rotation -- the deduplication the previous implementation did
+    afterwards, done by construction instead.
+
+    Bounded depth is what keeps this cheap: the caller asks for cycles of at
+    most a handful of files, and pruning during the walk avoids enumerating the
+    long ones only to discard them.
+    """
+
+    found: list[list[str]] = []
+    for root in sorted(edges):
+        stack: list[tuple[str, list[str]]] = [(root, [root])]
+        while stack:
+            node, path = stack.pop()
+            for neighbour in sorted(edges.get(node, ())):
+                if neighbour == root:
+                    found.append(list(path))
+                    continue
+                if neighbour < root or neighbour in path or len(path) >= max_length:
+                    continue
+                stack.append((neighbour, [*path, neighbour]))
+    # Shortest first: a two-file cycle is tighter coupling than a five-file one.
+    # Ties break on the cycle itself so the answer does not depend on dict or
+    # traversal order.
+    found.sort(key=lambda cycle: (len(cycle), cycle))
+    return found
+
+
+def _graph_difference(
+    old: dict[str, Any], new: dict[str, Any]
+) -> dict[str, Any]:
+    """What changed between two graphs, as node and edge set differences."""
+
+    def index(graph: dict[str, Any]) -> dict[str, str]:
+        return {
+            str(node["id"]): str(node.get("label", node["id"]))
+            for node in graph["nodes"]
+        }
+
+    def keys(graph: dict[str, Any]) -> dict[tuple[str, str, str], dict[str, Any]]:
+        out: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for edge in graph["edges"]:
+            key = (str(edge["source"]), str(edge["target"]), str(edge.get("type", "")))
+            out.setdefault(key, edge)
+        return out
+
+    old_nodes, new_nodes = index(old), index(new)
+    old_edges, new_edges = keys(old), keys(new)
+
+    def described(
+        source: dict[tuple[str, str, str], dict[str, Any]],
+        selected: set[tuple[str, str, str]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "source": key[0],
+                "target": key[1],
+                "relation": key[2],
+                "confidence": edge.get("confidence", ""),
+            }
+            for key, edge in source.items()
+            if key in selected
+        ]
+
+    added_nodes = [
+        {"id": node_id, "label": label}
+        for node_id, label in new_nodes.items()
+        if node_id not in old_nodes
+    ]
+    removed_nodes = [
+        {"id": node_id, "label": label}
+        for node_id, label in old_nodes.items()
+        if node_id not in new_nodes
+    ]
+    added_edges = described(new_edges, set(new_edges) - set(old_edges))
+    removed_edges = described(old_edges, set(old_edges) - set(new_edges))
+
+    parts = []
+    for count, noun, verb in (
+        (len(added_nodes), "node", "new"),
+        (len(added_edges), "edge", "new"),
+        (len(removed_nodes), "node", "removed"),
+        (len(removed_edges), "edge", "removed"),
+    ):
+        if not count:
+            continue
+        plural = "" if count == 1 else "s"
+        parts.append(
+            f"{count} new {noun}{plural}"
+            if verb == "new"
+            else f"{count} {noun}{plural} removed"
+        )
+    return {
+        "new_nodes": added_nodes,
+        "removed_nodes": removed_nodes,
+        "new_edges": added_edges,
+        "removed_edges": removed_edges,
+        "summary": ", ".join(parts) if parts else "no changes",
+    }
 
 
 def _networkx_graph(graph: dict[str, Any]) -> nx.Graph:

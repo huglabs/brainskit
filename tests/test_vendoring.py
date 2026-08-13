@@ -132,3 +132,45 @@ class InstallHintTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VendoredAnalysisIsUnreachableTest(unittest.TestCase):
+    """`graphify.analyze` and `graphify.build` are no longer imported.
+
+    `analyze.py` did a module-level `from graphify.build import edge_data`, so
+    reaching `find_import_cycles` or `graph_diff` loaded 1,643 lines of builder
+    plus `validate.py` plus networkx, for a thirteen-line helper. Both analyses
+    operate on brainskit's own `code.json` and are now implemented against it,
+    which puts 2,487 lines of vendored source out of the import graph.
+
+    `graphify.cluster` is deliberately still reachable: community detection is
+    genuine graph-theory work and imports only networkx.
+    """
+
+    def first_party(self) -> dict[str, str]:
+        root = Path(__file__).resolve().parents[1] / "src" / "brainskit"
+        return {
+            str(path.relative_to(root)): path.read_text(encoding="utf-8")
+            for path in root.rglob("*.py")
+            if "codeanalysis" not in path.parts
+        }
+
+    def test_no_first_party_module_imports_the_vendored_analysis(self) -> None:
+        offenders = [
+            name
+            for name, text in self.first_party().items()
+            if "from graphify import analyze" in text
+            or "graphify.analyze\"" in text
+            or "import graphify.analyze" in text
+        ]
+        self.assertEqual(offenders, [], msg="the build.py chain is reachable again")
+
+    def test_cluster_is_still_the_one_delegation(self) -> None:
+        """Control: the test must not pass by nothing importing graphify at all."""
+
+        importers = [
+            name
+            for name, text in self.first_party().items()
+            if "from graphify import cluster" in text
+        ]
+        self.assertEqual(importers, ["application/codegraph.py"])
