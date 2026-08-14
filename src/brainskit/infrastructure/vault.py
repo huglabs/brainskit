@@ -808,12 +808,21 @@ class FileVault:
                         destination = self._resolve_relative(
                             raw_move_entry["destination"]
                         )
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        raw_move_entry["inflight"] = True
-                        _atomic_json(journal_path, journal)
-                        os.replace(source, destination)
-                        raw_move_entry["moved"] = True
-                        raw_move_entry["inflight"] = False
+                        # A source already sitting in the destination branch is
+                        # not moved: `_transaction_move_destination` hands back
+                        # the source path itself. Marking that `moved` would
+                        # journal a rollback instruction for something that
+                        # never happened, and its reversal has one file under
+                        # both names -- so rollback would delete the only copy
+                        # of raw evidence, which no backup here covers. Leaving
+                        # both flags false gives rollback nothing to reverse.
+                        if destination != source:
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            raw_move_entry["inflight"] = True
+                            _atomic_json(journal_path, journal)
+                            os.replace(source, destination)
+                            raw_move_entry["moved"] = True
+                            raw_move_entry["inflight"] = False
                         records[raw_move_entry["content_hash"]].path = (
                             raw_move_entry["destination"]
                         )
@@ -1163,11 +1172,19 @@ class FileVault:
                 destination = self._resolve_relative(
                     str(raw_move.get("destination", ""))
                 )
-                source.parent.mkdir(parents=True, exist_ok=True)
-                if destination.is_file() and not source.exists():
-                    os.replace(destination, source)
-                elif destination.is_file() and source.exists():
-                    destination.unlink()
+                # Recovery reads a journal some earlier process wrote, which may
+                # be an older build that still marked a same-path move `moved`.
+                # The writer no longer produces that record, but this side has
+                # to survive one: both names reach a single file, so the
+                # reversal below would take its `source.exists()` branch and
+                # unlink the vault's only copy of that raw evidence. There is
+                # nothing to reverse when the two paths are one path.
+                if destination != source:
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.is_file() and not source.exists():
+                        os.replace(destination, source)
+                    elif destination.is_file() and source.exists():
+                        destination.unlink()
             backups = journal.get("backups")
             if isinstance(backups, list):
                 for entry in backups:
