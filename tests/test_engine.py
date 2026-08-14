@@ -18,6 +18,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from brainskit.application.jobs import MAX_HISTORY_CHARS, MAX_HISTORY_EXCHANGES
+from brainskit.application.ports import ApplyPlan
 from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
@@ -3012,14 +3013,16 @@ class ProposalIdReuseNamesATerminatingRemedyTest(unittest.TestCase):
 
         with self.assertRaises(ValidationError) as refused:
             self.vault.commit_wiki_batch(
-                {},
-                {},
-                {},
-                "agent-turn-1",
-                "0" * 64,
-                {},
-                None,
-                lambda records: 0,
+                ApplyPlan(
+                    pages={},
+                    expected_versions={},
+                    source_statuses={},
+                    proposal_id="agent-turn-1",
+                    request_hash="0" * 64,
+                    freshness_updates={},
+                    raw_move=None,
+                    index_rebuild=lambda records: 0,
+                )
             )
         locked = refused.exception
         gate = self.refusal(

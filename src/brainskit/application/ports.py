@@ -1,10 +1,44 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from brainskit.domain.model import ScanSurvey, SearchHit, SourceRecord, VaultConfig
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyPlan:
+    """The complete description of one apply, so that a port and its adapter
+    can no longer disagree about a parameter's name.
+
+    `commit_wiki_batch` took these as eight positional parameters and had one
+    production caller, which passed all eight positionally. A positional call
+    cannot disagree about a name, so nothing noticed when the port came to
+    declare `freshness_state` while the adapter went on implementing
+    `freshness_updates` -- two live spellings of one argument, each of them
+    wrong depending on which file you were reading, and neither reachable by a
+    test that only ever *calls* the thing. The same silence hid a weaker type
+    on the port (`dict[str, Any]` for what `FreshnessLedger.mark_applied`
+    actually returns). One argument object means one spelling.
+
+    It lives beside the port rather than in `domain/model.py` because
+    `index_rebuild` is a callback into the index adapter: behaviour, not data.
+    Every value the domain holds is data that refers to nothing that runs, and
+    `DomainHasNoThirdPartyImportsTest` would not have caught this one --
+    `Callable` is stdlib -- so the placement has to be argued rather than
+    left to the guard.
+    """
+
+    pages: dict[str, str]
+    expected_versions: dict[str, str | None]
+    source_statuses: dict[str, str]
+    proposal_id: str
+    request_hash: str
+    freshness_updates: dict[str, dict[str, Any]]
+    raw_move: tuple[str, str] | None
+    index_rebuild: Callable[[dict[str, SourceRecord]], int]
 
 
 class VaultPort(Protocol):
@@ -56,17 +90,7 @@ class VaultPort(Protocol):
 
     def wiki_version(self, relative_path: str) -> str | None: ...
 
-    def commit_wiki_batch(
-        self,
-        pages: dict[str, str],
-        expected_versions: dict[str, str | None],
-        source_statuses: dict[str, str],
-        proposal_id: str,
-        request_hash: str,
-        freshness_state: dict[str, Any],
-        raw_move: tuple[str, str] | None,
-        index_rebuild: Callable[[dict[str, SourceRecord]], int],
-    ) -> dict[str, Any]: ...
+    def commit_wiki_batch(self, plan: ApplyPlan) -> dict[str, Any]: ...
 
     def read_state(self, name: str) -> dict[str, Any]: ...
 
@@ -99,6 +123,13 @@ class SearchIndexPort(Protocol):
     def upsert_raw(self, vault: VaultPort, record: SourceRecord) -> None: ...
 
     def upsert_wiki(self, vault: VaultPort, paths: Sequence[str]) -> None: ...
+
+    #: Rename indexed documents in place. Declared on the port because the
+    #: vault performs this migration and used to reach into `search_fts` --
+    #: another adapter's private schema -- to do it.
+    def rename_paths(
+        self, moved: Mapping[str, str], removed: Sequence[str]
+    ) -> None: ...
 
     def search(self, query: str, limit: int = 10) -> list[SearchHit]: ...
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import closing
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -141,6 +141,50 @@ class SqliteFtsIndex:
             )
             connection.commit()
         return count
+
+    def rename_paths(self, moved: Mapping[str, str], removed: Sequence[str]) -> None:
+        """Follow indexed documents whose path changed; forget the ones that are gone.
+
+        This is here because `FileVault` used to do it by hand: it opened
+        `.brain/index.db` with raw `sqlite3` and wrote `search_fts`, a table
+        this class creates and nothing declares. Two adapters sharing an
+        undeclared schema means a change to `_ensure_schema` breaks the *vault*
+        constructor, at a distance, with nothing naming the dependency.
+
+        The fallback moved with it. The index is disposable -- every row can be
+        rebuilt from the Markdown -- so an unusable database is discarded and
+        the next reindex recreates it. That decision belongs here rather than
+        with the caller for the same reason the SQL does: the caller would have
+        to catch `sqlite3.Error` to make it, which is the adapter's technology
+        crossing the port again, and it would have to know that this database
+        drags `-wal` and `-shm` companions. So this method is total: it either
+        renames or discards, and never raises.
+        """
+
+        if not self.database_path.is_file():
+            return
+        try:
+            with closing(self._connect()) as connection:
+                with connection:
+                    for old, new in moved.items():
+                        # The destination may already hold a row -- a merge
+                        # writes the surviving page there -- and `path` carries
+                        # no uniqueness constraint an upsert could use.
+                        connection.execute(
+                            "DELETE FROM search_fts WHERE path = ?", (new,)
+                        )
+                        connection.execute(
+                            "UPDATE search_fts SET path = ? WHERE path = ?", (new, old)
+                        )
+                    for old in removed:
+                        connection.execute(
+                            "DELETE FROM search_fts WHERE path = ?", (old,)
+                        )
+        except sqlite3.Error:
+            for suffix in ("", "-wal", "-shm"):
+                self.database_path.with_name(self.database_path.name + suffix).unlink(
+                    missing_ok=True
+                )
 
     def search(self, query: str, limit: int = 10) -> list[SearchHit]:
         match_query = _fts_query(query)

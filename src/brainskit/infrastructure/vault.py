@@ -6,17 +6,17 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import tempfile
 import unicodedata
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from copy import deepcopy
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
+from brainskit.application.ports import ApplyPlan, SearchIndexPort
 from brainskit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
     WIKI_DIRECTORIES,
@@ -32,6 +32,7 @@ from brainskit.domain.model import (
     utc_now,
 )
 from brainskit.infrastructure.converters import extract_document, guess_media_type
+from brainskit.infrastructure.index import SqliteFtsIndex
 
 #: The only directories `write_generated` may write into. Everything here is
 #: derived from `raw/` and `wiki/`, which are the source of truth.
@@ -642,36 +643,26 @@ class FileVault:
         content_hash, _ = _hash_file(path)
         return content_hash
 
-    def commit_wiki_batch(
-        self,
-        pages: dict[str, str],
-        expected_versions: dict[str, str | None],
-        source_statuses: dict[str, str],
-        proposal_id: str,
-        request_hash: str,
-        freshness_updates: dict[str, dict[str, Any]],
-        raw_move: tuple[str, str] | None,
-        index_rebuild: Callable[[dict[str, SourceRecord]], int],
-    ) -> dict[str, Any]:
+    def commit_wiki_batch(self, plan: ApplyPlan) -> dict[str, Any]:
         with self._write_lock():
             self._recover_apply_unlocked()
             with self._registry_lock(shared=False), self._state_lock(
                 "applied", shared=False
             ), self._state_lock("freshness", shared=False):
                 applied = self._read_state_unlocked("applied")
-                prior = applied.get("proposals", {}).get(proposal_id)
+                prior = applied.get("proposals", {}).get(plan.proposal_id)
                 if isinstance(prior, dict):
-                    if prior.get("request_hash") != request_hash:
+                    if prior.get("request_hash") != plan.request_hash:
                         # The gate checked this before taking the lock; this is
                         # the authoritative answer, and it has to be the *same*
                         # answer, so both raise through one constructor.
                         raise proposal_id_reuse_error(
-                            proposal_id,
+                            plan.proposal_id,
                             applied_request_hash=prior.get("request_hash"),
-                            request_hash=request_hash,
+                            request_hash=plan.request_hash,
                         )
                     return {**prior, "idempotent": True}
-                for relative, expected in expected_versions.items():
+                for relative, expected in plan.expected_versions.items():
                     observed = self.wiki_version(relative)
                     if observed != expected:
                         raise ConflictError(
@@ -684,8 +675,8 @@ class FileVault:
                         )
                 records = self._read_registry_unlocked()
                 raw_move_entry: dict[str, Any] | None = None
-                if raw_move:
-                    content_hash, branch = raw_move
+                if plan.raw_move:
+                    content_hash, branch = plan.raw_move
                     branch = normalize_branch(branch)
                     if branch not in self.config().branches:
                         raise NotConfiguredError(
@@ -718,7 +709,7 @@ class FileVault:
                 staged_root.mkdir(parents=True, exist_ok=True)
                 backup_root.mkdir(parents=True, exist_ok=True)
                 entries: list[dict[str, Any]] = []
-                for index, (relative, content) in enumerate(sorted(pages.items())):
+                for index, (relative, content) in enumerate(sorted(plan.pages.items())):
                     pure = PurePosixPath(relative)
                     if (
                         not pure.parts
@@ -777,7 +768,7 @@ class FileVault:
                 journal = {
                     "version": 2,
                     "transaction_id": transaction_id,
-                    "proposal_id": proposal_id,
+                    "proposal_id": plan.proposal_id,
                     "state": "committing",
                     "phase": "prepared",
                     "entries": entries,
@@ -827,7 +818,7 @@ class FileVault:
                             raw_move_entry["destination"]
                         )
                         _atomic_json(journal_path, journal)
-                    for content_hash, status in source_statuses.items():
+                    for content_hash, status in plan.source_statuses.items():
                         if content_hash not in records:
                             raise ValidationError(
                                 "Cannot update an unknown source",
@@ -838,7 +829,7 @@ class FileVault:
                     freshness = self._read_state_unlocked("freshness")
                     freshness["version"] = 2
                     freshness_pages = freshness.setdefault("pages", {})
-                    for path, update in freshness_updates.items():
+                    for path, update in plan.freshness_updates.items():
                         prior_freshness = freshness_pages.get(path, {})
                         freshness_pages[path] = {
                             **(
@@ -851,14 +842,14 @@ class FileVault:
                     self._write_state_unlocked("freshness", freshness)
                     journal["phase"] = "state-written"
                     _atomic_json(journal_path, journal)
-                    indexed_documents = index_rebuild(records)
+                    indexed_documents = plan.index_rebuild(records)
                     journal["phase"] = "index-written"
                     _atomic_json(journal_path, journal)
                     result = {
                         "transaction_id": transaction_id,
-                        "proposal_id": proposal_id,
-                        "request_hash": request_hash,
-                        "paths": sorted(pages),
+                        "proposal_id": plan.proposal_id,
+                        "request_hash": plan.request_hash,
+                        "paths": sorted(plan.pages),
                         "applied_at": utc_now(),
                         "idempotent": False,
                         "indexed_documents": indexed_documents,
@@ -872,7 +863,7 @@ class FileVault:
                             else None
                         ),
                     }
-                    applied.setdefault("proposals", {})[proposal_id] = result
+                    applied.setdefault("proposals", {})[plan.proposal_id] = result
                     self._write_state_unlocked("applied", applied)
                     journal["state"] = "committed"
                     _atomic_json(journal_path, journal)
@@ -1123,27 +1114,23 @@ class FileVault:
         merged: dict[str, str],
         quarantined: list[str],
     ) -> None:
-        database = self.root / ".brain" / "index.db"
-        if not database.is_file():
-            return
-        try:
-            with closing(sqlite3.connect(database, timeout=10)) as connection:
-                with connection:
-                    for old, new in moved.items():
-                        connection.execute(
-                            "DELETE FROM search_fts WHERE path = ?", (new,)
-                        )
-                        connection.execute(
-                            "UPDATE search_fts SET path = ? WHERE path = ?", (new, old)
-                        )
-                    for old in (*merged, *quarantined):
-                        connection.execute(
-                            "DELETE FROM search_fts WHERE path = ?", (old,)
-                        )
-        except sqlite3.Error:
-            # The index is disposable: drop it and let the next reindex rebuild.
-            for suffix in ("", "-wal", "-shm"):
-                database.with_name(database.name + suffix).unlink(missing_ok=True)
+        """Tell the index where the pages went.
+
+        `merged` and `quarantined` arrive separately because the *vault* has to
+        tell them apart -- one discards a byte-identical duplicate, the other
+        preserves a divergent page outside `wiki/` -- but both leave no file at
+        the old path, which is the only thing the index can act on. Collapsing
+        them here keeps that classification on this side of the port instead of
+        asking the index to learn a legacy-directory vocabulary.
+
+        The adapter is constructed here rather than injected because this runs
+        from `__init__`, and the index is built *from* `index_path`: a vault has
+        to exist before its index can. The vault already owns where that file
+        lives, and now stops claiming to know what is inside it.
+        """
+
+        index: SearchIndexPort = SqliteFtsIndex(self.index_path)
+        index.rename_paths(moved, [*merged, *quarantined])
 
     def _recover_apply_unlocked(self) -> None:
         journal_path = self.root / ".brain" / "apply-journal.json"

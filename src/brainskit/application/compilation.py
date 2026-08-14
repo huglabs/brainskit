@@ -27,7 +27,7 @@ from brainskit.application.pages import (
     parse_frontmatter,
     render_page,
 )
-from brainskit.application.ports import SearchIndexPort, VaultPort
+from brainskit.application.ports import ApplyPlan, SearchIndexPort, VaultPort
 from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     CITATION_RE,
@@ -104,19 +104,21 @@ class ApplyGate:
                 details={"failures": failures},
             )
         transaction = self.vault.commit_wiki_batch(
-            pages,
-            expected_versions,
-            dict.fromkeys(referenced_hashes, "ingested"),
-            proposal_id,
-            request_hash,
-            self.ledger.mark_applied(proposal.operations, pages),
-            raw_move,
-            lambda records: self.index.apply_snapshot(
-                self.vault,
-                records,
-                sorted(pages),
-                raw_move[0] if raw_move else None,
-            ),
+            ApplyPlan(
+                pages=pages,
+                expected_versions=expected_versions,
+                source_statuses=dict.fromkeys(referenced_hashes, "ingested"),
+                proposal_id=proposal_id,
+                request_hash=request_hash,
+                freshness_updates=self.ledger.mark_applied(proposal.operations, pages),
+                raw_move=raw_move,
+                index_rebuild=lambda records: self.index.apply_snapshot(
+                    self.vault,
+                    records,
+                    sorted(pages),
+                    raw_move[0] if raw_move else None,
+                ),
+            )
         )
         return {
             "applied": len(pages),
