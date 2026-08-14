@@ -33,3 +33,26 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   every node and edge exists, so a link cannot pull a redacted node back in
   through its neighbour. A redacted source contributes nothing: not its body,
   not its filename, not its branch.
+
+## Freshness
+
+- **FreshnessLedger** — the one owner of `.brain/freshness.json`. Every read and
+  write goes through it; no other module names the state file. Transitions are
+  named after intent (`mark_applied`, `mark_reviewed`, `record_resurfaced`,
+  `refresh_staleness`, `record_projection`, `drop`), so the rules that hold
+  across the file are stated once instead of in each writer. Built at the
+  composition root and handed to its collaborators, never constructed by them.
+- **FreshnessSnapshot** — one read of the ledger, and every question asked of
+  that read. Request-scoped by the same convention as `PrivacyBoundary`: taken,
+  questioned, dropped — never held across a write.
+- **applied entry vs annotation** — `content_hash` means "the apply gate wrote
+  this page, and here is what it wrote", and `mark_applied` is the only writer
+  that produces one. An entry without it is an **annotation** (a review request,
+  a resurface note): it records something *about* the page and vouches for
+  nothing. `applied_hash` answers `None` for it, exactly as for no entry at all,
+  so `wiki.outside_apply` still reports the page. Populating the field outside
+  apply would bless a hand edit rather than report it.
+- **never-downgrade** — `review` is a weaker claim on attention than `stale`,
+  and the ageing pass skips `review`, so writing it over `stale` removes the
+  page from the loop rather than lowering a badge. `mark_reviewed` refuses,
+  which leaves `review` reachable only from `fresh`.

@@ -16,7 +16,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from brainskit.application.filing import Filing
-from brainskit.application.freshness import _freshness_summary
+from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health, enforcement_ok
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
@@ -64,12 +64,14 @@ class Reader:
         health: Health,
         filing: Filing,
         projections: Projections,
+        ledger: FreshnessLedger,
     ):
         self.vault = vault
         self.index = index
         self.health = health
         self.filing = filing
         self.projections = projections
+        self.ledger = ledger
 
     def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
         boundary = for_consumer(consumer, self.vault)
@@ -95,15 +97,7 @@ class Reader:
         raw_counts: dict[str, int] = defaultdict(int)
         for record in visible_records.values():
             raw_counts[record_branch(record)] += 1
-        freshness = self.vault.read_state("freshness")
-        filtered_freshness = {
-            **freshness,
-            "pages": {
-                path: value
-                for path, value in freshness.get("pages", {}).items()
-                if path in visible_pages
-            },
-        }
+        freshness = self.ledger.snapshot()
         index_state = self.index.stats()
         enforcement = _reportable_enforcement(self.health.enforcement())
         return {
@@ -118,7 +112,7 @@ class Reader:
                 **index_state,
                 "documents": len(visible_records) + len(visible_pages),
             },
-            "freshness": _freshness_summary(filtered_freshness),
+            "freshness": freshness.summary(present=visible_pages),
             "enforcement": enforcement,
             # The same two inputs `Health.status` weighs, and for the same
             # reason: this feeds `/api/status`, which the viewer renders as
@@ -194,7 +188,7 @@ class Reader:
         boundary = for_consumer(consumer, self.vault)
         if not 1 <= limit <= 1_000:
             raise ValidationError("Page browse limit must be between 1 and 1000")
-        freshness = self.vault.read_state("freshness").get("pages", {})
+        freshness = self.ledger.snapshot()
         graph = self.projections.graph_data(consumer=consumer)
         pages = []
         for node in graph["nodes"]:
@@ -202,21 +196,12 @@ class Reader:
                 continue
             path = str(node["path"])
             privacy = boundary.evidence_privacy(node)
-            page_freshness = freshness.get(path, {})
             pages.append(
                 {
                     **node,
                     "privacy": privacy.value,
-                    "freshness": (
-                        page_freshness.get("status", "unknown")
-                        if isinstance(page_freshness, dict)
-                        else "unknown"
-                    ),
-                    "updated_at": (
-                        page_freshness.get("updated_at")
-                        if isinstance(page_freshness, dict)
-                        else None
-                    ),
+                    "freshness": freshness.status(path),
+                    "updated_at": freshness.updated_at(path),
                 }
             )
         pages.sort(key=lambda page: (str(page["kind"]), str(page["label"])))

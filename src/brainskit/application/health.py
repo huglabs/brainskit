@@ -27,9 +27,9 @@ from brainskit.application.freshness import (
     PROJECTION_LINT_CODES,
     PROJECTION_RAW_FIELDS,
     REGENERATE_STATES,
+    FreshnessLedger,
+    FreshnessSnapshot,
     _age_in_days,
-    _freshness_summary,
-    _orphaned_freshness,
     _projection_source_hash,
 )
 from brainskit.application.gate import INSTRUCTION_START
@@ -46,7 +46,6 @@ from brainskit.domain.model import (
     LintFinding,
     SourceRecord,
     ValidationError,
-    utc_now,
 )
 from brainskit.domain.privacy import context_branches
 
@@ -182,11 +181,13 @@ class Health:
         index: SearchIndexPort,
         retrieval: Retrieval,
         judgment_runner: JudgmentRunner,
+        ledger: FreshnessLedger,
     ):
         self.vault = vault
         self.index = index
         self.retrieval = retrieval
         self.judgment_runner = judgment_runner
+        self.ledger = ledger
 
 
     def lint(self, *, semantic: bool = False) -> dict[str, Any]:
@@ -221,7 +222,7 @@ class Health:
         lint_result = self.lint()
         # Read after lint: `_mechanical_lint` refreshes page staleness in place,
         # so reading first would report the state that lint just superseded.
-        freshness = self.vault.read_state("freshness")
+        freshness = self.ledger.snapshot()
         enforcement = self._enforcement_state()
         return {
             "vault": str(self.vault.root),
@@ -230,7 +231,7 @@ class Health:
             "wiki_pages": len(pages),
             "by_branch": dict(sorted(raw_counts.items())),
             "index": self.index.stats(),
-            "freshness": _freshness_summary(freshness, present=set(pages)),
+            "freshness": freshness.summary(present=set(pages)),
             "projections": {
                 **self._projection_report(freshness, records),
                 # Reported alongside the vault's own projections because it is
@@ -286,7 +287,7 @@ class Health:
         findings: list[LintFinding] = []
         self._lint_enrichment(findings)
         findings.extend(self._duplicate_slug_findings(self.vault.wiki_pages()))
-        freshness = self._refresh_staleness()
+        freshness = self.ledger.refresh_staleness()
         records = self.vault.registry()
         raw_files = set(self.vault.raw_files())
         registered_paths: dict[str, str] = {}
@@ -335,20 +336,22 @@ class Health:
         for path in self.vault.wiki_pages():
             text = self.vault.read_text(path)
             metadata, body = parse_frontmatter(text)
-            freshness_entry = freshness.get("pages", {}).get(path)
-            if not isinstance(freshness_entry, dict):
+            # `applied_hash` is the tracked/annotation question, asked of the
+            # ledger rather than derived here from the shape of an entry. A
+            # bare entry -- one an annotation created, carrying no hash -- is
+            # not provenance, so it falls to the untracked branch instead of
+            # buying the page silence in both.
+            expected_hash = freshness.applied_hash(path)
+            if expected_hash is None:
                 findings.extend(self._untracked_page_findings(path, body))
-            else:
-                expected_hash = freshness_entry.get("content_hash")
-                wiki_observed_hash = self.vault.wiki_version(path)
-                if expected_hash and expected_hash != wiki_observed_hash:
-                    findings.append(
-                        LintFinding(
-                            "wiki.outside_apply",
-                            "Wiki page changed outside the apply gate",
-                            path=path,
-                        )
+            elif expected_hash != self.vault.wiki_version(path):
+                findings.append(
+                    LintFinding(
+                        "wiki.outside_apply",
+                        "Wiki page changed outside the apply gate",
+                        path=path,
                     )
+                )
             for failure in validate_schema(metadata, schema):
                 findings.append(
                     LintFinding(
@@ -405,17 +408,16 @@ class Health:
                             path=path,
                         )
                     )
-        for path, entry in freshness.get("pages", {}).items():
-            if isinstance(entry, dict) and entry.get("status") == "stale":
-                findings.append(
-                    LintFinding(
-                        "wiki.stale",
-                        f"Wiki page is stale ({entry.get('age_days', '?')} days)",
-                        severity="warning",
-                        path=path,
-                    )
+        for path, age_days in freshness.stale_pages():
+            findings.append(
+                LintFinding(
+                    "wiki.stale",
+                    f"Wiki page is stale ({age_days} days)",
+                    severity="warning",
+                    path=path,
                 )
-        for path in _orphaned_freshness(freshness, set(self.vault.wiki_pages())):
+            )
+        for path in freshness.orphans(set(self.vault.wiki_pages())):
             findings.append(
                 LintFinding(
                     "freshness.orphaned",
@@ -425,7 +427,7 @@ class Health:
                     path=path,
                 )
             )
-        # `freshness` is the state `_refresh_staleness` just committed and
+        # `freshness` is the state `refresh_staleness` just committed and
         # `records` the registry this run already read, so the comparison sees
         # exactly the inputs lint reported on without re-reading either. Note
         # the fingerprint leaves out the status and age fields that refresh
@@ -594,56 +596,23 @@ class Health:
         vault carries until someone acts on it, and it is already how a page
         answers "is this still backed by what it was compiled from" — so code
         drift joins the same queue rather than inventing a second one.
+
+        The never-downgrade rule that used to sit inside this mutator now lives
+        in `mark_reviewed`, where the capture path reaches it too.
         """
 
-        drifted = {
-            finding.path: finding.message
-            for finding in findings
-            if finding.code == "wiki.stale_code_citation" and finding.path
-        }
-        if not drifted:
-            return
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            pages = state.setdefault("pages", {})
-            for path, message in drifted.items():
-                entry = pages.setdefault(path, {})
-                # Never downgrade: a page already `stale` has a stronger claim
-                # on attention than one that has merely drifted.
-                if entry.get("status") == "stale":
-                    continue
-                entry["status"] = "review"
-                entry["review_reason"] = f"code changed: {message.split(' has changed')[0]}"
-                entry["review_requested_at"] = utc_now()
-            return state
-
-        self.vault.mutate_state("freshness", mutate)
-
-    def _refresh_staleness(self) -> dict[str, Any]:
-        stale_after_days = self.vault.config().novelty.stale_after_days
-        now = datetime.now(UTC)
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            for entry in state.setdefault("pages", {}).values():
-                if not isinstance(entry, dict) or entry.get("status") == "review":
-                    continue
-                updated_at = entry.get("updated_at")
-                if not isinstance(updated_at, str):
-                    continue
-                try:
-                    age_days = (now - datetime.fromisoformat(updated_at)).days
-                except ValueError:
-                    continue
-                entry["status"] = (
-                    "stale" if age_days >= stale_after_days else "fresh"
+        self.ledger.mark_reviewed(
+            {
+                finding.path: (
+                    f"code changed: {finding.message.split(' has changed')[0]}"
                 )
-                entry["age_days"] = age_days
-            return state
-
-        return self.vault.mutate_state("freshness", mutate)
+                for finding in findings
+                if finding.code == "wiki.stale_code_citation" and finding.path
+            }
+        )
 
     def _projection_report(
-        self, freshness: dict[str, Any], records: dict[str, SourceRecord]
+        self, freshness: FreshnessSnapshot, records: dict[str, SourceRecord]
     ) -> dict[str, Any]:
         """Compare every derived artefact against the inputs it was built from.
 
@@ -690,9 +659,8 @@ class Health:
         would age both — and a projection that cries wolf gets ignored, which
         loses the signal by a different route than having no signal at all.
         """
-        pages = freshness.get("pages", {})
-        recorded = freshness.get("projections", {})
-        recorded = recorded if isinstance(recorded, dict) else {}
+        pages = freshness.pages()
+        recorded = freshness.projections()
         now = datetime.now(UTC)
         report: dict[str, Any] = {}
         for artifact, anchor in PROJECTION_ANCHORS.items():
@@ -758,38 +726,6 @@ class Health:
         except (OSError, ValueError):
             return _ARTEFACT_ABSENT
         return PROJECTION_INTEGRITY[artifact](text)
-
-    def _record_projection(self, artifact: str) -> None:
-        """Stamp a derived artefact with the inputs it was just built from.
-
-        The page half of the fingerprint is taken inside the mutator, so it is
-        computed from the state the write actually commits: an apply landing
-        between a read and a write cannot leave a projection claiming to cover
-        pages it never saw.
-
-        The registry is read *before* the mutator on purpose. `commit_wiki_batch`
-        takes the registry lock before the freshness lock, and both are blocking
-        `flock`s, so reading the registry while holding freshness would invert
-        the order and deadlock. Reading it first is also the safe direction: a
-        capture landing in between is simply absent from the recorded
-        fingerprint, and the next lint compares against a registry that has it
-        and reports stale. The error can only be a false `stale`, never a false
-        `fresh`.
-        """
-        records = self.vault.registry()
-        raw_fields = PROJECTION_RAW_FIELDS[artifact]
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            projections = state.setdefault("projections", {})
-            projections[artifact] = {
-                "generated_at": utc_now(),
-                "source_hash": _projection_source_hash(
-                    state.get("pages", {}), records, raw_fields
-                ),
-            }
-            return state
-
-        self.vault.mutate_state("freshness", mutate)
 
     def _enforcement_state(self) -> dict[str, Any]:
         """Report which enforcement layers are live for this vault, from disk.

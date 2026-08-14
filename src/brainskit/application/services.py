@@ -11,9 +11,7 @@ from brainskit.application.codegraph import CodeGraph
 from brainskit.application.compilation import ApplyGate
 from brainskit.application.enrichment import Enrichment
 from brainskit.application.filing import Filing
-from brainskit.application.freshness import (
-    _orphaned_freshness,
-)
+from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.gate import check_write
 from brainskit.application.health import Health
 from brainskit.application.jobs import Jobs
@@ -59,7 +57,6 @@ from brainskit.domain.model import (
     is_ignored,
     normalize_branch,
     resolve_source_path,
-    utc_now,
 )
 
 INTEGRATION_TARGETS = ("obsidian", "neo4j", "postgres")
@@ -97,21 +94,35 @@ class BrainskitService:
     ):
         self.vault = vault
         self.index = index
-        self.gate = ApplyGate(vault, index)
+        # Built once, here, and handed to every collaborator that reads or
+        # writes freshness. Letting each one construct its own would put five
+        # partially-configured owners back on a file whose invariants only hold
+        # when one object states them -- the shape ADR 0002 exists to remove.
+        self.ledger = FreshnessLedger(vault)
+        self.gate = ApplyGate(vault, index, self.ledger)
         self.retrieval = Retrieval(vault, index)
         self.judgment_runner = JudgmentRunner(jobs, judgment)
-        self.health = Health(vault, index, self.retrieval, self.judgment_runner)
+        self.health = Health(
+            vault, index, self.retrieval, self.judgment_runner, self.ledger
+        )
         self.filing = Filing(
             vault, index, self.gate, self.retrieval, self.judgment_runner
         )
-        self.projections = Projections(vault, self.health, graph, integrations)
+        self.projections = Projections(
+            vault, self.health, self.ledger, graph, integrations
+        )
         self.code_graph = CodeGraph(vault, extractor)
         self.enrichment = Enrichment(vault, graph)
         self.reader = Reader(
-            vault, index, self.health, self.filing, self.projections
+            vault, index, self.health, self.filing, self.projections, self.ledger
         )
         self.jobs_runner = Jobs(
-            vault, self.retrieval, self.judgment_runner, self.health, self.filing
+            vault,
+            self.retrieval,
+            self.judgment_runner,
+            self.health,
+            self.filing,
+            self.ledger,
         )
         self.judgment = judgment
         self.jobs = jobs
@@ -230,17 +241,8 @@ class BrainskitService:
         so a deleted page leaves an entry that can never be revived.
         """
         present = set(self.vault.wiki_pages())
-        dropped = _orphaned_freshness(self.vault.read_state("freshness"), present)
-        if not dropped:
-            return []
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            pages = state.setdefault("pages", {})
-            for path in dropped:
-                pages.pop(path, None)
-            return state
-
-        self.vault.mutate_state("freshness", mutate)
+        dropped = self.ledger.snapshot().orphans(present)
+        self.ledger.drop(dropped)
         return dropped
 
     def forget(self, identifier: str, *, force: bool = False) -> dict[str, Any]:
@@ -571,19 +573,12 @@ class BrainskitService:
             related.append(hit.path)
             if len(related) >= _RELATED_PAGE_LIMIT:
                 break
-        if not related:
-            return
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            pages = state.setdefault("pages", {})
-            for path in related:
-                entry = pages.setdefault(path, {})
-                entry["status"] = "review"
-                entry["review_reason"] = f"related source:{record.content_hash}"
-                entry["review_requested_at"] = utc_now()
-            return state
-
-        self.vault.mutate_state("freshness", mutate)
+        # `mark_reviewed` carries the never-downgrade rule, which this writer
+        # used to lack: a page already `stale` stays `stale`, because `review`
+        # is skipped by the ageing pass and would have parked it there.
+        self.ledger.mark_reviewed(
+            dict.fromkeys(related, f"related source:{record.content_hash}")
+        )
 
     def _related_query_terms(self, record: SourceRecord) -> list[str]:
         """Describe a capture by its own text, not by the name it was saved under."""

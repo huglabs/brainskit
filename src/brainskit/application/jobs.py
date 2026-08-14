@@ -17,6 +17,7 @@ import re
 from typing import Any
 
 from brainskit.application.filing import Filing
+from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import VaultPort
@@ -127,12 +128,14 @@ class Jobs:
         judgment_runner: JudgmentRunner,
         health: Health,
         filing: Filing,
+        ledger: FreshnessLedger,
     ):
         self.vault = vault
         self.retrieval = retrieval
         self.judgment_runner = judgment_runner
         self.health = health
         self.filing = filing
+        self.ledger = ledger
 
 
     def ask(
@@ -207,7 +210,7 @@ class Jobs:
                     self.filing.proposals(), ensure_ascii=False
                 ),
                 "freshness": json.dumps(
-                    self.vault.read_state("freshness"), ensure_ascii=False
+                    self.ledger.snapshot().state, ensure_ascii=False
                 ),
             },
         )
@@ -222,7 +225,6 @@ class Jobs:
         }
 
     def resurface(self) -> dict[str, Any]:
-        freshness = self.vault.read_state("freshness")
         # `resurface` only ever reads (see `ask`, above, for why this stays off).
         context = self.retrieval.context(
             "durable insight worth revisiting", limit=20, include_apply_contract=False
@@ -234,14 +236,7 @@ class Jobs:
         )
         path = f"output/resurface/{utc_now()[:10]}.md"
         self.vault.write_generated(path, str(result["markdown"]).rstrip() + "\n")
-        page = str(result["page"])
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            pages = state.setdefault("pages", {})
-            entry = pages.setdefault(page, {})
-            entry["last_resurfaced_at"] = utc_now()
-            return state
-
-        if page in freshness.get("pages", {}) or page in self.vault.wiki_pages():
-            self.vault.mutate_state("freshness", mutate)
+        # An annotation, not a freshness verdict -- see `record_resurfaced`,
+        # which also refuses to invent an entry for a page that is not there.
+        self.ledger.record_resurfaced(str(result["page"]))
         return {**result, "path": path}

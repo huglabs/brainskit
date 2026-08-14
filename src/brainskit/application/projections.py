@@ -17,7 +17,11 @@ from collections import defaultdict
 from pathlib import PurePosixPath
 from typing import Any
 
-from brainskit.application.freshness import GRAPH_PROJECTION, VIEWS_PROJECTION
+from brainskit.application.freshness import (
+    GRAPH_PROJECTION,
+    VIEWS_PROJECTION,
+    FreshnessLedger,
+)
 from brainskit.application.health import Health
 from brainskit.application.pages import GENERATED_MARKER
 from brainskit.application.ports import GraphPort, IntegrationPort, VaultPort
@@ -86,11 +90,13 @@ class Projections:
         self,
         vault: VaultPort,
         health: Health,
+        ledger: FreshnessLedger,
         graph_port: GraphPort | None = None,
         integrations: IntegrationPort | None = None,
     ):
         self.vault = vault
         self.health = health
+        self.ledger = ledger
         self.graph_port = graph_port
         self.integration_port = integrations
 
@@ -99,7 +105,7 @@ class Projections:
         boundary = for_consumer(consumer, self.vault)
         status = self.health.status()
         records, _ = boundary.split_records()
-        freshness = self.vault.read_state("freshness").get("pages", {})
+        freshness = self.ledger.snapshot()
         pages = {}
         for path in self.vault.wiki_pages():
             content = self.vault.read_text(path)
@@ -146,10 +152,7 @@ class Projections:
                     f"[[{PurePosixPath(path).stem}]]" for path in linked_paths
                 ]
                 freshness_badges = sorted(
-                    {
-                        str(freshness.get(path, {}).get("status", "unknown"))
-                        for path in linked_paths
-                    }
+                    {freshness.status(path) for path in linked_paths}
                 )
                 rows.append(
                     "| "
@@ -161,7 +164,7 @@ class Projections:
             self.vault.write_generated(view_path, "\n".join(rows) + "\n")
             written.append(view_path)
         self.vault.write_generated("views/home.md", "\n".join(home) + "\n")
-        self.health._record_projection(VIEWS_PROJECTION)
+        self.ledger.record_projection(VIEWS_PROJECTION)
         return {"written": written}
 
     def graph(
@@ -191,7 +194,7 @@ class Projections:
                 "graph/graph.html", self.graph_port.export(graph, "html")
             )
             written.append("graph/graph.html")
-        self.health._record_projection(GRAPH_PROJECTION)
+        self.ledger.record_projection(GRAPH_PROJECTION)
         return {
             "consumer": consumer,
             "nodes": len(graph["nodes"]),

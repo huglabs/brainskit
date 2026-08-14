@@ -5,17 +5,20 @@ Everything here exists to make one guarantee checkable -- that a page in
 is validated before a single page is staged, because a partially applied
 proposal is indistinguishable, afterwards, from a hand edit.
 
-This is a leaf of the application layer: it needs the vault and the index and
-nothing else, which is what lets `apply` and the filing workflow share it
-without either one owning it.
+This is a leaf of the application layer: it needs the vault, the index and the
+freshness ledger and nothing else, which is what lets `apply` and the filing
+workflow share it without either one owning it. The ledger is here because an
+apply is the one writer that records provenance -- see `mark_applied` for why
+the entries it builds are committed by the transaction rather than by the
+ledger itself.
 """
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import PurePosixPath
 from typing import Any
 
+from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.pages import (
     _content_tokens,
     _normalize_identity,
@@ -34,16 +37,18 @@ from brainskit.domain.model import (
     PageOperation,
     ValidationError,
     proposal_id_reuse_error,
-    utc_now,
 )
 
 
 class ApplyGate:
     """Validates and commits a proposal as one recoverable unit of work."""
 
-    def __init__(self, vault: VaultPort, index: SearchIndexPort):
+    def __init__(
+        self, vault: VaultPort, index: SearchIndexPort, ledger: FreshnessLedger
+    ):
         self.vault = vault
         self.index = index
+        self.ledger = ledger
 
 
     def apply(self, raw_proposal: dict[str, Any]) -> dict[str, Any]:
@@ -104,7 +109,7 @@ class ApplyGate:
             dict.fromkeys(referenced_hashes, "ingested"),
             proposal_id,
             request_hash,
-            self._freshness_updates(proposal.operations, pages),
+            self.ledger.mark_applied(proposal.operations, pages),
             raw_move,
             lambda records: self.index.apply_snapshot(
                 self.vault,
@@ -411,22 +416,3 @@ class ApplyGate:
                 }
             )
         return catalog
-
-    def _freshness_updates(
-        self,
-        operations: tuple[PageOperation, ...],
-        pages: dict[str, str],
-    ) -> dict[str, dict[str, Any]]:
-        now = utc_now()
-        return {
-            operation.relative_path: {
-                "status": "fresh",
-                "updated_at": now,
-                "content_hash": hashlib.sha256(
-                    pages[operation.relative_path].encode("utf-8")
-                ).hexdigest(),
-                "source_hashes": list(operation.source_hashes),
-                "review_reason": None,
-            }
-            for operation in operations
-        }
