@@ -47,9 +47,6 @@ from brainskit.application.ports import (
     SearchIndexPort,
     VaultPort,
 )
-from brainskit.application.privacy import (
-    _is_url,
-)
 from brainskit.application.projections import DEFAULT_EXPORT_CONSUMER, Projections
 from brainskit.application.reader import Reader
 from brainskit.application.retrieval import Retrieval
@@ -397,9 +394,11 @@ class BrainskitService:
             name, enabled=enabled, managed=managed, options=options
         )
 
-    def integration_status(self, name: str | None = None) -> dict[str, Any]:
+    def integration_status(
+        self, name: str | None = None, *, consumer: str = "human"
+    ) -> dict[str, Any]:
         """Durable policy plus live process state. See `Projections`."""
-        return self.projections.integration_status(name)
+        return self.projections.integration_status(name, consumer=consumer)
 
     def integration_up(self, name: str) -> dict[str, Any]:
         """Start a managed integration. See `Projections`."""
@@ -618,6 +617,10 @@ class BrainskitService:
 
 
 
+
+
+def _is_url(value: str) -> bool:
+    return urlparse(value).scheme in {"http", "https"}
 
 
 def _missing_source(value: str, root: Path) -> dict[str, str]:

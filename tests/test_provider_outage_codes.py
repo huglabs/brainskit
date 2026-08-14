@@ -109,10 +109,10 @@ class ProviderOutageIsNotConfiguredTest(unittest.TestCase):
         its own code.
         """
 
-        from brainskit.application.privacy import _validate_consumer
+        from brainskit.domain.privacy import Consumer
 
         with self.assertRaises(ValidationError) as raised:
-            _validate_consumer("everyone")
+            Consumer.parse("everyone")
         self.assertEqual(raised.exception.code, "validation_error")
 
     def test_a_bad_base_url_is_configuration_not_a_bad_request(self) -> None:

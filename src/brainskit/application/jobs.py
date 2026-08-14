@@ -20,18 +20,18 @@ from brainskit.application.filing import Filing
 from brainskit.application.health import Health
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import VaultPort
-from brainskit.application.privacy import (
-    _branch_policy,
-    _context_branches,
-    _privacy_for_record,
-    _record_branch,
-)
+from brainskit.application.privacy import for_consumer
 from brainskit.application.retrieval import Retrieval
 from brainskit.domain.model import (
     PolicyError,
     PrivacyMode,
     VaultConfig,
     utc_now,
+)
+from brainskit.domain.privacy import (
+    context_branches,
+    record_branch,
+    resolve_branch_policy,
 )
 
 #: Conversation bounds for `Jobs.ask`. History is model context only -- it
@@ -97,7 +97,7 @@ def _resolved_query_route(
         return None, None
     try:
         policies = [
-            _branch_policy(config, branch) for branch in (branches or ["_inbox"])
+            resolve_branch_policy(config, branch) for branch in (branches or ["_inbox"])
         ]
     except PolicyError:
         return None, None
@@ -151,7 +151,7 @@ class Jobs:
         # burying the terms this question is actually about. History is model
         # context for *interpreting* the question, and rides only the prompt.
         context = self.retrieval.context(question, include_apply_contract=False)
-        branches = _context_branches(context)
+        branches = context_branches(context)
         response = self.judgment_runner.run(
             job="query",
             branches=branches,
@@ -188,13 +188,10 @@ class Jobs:
             key=lambda item: item.captured_at,
             reverse=True,
         )[:50]
-        config = self.vault.config()
-        allowed_recent = [
-            record
-            for record in recent
-            if _privacy_for_record(config, record) != PrivacyMode.NEVER_INGEST
-        ]
-        digest_branches = sorted({_record_branch(record) for record in allowed_recent})
+        # `local` is the boundary that excludes exactly never-ingest evidence.
+        boundary = for_consumer("local", self.vault)
+        allowed_recent = [record for record in recent if boundary.allows_record(record)]
+        digest_branches = sorted({record_branch(record) for record in allowed_recent})
         if not digest_branches:
             digest_branches = ["_inbox"]
         digest_payload = self.judgment_runner.run(
@@ -232,7 +229,7 @@ class Jobs:
         )
         result = self.judgment_runner.run(
             job="resurface",
-            branches=_context_branches(context),
+            branches=context_branches(context),
             variables={"context": json.dumps(context, ensure_ascii=False)},
         )
         path = f"output/resurface/{utc_now()[:10]}.md"

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -20,17 +20,12 @@ from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import urlopen
 
-from brainskit.application.ports import VaultPort
-from brainskit.application.privacy import (
-    _consumer_allows,
-    _evidence_privacy,
-)
+from brainskit.application.ports import SyncBoundaryPort, VaultPort
 from brainskit.domain.model import (
     INTEGRATION_NAMES,
     BrainskitError,
     IntegrationPolicy,
     NotConfiguredError,
-    PrivacyMode,
     RefusalError,
     ValidationError,
     VaultConfig,
@@ -118,6 +113,11 @@ class NativeIntegrations:
 
     def __init__(self, vault: VaultPort):
         self.vault = vault
+        # Set per `sync` call and cleared after, so `_sync_obsidian` -- whose
+        # signature is pinned -- can reach the caller's required boundary
+        # without the graph payload carrying it. The graph dict stays pure
+        # JSON data end to end.
+        self._sync_boundary_override: SyncBoundaryPort | None = None
 
     def configure(
         self,
@@ -208,22 +208,28 @@ class NativeIntegrations:
         self._record(name, {"last_down_at": utc_now(), **result})
         return result
 
-    def sync(self, name: str, graph: dict[str, Any]) -> dict[str, Any]:
+    def sync(
+        self, name: str, graph: dict[str, Any], boundary: SyncBoundaryPort
+    ) -> dict[str, Any]:
         name = _integration_name(name)
         policy = self._enabled_policy(name)
-        if name == "obsidian":
-            result = self._sync_obsidian(policy, graph)
-        elif name == "neo4j":
-            result = self._sync_neo4j(policy, graph)
-        elif name == "postgres":
-            result = self._sync_postgres(policy, graph)
-        else:
-            result = {
-                "integration": "web",
-                "nodes": len(graph["nodes"]),
-                "edges": len(graph["edges"]),
-                "state": self._live_state("web", policy),
-            }
+        self._sync_boundary_override = boundary
+        try:
+            if name == "obsidian":
+                result = self._sync_obsidian(policy, graph)
+            elif name == "neo4j":
+                result = self._sync_neo4j(policy, graph)
+            elif name == "postgres":
+                result = self._sync_postgres(policy, graph)
+            else:
+                result = {
+                    "integration": "web",
+                    "nodes": len(graph["nodes"]),
+                    "edges": len(graph["edges"]),
+                    "state": self._live_state("web", policy),
+                }
+        finally:
+            self._sync_boundary_override = None
         self._record(name, {"last_sync_at": utc_now(), **result})
         return result
 
@@ -278,54 +284,6 @@ class NativeIntegrations:
         container = _container_name(self.vault.root, name, policy.options)
         return _docker_container_state(container)
 
-    def _sync_boundary(self, consumer: str) -> Callable[[Path], bool]:
-        """Whether a vault-relative path may be copied out to `consumer`.
-
-        The graph object was filtered carefully and then the files were chosen
-        by walking the filesystem, so the boundary never reached the copy. The
-        compiled page leaked under default options and raw never-ingest bytes
-        leaked under `include_raw` -- into what is usually an iCloud- or
-        Dropbox-backed directory.
-
-        `views/` needs no check here: `ProjectionService.integration_sync`
-        regenerates it filtered under this same consumer immediately before the
-        copy. It is the only tree that was ever safe, and it was safe by that
-        accident rather than by this decision.
-        """
-
-        records = self.vault.registry()
-        config = self.vault.config()
-
-        def allows(relative: Path) -> bool:
-            posix = relative.as_posix()
-            if posix.startswith("wiki/"):
-                content = (self.vault.root / relative).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-                privacy = _evidence_privacy({"path": posix}, content, records, config)
-                return _consumer_allows(consumer, privacy)
-            if posix.startswith("raw/"):
-                # Branch comes from the path, the way `_record_branch` reads it,
-                # rather than from a registry lookup: a file that landed in the
-                # inbox but has not been reconciled yet still sits in a branch
-                # whose policy is known, and refusing it would over-block the
-                # one directory files arrive in.
-                parts = PurePosixPath(posix).parts
-                branch = parts[1] if len(parts) > 1 else ""
-                if branch == "_inbox":
-                    return _consumer_allows(
-                        consumer, PrivacyMode(config.inbox_policy.privacy)
-                    )
-                branch_policy = config.branches.get(branch)
-                if branch_policy is None:
-                    # Not a configured branch, so there is no policy that says
-                    # this may leave the vault.
-                    return consumer == "human"
-                return _consumer_allows(consumer, PrivacyMode(branch_policy.privacy))
-            return True
-
-        return allows
-
     def _sync_obsidian(
         self, policy: IntegrationPolicy, graph: dict[str, Any]
     ) -> dict[str, Any]:
@@ -373,11 +331,18 @@ class NativeIntegrations:
             source_paths.extend(
                 path for path in (self.vault.root / "raw").rglob("*") if path.is_file()
             )
-        allows = self._sync_boundary(str(graph.get("consumer", "local")))
+        boundary = self._sync_boundary_override
+        if boundary is None:
+            # Unreachable through the port: `sync` is the only caller and it
+            # stores its required `boundary` before dispatching here. Stated as
+            # a refusal rather than assumed, the same way `up` refuses an
+            # Obsidian call that did not route through sync.
+            raise ValidationError("Obsidian sync must be routed through sync")
+        allows = boundary.allows_path
         managed: set[str] = set()
         for source in sorted(set(source_paths)):
             relative = source.relative_to(self.vault.root)
-            if not allows(relative):
+            if not allows(PurePosixPath(*relative.parts)):
                 # Excluded files are deliberately left out of `managed`, so the
                 # stale sweep below deletes any copy an earlier, wider sync
                 # wrote. Narrowing the consumer has to remove, not just stop

@@ -20,6 +20,7 @@ from brainskit.domain.model import (
     ValidationError,
     VaultConfig,
 )
+from brainskit.domain.privacy import resolve_branch_policy, strictest_privacy
 
 SUPPORTED_PROVIDERS = {"anthropic", "openai", "openrouter", "ollama"}
 
@@ -118,37 +119,38 @@ class PolicyJudgmentRouter:
     ) -> str:
         if not branches:
             branches = ["_inbox"]
-        policies = {
-            branch: (
-                self.config.inbox_policy
-                if branch == "_inbox"
-                else self.config.branches.get(branch)
-            )
-            for branch in set(branches)
-        }
-        missing = sorted(branch for branch, policy in policies.items() if policy is None)
+        policies: dict[str, Any] = {}
+        missing: list[str] = []
+        for branch in set(branches):
+            try:
+                policies[branch] = resolve_branch_policy(self.config, branch)
+            except PolicyError:
+                missing.append(branch)
         if missing:
+            # One refusal naming every unresolved branch, not the first one
+            # found: the router's contract is plural and callers pin it.
             raise PolicyError(
                 "No privacy policy exists for one or more branches",
-                details={"branches": missing},
+                details={"branches": sorted(missing)},
             )
         never_ingest = sorted(
             branch
             for branch, policy in policies.items()
-            if policy and policy.privacy == PrivacyMode.NEVER_INGEST
+            if policy.privacy == PrivacyMode.NEVER_INGEST
         )
         if never_ingest:
             raise PolicyError(
                 "Branch policy forbids judgment ingestion",
                 details={"branches": never_ingest},
             )
-        effective_privacy = (
-            PrivacyMode.LOCAL_ONLY
-            if any(
-                policy and policy.privacy == PrivacyMode.LOCAL_ONLY
-                for policy in policies.values()
-            )
-            else PrivacyMode.CLOUD
+        # Runs after the never-ingest refusal, so the fold answers LOCAL_ONLY
+        # or CLOUD. `on_empty` is unreachable -- `branches` defaults to
+        # `["_inbox"]` and every branch resolved above -- but the answer is
+        # stated because the doctrine makes it a required decision, not an
+        # asserted invariant.
+        effective_privacy = strictest_privacy(
+            (policy.privacy for policy in policies.values()),
+            on_empty=PrivacyMode.NEVER_INGEST,
         )
         mapping = self.config.job_models.get(job)
         if not mapping:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from brainskit.domain.model import ScanSurvey, SearchHit, SourceRecord, VaultConfig
@@ -144,9 +144,18 @@ class CodeExtractorPort(Protocol):
     #: missing grammars *before* extracting, and both need this answer. Callers
     #: reach it defensively (`getattr`) so an extractor that predates it still
     #: satisfies the protocol at runtime.
-    def survey(
-        self, root: Path, paths: list[Path] | None = None
-    ) -> ScanSurvey: ...
+    def survey(self, root: Path, paths: list[Path] | None = None) -> ScanSurvey: ...
+
+
+class SyncBoundaryPort(Protocol):
+    """What crosses to an integration adapter: a consumer name and one path
+    predicate. Never inside the graph payload -- the graph dict stays pure
+    JSON data end to end."""
+
+    @property
+    def consumer(self) -> str: ...
+
+    def allows_path(self, relative: PurePosixPath) -> bool: ...
 
 
 class IntegrationPort(Protocol):
@@ -165,4 +174,9 @@ class IntegrationPort(Protocol):
 
     def down(self, name: str) -> dict[str, Any]: ...
 
-    def sync(self, name: str, graph: dict[str, Any]) -> dict[str, Any]: ...
+    def sync(
+        self,
+        name: str,
+        graph: dict[str, Any],
+        boundary: SyncBoundaryPort,
+    ) -> dict[str, Any]: ...

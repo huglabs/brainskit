@@ -501,7 +501,10 @@ def _call_tool(
             options=dict(arguments.get("options", {})),
         ),
         "integration_status": lambda: service.integration_status(
-            str(arguments["name"]) if arguments.get("name") else None
+            str(arguments["name"]) if arguments.get("name") else None,
+            # MCP is a machine surface; `local` is its scope everywhere it
+            # reads without a caller-declared consumer (see resources/*).
+            consumer="local",
         ),
         "integration_up": lambda: service.integration_up(str(arguments["name"])),
         "integration_down": lambda: service.integration_down(

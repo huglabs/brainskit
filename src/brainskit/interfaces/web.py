@@ -337,7 +337,9 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
                     limit=int(_one(query, "limit", "500")),
                 )
             elif parsed.path == "/api/integrations":
-                value = self.server.service.integration_status()
+                value = self.server.service.integration_status(
+                    consumer=self.server.consumer
+                )
             else:
                 self._send_json(
                     {"ok": False, "error": {"code": "not_found"}},

@@ -15,15 +15,9 @@ from typing import Any
 
 from brainskit.application.pages import _focused_excerpt, parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import (
-    _consumer_allows,
-    _evidence_branches,
-    _evidence_privacy,
-    _privacy_for_record,
-    _record_branch,
-    _validate_consumer,
-)
+from brainskit.application.privacy import for_consumer
 from brainskit.domain.model import WIKI_LINK_RE, ValidationError
+from brainskit.domain.privacy import record_branch
 
 
 class Retrieval:
@@ -33,7 +27,6 @@ class Retrieval:
         self.vault = vault
         self.index = index
 
-
     def search(
         self, query: str, limit: int = 10, *, consumer: str = "human"
     ) -> dict[str, Any]:
@@ -41,9 +34,7 @@ class Retrieval:
             raise ValidationError("Search query cannot be empty")
         if limit < 1:
             raise ValidationError("Search limit must be positive")
-        _validate_consumer(consumer)
-        records = self.vault.registry()
-        config = self.vault.config()
+        boundary = for_consumer(consumer, self.vault)
         ranked: list[Any] = []
         redacted = 0
         privacy_by_path: dict[str, str] = {}
@@ -56,14 +47,14 @@ class Retrieval:
             redacted = 0
             privacy_by_path = {}
             for hit in self.index.search(query, candidate_limit):
-                if hit.content_hash and hit.content_hash in records:
-                    privacy = _privacy_for_record(config, records[hit.content_hash])
+                if hit.content_hash and hit.content_hash in boundary.records:
+                    privacy = boundary.record_privacy(
+                        boundary.records[hit.content_hash]
+                    )
                 else:
                     content = self.vault.read_text(hit.path)
-                    privacy = _evidence_privacy(
-                        hit.to_dict(), content, records, config
-                    )
-                if not _consumer_allows(consumer, privacy):
+                    privacy = boundary.evidence_privacy(hit.to_dict(), content)
+                if not boundary.allows(privacy):
                     redacted += 1
                     continue
                 privacy_by_path[hit.path] = privacy.value
@@ -88,8 +79,8 @@ class Retrieval:
         expanded = []
         for hit in expanded_candidates:
             content = self.vault.read_text(hit.path)
-            privacy = _evidence_privacy(hit.to_dict(), content, records, config)
-            if not _consumer_allows(consumer, privacy):
+            privacy = boundary.evidence_privacy(hit.to_dict(), content)
+            if not boundary.allows(privacy):
                 redacted += 1
                 continue
             privacy_by_path[hit.path] = privacy.value
@@ -107,12 +98,7 @@ class Retrieval:
                 {
                     **hit.to_dict(),
                     "privacy": privacy_by_path.get(hit.path)
-                    or _evidence_privacy(
-                        hit.to_dict(),
-                        self.vault.read_text(hit.path),
-                        records,
-                        config,
-                    ).value,
+                    or boundary.evidence_privacy(hit.to_dict()).value,
                 }
                 for hit in (*hits, *expanded)
             ],
@@ -127,24 +113,22 @@ class Retrieval:
         consumer: str = "human",
         include_apply_contract: bool = True,
     ) -> dict[str, Any]:
-        _validate_consumer(consumer)
-        records = self.vault.registry()
-        config = self.vault.config()
+        boundary = for_consumer(consumer, self.vault)
         evidence: list[dict[str, Any]] = []
         # A count, never a description. `context` is the payload handed to a
         # cloud model, and the path of a redacted source names the document and
         # the branch it lives in — disclosure in its own right.
         redacted = 0
-        if query in records:
-            record = records[query]
-            privacy = _privacy_for_record(config, record)
-            if _consumer_allows(consumer, privacy):
+        if query in boundary.records:
+            record = boundary.records[query]
+            privacy = boundary.record_privacy(record)
+            if boundary.allows(privacy):
                 evidence.append(
                     {
                         "citation": f"source:{record.content_hash}",
                         "path": record.path,
                         "kind": "raw",
-                        "branches": [_record_branch(record)],
+                        "branches": [record_branch(record)],
                         "privacy": privacy.value,
                         "content": self.vault.raw_text(record, max_chars=max_chars),
                     }
@@ -159,11 +143,11 @@ class Retrieval:
                 if remaining <= 0:
                     break
                 content = self.vault.read_text(hit["path"])
-                if hit.get("content_hash") and hit["content_hash"] in records:
-                    content = self.vault.raw_text(records[hit["content_hash"]])
+                if hit.get("content_hash") and hit["content_hash"] in boundary.records:
+                    content = self.vault.raw_text(boundary.records[hit["content_hash"]])
                 excerpt = _focused_excerpt(content, query, min(4_000, remaining))
                 remaining -= len(excerpt)
-                branches = _evidence_branches(hit, content, records)
+                branches = boundary.evidence_branches(hit, content)
                 evidence.append(
                     {
                         "citation": (
@@ -187,7 +171,7 @@ class Retrieval:
             "contract_version": 1,
             "query": query,
             "consumer": consumer,
-            "wiki_language": config.wiki_language,
+            "wiki_language": self.vault.config().wiki_language,
             "evidence": evidence,
             "redacted": redacted,
         }
@@ -237,9 +221,7 @@ class Retrieval:
         for hit in wiki_hits:
             outgoing_slugs.update(
                 PurePosixPath(value.strip()).name
-                for value in WIKI_LINK_RE.findall(
-                    self.vault.read_text(hit.path)
-                )
+                for value in WIKI_LINK_RE.findall(self.vault.read_text(hit.path))
             )
         expanded: list[SearchHit] = []
         for path in self.vault.wiki_pages():
@@ -247,9 +229,8 @@ class Retrieval:
                 continue
             text = self.vault.read_text(path)
             links = {PurePosixPath(v.strip()).name for v in WIKI_LINK_RE.findall(text)}
-            if (
-                PurePosixPath(path).stem not in outgoing_slugs
-                and not (links & known_slugs)
+            if PurePosixPath(path).stem not in outgoing_slugs and not (
+                links & known_slugs
             ):
                 continue
             metadata, body = parse_frontmatter(text)

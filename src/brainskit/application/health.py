@@ -36,7 +36,6 @@ from brainskit.application.gate import INSTRUCTION_START
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import _context_branches
 from brainskit.application.retrieval import Retrieval
 from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
@@ -49,6 +48,7 @@ from brainskit.domain.model import (
     ValidationError,
     utc_now,
 )
+from brainskit.domain.privacy import context_branches
 
 #: Where git reads hooks from when `core.hooksPath` says nothing.
 DEFAULT_GIT_HOOKS = Path(".git") / "hooks"
@@ -201,7 +201,7 @@ class Health:
             )
             semantic_report = self.judgment_runner.run(
                 job="lint-semantic",
-                branches=_context_branches(context),
+                branches=context_branches(context),
                 variables={"context": json.dumps(context, ensure_ascii=False)},
             )
         return {

@@ -18,6 +18,7 @@ from brainskit.application.services import BrainskitService
 from brainskit.domain.model import NotFoundError, ValidationError
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.integrations import NativeIntegrations
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces import cli, console, onboarding, prompt
 from brainskit.interfaces.mcp import (
@@ -25,6 +26,7 @@ from brainskit.interfaces.mcp import (
     MCP_PROTOCOL_VERSION,
     BrainskitMcpHttpHandler,
     BrainskitMcpHttpServer,
+    _call_tool,
     _safe_reason,
     _tool_definitions,
     run_stdio,
@@ -704,6 +706,32 @@ class McpConsumerSchemaTest(unittest.TestCase):
             self.assertIn("consumer", tool["inputSchema"]["required"])
 
 
+class McpIntegrationStatusConsumerTest(unittest.TestCase):
+    """integration_status over MCP names the machine boundary explicitly.
+
+    The tool schema declares no consumer, so the call inherits the transport's
+    own scope: `local`, the same boundary resources/list and resources/read
+    already hardcode. Before the fix the call was bare, which handed a machine
+    caller the unfiltered human payload.
+    """
+
+    def test_the_tool_passes_the_local_consumer(self) -> None:
+        service = RecordingService()
+        _call_tool(service, "integration_status", {})  # type: ignore[arg-type]
+        name, args, kwargs = service.calls[-1]
+        self.assertEqual(name, "integration_status")
+        self.assertEqual(args, (None,))
+        self.assertEqual(kwargs.get("consumer"), "local")
+
+    def test_a_named_integration_keeps_the_local_consumer(self) -> None:
+        service = RecordingService()
+        _call_tool(service, "integration_status", {"name": "web"})  # type: ignore[arg-type]
+        name, args, kwargs = service.calls[-1]
+        self.assertEqual(name, "integration_status")
+        self.assertEqual(args, ("web",))
+        self.assertEqual(kwargs.get("consumer"), "local")
+
+
 class AgentInstallTest(unittest.TestCase):
     """`hooks install` seeds the skill and the graph instructions."""
 
@@ -894,6 +922,103 @@ class WebViewerBoundaryTest(unittest.TestCase):
             build_server(
                 self.service, host="0.0.0.0", port=0, consumer="local"  # noqa: S104
             )
+
+
+class WebIntegrationsConsumerTest(unittest.TestCase):
+    """/api/integrations answers under the viewer's bound consumer.
+
+    Before the fix the handler called `integration_status()` bare, so a viewer
+    bound at a machine consumer received the human payload over HTTP —
+    filesystem paths and secret-bearing env-var names included. ADR 0001 names
+    this as one of the two behavioral gaps the seam closes: "machine consumers
+    no longer receive filesystem paths, container names, DSN env names".
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.obsidian_target = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        vault = FileVault.initialize(root, policy())
+        self.service = BrainskitService(
+            vault,
+            SqliteFtsIndex(vault.index_path),
+            graph=MarkdownGraph(),
+            integrations=NativeIntegrations(vault),
+        )
+        self.service.integration_configure(
+            "obsidian",
+            enabled=True,
+            managed=False,
+            options={"path": self.obsidian_target.name, "subdirectory": "brainskit"},
+        )
+        self.service.integration_configure(
+            "postgres",
+            enabled=True,
+            managed=False,
+            options={"dsn_env": "BRAINSKIT_TEST_PG_DSN", "consumer": "local"},
+        )
+
+    def tearDown(self) -> None:
+        self.obsidian_target.cleanup()
+        self.temporary.cleanup()
+
+    def _fetch(self, consumer: str) -> tuple[int, str]:
+        server = build_server(self.service, host="127.0.0.1", port=0, consumer=consumer)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(f"http://127.0.0.1:{server.server_port}/api/integrations")
+            try:
+                with urlopen(request, timeout=3) as response:
+                    return response.status, response.read().decode("utf-8")
+            except HTTPError as error:
+                return error.code, error.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_the_handler_forwards_the_bound_consumer(self) -> None:
+        recording = RecordingService()
+        server = build_server(
+            recording,  # type: ignore[arg-type]
+            host="127.0.0.1",
+            port=0,
+            consumer="local",
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/integrations", timeout=3
+            ) as response:
+                self.assertEqual(response.status, HTTPStatus.OK)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual(
+            recording.calls[-1],
+            ("integration_status", (), {"consumer": "local"}),
+        )
+
+    def test_a_machine_viewer_receives_no_machine_layout_disclosure(self) -> None:
+        leak_path = self.obsidian_target.name
+        status, human_body = self._fetch("human")
+        self.assertEqual(status, HTTPStatus.OK)
+        # Control: the human payload really carries the layout the machine
+        # assertions below are about, so absence there is filtering at work,
+        # not a vacuously green test.
+        self.assertIn(leak_path, human_body)
+        self.assertIn("BRAINSKIT_TEST_PG_DSN", human_body)
+
+        status, machine_body = self._fetch("local")
+        self.assertEqual(status, HTTPStatus.OK)
+        payload = json.loads(machine_body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"].get("consumer"), "local")
+        self.assertNotIn(leak_path, machine_body)
+        self.assertNotIn("BRAINSKIT_TEST_PG_DSN", machine_body)
 
 
 class RendererUnitTests(unittest.TestCase):

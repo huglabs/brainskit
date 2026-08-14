@@ -345,6 +345,88 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(result["integrations"][0]["name"], "web")
         self.assertEqual(result["integrations"][0]["state"], "disabled")
 
+    def test_integration_status_hides_machine_layout_from_machine_consumers(
+        self,
+    ) -> None:
+        # One canary per disclosure class the sanctioned fix strips: a
+        # filesystem path, a directory name, a DSN, env-var names, and the
+        # runtime file listing / paths / container name a sync leaves behind.
+        self.service.integration_configure(
+            "obsidian",
+            options={
+                "path": str(self.root / "mirror-canary"),
+                "subdirectory": "layout-canary-subdir",
+            },
+        )
+        self.service.integration_configure(
+            "neo4j",
+            enabled=True,
+            managed=False,
+            options={
+                "uri": "bolt://dsn-canary-host:7687",
+                "user": "neo4j",
+                "password_env": "BRAINSKIT_CANARY_NEO4J_PASSWORD",
+                "database": "graphdb",
+                "consumer": "local",
+            },
+        )
+        self.service.integration_configure(
+            "postgres",
+            enabled=True,
+            managed=False,
+            options={
+                "dsn_env": "BRAINSKIT_CANARY_PG_DSN",
+                "consumer": "local",
+            },
+        )
+
+        def seed(state: dict) -> dict:
+            rows = state.setdefault("integrations", {})
+            rows["obsidian"] = {
+                "last_sync_at": "2026-08-14T00:00:00+00:00",
+                "path": "/tmp/canary-managed-root",
+                "managed_files": ["wiki/canary-page.md"],
+                "managed_file_count": 1,
+            }
+            rows["postgres"] = {"container": "canary-container"}
+            rows["web"] = {"log": "/tmp/canary-web.log", "pid": 4242}
+            return state
+
+        self.vault.mutate_state("integration-state", seed)
+
+        canaries = (
+            "mirror-canary",
+            "layout-canary-subdir",
+            "bolt://",
+            "BRAINSKIT_CANARY",
+            "canary-managed-root",
+            "canary-page.md",
+            "canary-container",
+            "canary-web.log",
+        )
+        human = self.service.integration_status()
+        serialized_human = json.dumps(human)
+        self.assertNotIn("consumer", human)
+        for canary in canaries:
+            self.assertIn(canary, serialized_human)
+        for consumer in ("local", "cloud"):
+            with self.subTest(consumer=consumer):
+                machine = self.service.integration_status(consumer=consumer)
+                serialized = json.dumps(machine)
+                self.assertEqual(consumer, machine["consumer"])
+                for canary in canaries:
+                    self.assertNotIn(canary, serialized)
+                by_name = {row["name"]: row for row in machine["integrations"]}
+                # The question the row exists to answer still is answered.
+                self.assertIn("state", by_name["neo4j"])
+                self.assertTrue(by_name["neo4j"]["enabled"])
+                self.assertEqual("local", by_name["neo4j"]["options"]["consumer"])
+                self.assertEqual("graphdb", by_name["neo4j"]["options"]["database"])
+                self.assertEqual(4242, by_name["web"]["runtime"]["pid"])
+                self.assertEqual(
+                    1, by_name["obsidian"]["runtime"]["managed_file_count"]
+                )
+
     def test_apply_is_idempotent_and_rejects_stale_updates(self) -> None:
         captured = self.service.capture(None, text="Evidence", title="Evidence")
         content_hash = captured["source"]["content_hash"]

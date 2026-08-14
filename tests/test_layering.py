@@ -55,22 +55,15 @@ ALLOWED: dict[str, frozenset[str]] = {
 DOCUMENTED_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset(
     {
         ("application.codegraph", "infrastructure.codeanalysis"),
-        # Two adapters reaching *up* for a concrete application function rather
-        # than a port. Both were invisible while `ALLOWED` let infrastructure
-        # import all of `application`; naming them is what turns a silent
+        # An adapter reaching *up* for a concrete application function rather
+        # than a port. It was invisible while `ALLOWED` let infrastructure
+        # import all of `application`; naming it is what turns a silent
         # allowance into a decision someone has to defend.
         #
         # `parse_frontmatter` is a pure parser over bytes the adapter already
         # holds, with no port to answer to -- the same argument as
         # `normalize_id` above.
         ("infrastructure.graph", "application.pages"),
-        # The privacy rule deciding which files may leave the vault. This one
-        # is real debt: the decision belongs in the application layer and
-        # should be handed to the adapter as a predicate. Attempted and
-        # reverted -- threading a callable through the graph dict that also
-        # feeds the Neo4j and Postgres adapters broke five tests. Left here,
-        # named, rather than left invisible.
-        ("infrastructure.integrations", "application.privacy"),
     }
 )
 
