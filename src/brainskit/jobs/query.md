@@ -7,6 +7,13 @@ invent citations.
 
 Return only JSON with `answer`, `citations`, and `uncertainty`.
 
+Conversation so far (may be `(none)`). Use it only to interpret the current
+question — resolve pronouns, references, and follow-ups against it. Every
+claim and every citation must still come from the Evidence below, never from
+this conversation:
+
+{{history}}
+
 Question:
 
 {{question}}

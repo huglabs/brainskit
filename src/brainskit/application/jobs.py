@@ -21,12 +21,100 @@ from brainskit.application.health import Health
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import VaultPort
 from brainskit.application.privacy import (
+    _branch_policy,
     _context_branches,
     _privacy_for_record,
     _record_branch,
 )
 from brainskit.application.retrieval import Retrieval
-from brainskit.domain.model import PrivacyMode, utc_now
+from brainskit.domain.model import (
+    PolicyError,
+    PrivacyMode,
+    VaultConfig,
+    utc_now,
+)
+
+#: Conversation bounds for `Jobs.ask`. History is model context only -- it
+#: rides the prompt so pronouns and follow-ups resolve, and never reaches
+#: retrieval -- so these are token budgets, not correctness limits.
+MAX_HISTORY_EXCHANGES = 6
+MAX_HISTORY_CHARS = 4_000
+
+
+def _serialize_history(items: list[dict[str, str]]) -> str:
+    """Compact transcript for the query prompt's conversation section."""
+
+    if not items:
+        return "(none)"
+    return "\n\n".join(
+        f"Q: {item['question']}\nA: {item['answer']}" for item in items
+    )
+
+
+def _bounded_history(
+    history: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    """The most recent exchanges, oldest first, within both named bounds.
+
+    Trims whole exchanges oldest-first: the newest turns are what the current
+    question's pronouns resolve against. When the one remaining exchange alone
+    exceeds `MAX_HISTORY_CHARS`, the tail of its answer is cut instead of
+    dropping the only context there is.
+    """
+
+    items = [
+        {
+            "question": str(item.get("question", "")),
+            "answer": str(item.get("answer", "")),
+        }
+        for item in (history or [])
+    ][-MAX_HISTORY_EXCHANGES:]
+    while len(items) > 1 and len(_serialize_history(items)) > MAX_HISTORY_CHARS:
+        items.pop(0)
+    if items:
+        excess = len(_serialize_history(items)) - MAX_HISTORY_CHARS
+        if excess > 0:
+            answer = items[0]["answer"]
+            items[0]["answer"] = answer[: max(0, len(answer) - excess)]
+    return items
+
+
+def _resolved_query_route(
+    config: VaultConfig, branches: list[str]
+) -> tuple[str | None, str | None]:
+    """The provider/model the judgment router selects for job="query".
+
+    Mirrors the selection in `PolicyJudgmentRouter.run` (infrastructure/llm.py),
+    which stays authoritative: this runs only after that call succeeded, so
+    every state the router refuses -- an unknown branch, a never-ingest policy,
+    a missing or malformed mapping -- has already raised there. A miss here
+    therefore means the judgment port is a substitute (tests), and the honest
+    answer is None, not a guess.
+    """
+
+    mapping = config.job_models.get("query")
+    if not isinstance(mapping, dict):
+        return None, None
+    try:
+        policies = [
+            _branch_policy(config, branch) for branch in (branches or ["_inbox"])
+        ]
+    except PolicyError:
+        return None, None
+    effective = (
+        PrivacyMode.LOCAL_ONLY
+        if any(policy.privacy == PrivacyMode.LOCAL_ONLY for policy in policies)
+        else PrivacyMode.CLOUD
+    )
+    route = mapping.get(effective.value, mapping)
+    if not isinstance(route, dict):
+        return None, None
+    provider = route.get("provider")
+    model = route.get("model")
+    return (
+        provider if isinstance(provider, str) else None,
+        model if isinstance(model, str) else None,
+    )
 
 
 class Jobs:
@@ -47,19 +135,34 @@ class Jobs:
         self.filing = filing
 
 
-    def ask(self, question: str, *, save: bool = False) -> dict[str, Any]:
+    def ask(
+        self,
+        question: str,
+        *,
+        save: bool = False,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         # `ask` only ever reads; the apply-proposal shape belongs to callers
         # about to write one (see `Retrieval.context`).
+        #
+        # Retrieval stays keyed on the CURRENT question only, never the
+        # conversation. Concatenating past exchanges into the retrieval query
+        # would pollute BM25 term matching with every word already discussed,
+        # burying the terms this question is actually about. History is model
+        # context for *interpreting* the question, and rides only the prompt.
         context = self.retrieval.context(question, include_apply_contract=False)
+        branches = _context_branches(context)
         response = self.judgment_runner.run(
             job="query",
-            branches=_context_branches(context),
+            branches=branches,
             variables={
                 "question": question,
                 "context": json.dumps(context, ensure_ascii=False),
+                "history": _serialize_history(_bounded_history(history)),
             },
         )
         answer = str(response["answer"])
+        provider, model = _resolved_query_route(self.vault.config(), branches)
         path: str | None = None
         if save:
             slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60]
@@ -74,6 +177,8 @@ class Jobs:
             "citations": response["citations"],
             "uncertainty": response["uncertainty"],
             "saved_to": path,
+            "provider": provider,
+            "model": model,
         }
 
     def digest(self, since: str = "7d") -> dict[str, Any]:

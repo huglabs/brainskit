@@ -17,6 +17,7 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from brainskit.application.jobs import MAX_HISTORY_CHARS, MAX_HISTORY_EXCHANGES
 from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
@@ -718,9 +719,15 @@ class EngineTest(unittest.TestCase):
         # than `||` — so a truthy `X` short-circuits away everything appended
         # after it. Two call sites had this shape: buildGraph()'s node/edge
         # count caption, and showCodeNode()'s kind/path/line caption (the
-        # twin this fix's TWINS check found).
+        # twin this fix's TWINS check found). buildGraph now assembles the
+        # caption from segments (zero-count segments are omitted), but each
+        # fallback must still be parenthesized before anything concatenates
+        # onto it.
         self.assertIn(
-            "(data.total_nodes||data.nodes.length)+' nodes · '", WEB_VIEWER_HTML
+            "(data.total_nodes||data.nodes.length)+' nodes'", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "(data.total_edges||data.edges.length)+' edges'", WEB_VIEWER_HTML
         )
         self.assertIn(
             "(nd.kind||'code symbol')+' · '+(nd.path||'')", WEB_VIEWER_HTML
@@ -796,6 +803,19 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("ring.scale.set(26,26,1)", WEB_VIEWER_HTML)
         self.assertNotIn("r2.scale.set(18,18,1)", WEB_VIEWER_HTML)
         self.assertNotIn("label.scale.set(ar*8,8,1)", WEB_VIEWER_HTML)
+        # The creation-time size is only the first frame: flyToNode changes
+        # G.cam.dist ~10x over the fly, so each overlay stores its base size
+        # in world-units-per-150-dist and animate() recomputes the scale from
+        # the CURRENT camera distance every frame — otherwise rings and label
+        # balloon relative to the graph mid-fly.
+        self.assertIn("G.rings.push({sprite:ring,base:26})", WEB_VIEWER_HTML)
+        self.assertIn("G.rings.push({sprite:r2,base:18})", WEB_VIEWER_HTML)
+        self.assertIn("label.userData={ar,baseY:p.y};", WEB_VIEWER_HTML)
+        self.assertIn(
+            "G.label.scale.set(u.ar*8*dscale,8*dscale,1);"
+            "G.label.position.y=u.baseY+22*dscale",
+            WEB_VIEWER_HTML,
+        )
 
     def test_web_viewer_graph_empty_state_markup_and_wiring(self) -> None:
         # A fresh vault's graph is two system pages (index.md, log.md) and
@@ -836,9 +856,16 @@ class EngineTest(unittest.TestCase):
 
         # A successful capture must invalidate the cached graph and reload
         # the active tab -- otherwise the empty state (or a stale graph)
-        # outlives the capture that was supposed to fill it in.
+        # outlives the capture that was supposed to fill it in. Invalidation
+        # goes through one helper that also drops the collection and
+        # resource caches, so no fetch layer serves pre-capture data.
         self.assertIn(
-            "state.graph_cache={};if(state.source!=='code')loadGraph(state.source);load()",
+            "function invalidateData(){state.cache={};state.graph_cache={};"
+            "state.resourceCache={}}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "invalidateData();if(state.source!=='code')loadGraph(state.source);load()",
             WEB_VIEWER_HTML,
         )
 
@@ -1144,11 +1171,20 @@ class EngineTest(unittest.TestCase):
     def test_web_viewer_ask_answer_renders_as_markdown(self) -> None:
         # TWINS follow-up: the Ask answer box is the other place raw resource
         # content was dumped via escText into a <pre>. LLM answers are
-        # synthesized prose (not a citable byte-exact source), so this
-        # renders unconditionally as markdown without a Raw/Rendered toggle.
-        self.assertIn("box.className='md-content'", WEB_VIEWER_HTML)
+        # synthesized prose (not a citable byte-exact source), so the chat
+        # thread's answer card renders unconditionally as markdown through
+        # the same mdToHtml pipeline, without a Raw/Rendered toggle.
+        self.assertIn("box.className='md-content chat-answer'", WEB_VIEWER_HTML)
         self.assertIn("box.innerHTML=mdToHtml(r.answer)", WEB_VIEWER_HTML)
         self.assertNotIn("escText(pre,r.answer)", WEB_VIEWER_HTML)
+        # The query job emits `uncertainty` as free prose as often as a level
+        # word: a short value rides inside the badge, long prose renders as a
+        # muted note beside a compact badge instead of a paragraph-sized pill.
+        self.assertIn(
+            "let short=unc.length<=40;"
+            "escText(b,short?'uncertainty '+unc:'uncertainty')",
+            WEB_VIEWER_HTML,
+        )
 
     def test_web_viewer_collection_filters_are_derived_from_loaded_data(self) -> None:
         # The field list per view, and proof the chip label/count comes from
@@ -1270,7 +1306,9 @@ class EngineTest(unittest.TestCase):
             body,
         )
         self.assertIn(".feed-excerpt{overflow:hidden;", WEB_VIEWER_HTML)
-        self.assertIn("-webkit-line-clamp:4", WEB_VIEWER_HTML)
+        # The truncation shape (max-height + fade mask, never line-clamp) is
+        # pinned by test_web_viewer_feed_excerpt_stacks_blocks_and_fades.
+        self.assertIn("mask-image:linear-gradient(", WEB_VIEWER_HTML)
 
     def test_web_viewer_ring_pulse_amplitude_is_a_named_reduced_constant(
         self,
@@ -1280,14 +1318,252 @@ class EngineTest(unittest.TestCase):
         # the mechanism, so it reads as a steady highlight, and so a human
         # can retune the single named constant later.
         self.assertIn("const RING_PULSE_AMPLITUDE=0.04;", WEB_VIEWER_HTML)
+        # The pulse survives, but behind the reduced-motion gate: an OS-level
+        # "reduce motion" preference gets a steady ring instead.
         self.assertIn(
-            "p=1+RING_PULSE_AMPLITUDE*Math.sin(tGlobal*2.2)", WEB_VIEWER_HTML
+            "p=REDUCED_MOTION?1:1+RING_PULSE_AMPLITUDE*Math.sin(tGlobal*2.2)",
+            WEB_VIEWER_HTML,
         )
         self.assertNotIn("1+0.12*Math.sin(tGlobal*2.2)", WEB_VIEWER_HTML)
+        # The pulse must multiply a STORED base size, never the sprite's
+        # current scale: `s=r.sprite.scale.x; scale.set(s*p,...)` compounds
+        # frame over frame (a random walk, measured x1.349 drift in 4s)
+        # instead of oscillating within +/-RING_PULSE_AMPLITUDE.
+        self.assertIn(
+            "for(let r of G.rings){let s=r.base*dscale*p;r.sprite.scale.set(s,s,1)}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertNotIn("r.sprite.scale.x", WEB_VIEWER_HTML)
         # Untouched: fly-to easing, force-sim damping/gravity, star field.
         self.assertIn("let k=Math.min(1,f.t),e=1-Math.pow(1-k,3);", WEB_VIEWER_HTML)
         self.assertIn("damp:0.84", WEB_VIEWER_HTML)
         self.assertIn("opacity:0.65,map:dotTexture()", WEB_VIEWER_HTML)
+
+    def test_web_viewer_nodes_are_shaded_instanced_atoms_with_degree_scaling(
+        self,
+    ) -> None:
+        # The molecule look: nodes are lit spheres (InstancedMesh + Phong
+        # under a hemisphere + key directional light), not additive dot
+        # sprites. Per-instance radius encodes degree so hubs read as heavy
+        # atoms, and colors flow through setColorAt so the semantic palettes
+        # and mono mode keep working under the lighting.
+        self.assertIn("new THREE.SphereGeometry(1,16,12)", WEB_VIEWER_HTML)
+        self.assertIn(
+            "new THREE.MeshPhongMaterial({color:0xffffff,shininess:40",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("new THREE.InstancedMesh(ageom,amat,n)", WEB_VIEWER_HTML)
+        self.assertIn("new THREE.DirectionalLight(0xffffff,0.9)", WEB_VIEWER_HTML)
+        self.assertIn(
+            "clamp(1+ATOM_SCALE_K*Math.log(1+deg),1,ATOM_SCALE_MAX)",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("G.atoms.setColorAt(i,", WEB_VIEWER_HTML)
+        # Picking uses the InstancedMesh instanceId everywhere the fuzzy
+        # Points index used to be read; the Points threshold hack is gone.
+        self.assertIn("hit.instanceId", WEB_VIEWER_HTML)
+        self.assertNotIn("hit.index", WEB_VIEWER_HTML)
+        self.assertNotIn("G.raycaster.params.Points.threshold", WEB_VIEWER_HTML)
+        # The star backdrop is the only remaining Points/dot-sprite user;
+        # the node sprite material (alphaTest) and G.points are fully gone.
+        self.assertNotIn("alphaTest:0.01", WEB_VIEWER_HTML)
+        self.assertNotIn("G.points", WEB_VIEWER_HTML)
+
+    def test_web_viewer_bonds_are_split_color_half_cylinders_with_line_fallback(
+        self,
+    ) -> None:
+        # The classic molecular bond: two thin open-ended half-cylinders per
+        # edge, each colored by its endpoint atom — a sourced_from bond reads
+        # evidence-cyan on the raw half flowing into the page's kind color.
+        # Above the instancing budget the same endpoint coloring degrades to
+        # gradient-colored line segments instead of vanishing. 6000 covers
+        # the 1100-node/5051-edge code graph, measured at 120fps (idle and
+        # mid-sim, 10,102 instance matrices rewritten per frame).
+        self.assertIn("BOND_SPLIT_MAX_EDGES=6000", WEB_VIEWER_HTML)
+        self.assertIn("new THREE.CylinderGeometry(1,1,1,8,1,true)", WEB_VIEWER_HTML)
+        self.assertIn("edgeVerts.length*2", WEB_VIEWER_HTML)
+        self.assertIn(
+            "function bondRadius(){return atomBaseRadius()*0.18}", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "setBondHalf(i*2,ax,ay,az,mx,my,mz,r,s);"
+            "setBondHalf(i*2+1,bx,by,bz,mx,my,mz,r,s)",
+            WEB_VIEWER_HTML,
+        )
+        # Each half is oriented from the midpoint to its endpoint with a
+        # quaternion from the unit Y axis, through reused scratch objects
+        # (no per-frame allocations across ~10k matrix writes).
+        self.assertIn("s.q.setFromUnitVectors(s.up,s.v2)", WEB_VIEWER_HTML)
+        # Both halves brighten when adjacent to the focus, dim otherwise.
+        self.assertIn("f=set?(lit?1.6:0.22):1", WEB_VIEWER_HTML)
+        # The legend explains the split-color bond with a two-color capsule.
+        self.assertIn("cap.className='bond'", WEB_VIEWER_HTML)
+        self.assertIn("'evidence → page'", WEB_VIEWER_HTML)
+
+    def test_web_viewer_click_inspects_and_only_double_click_flies(self) -> None:
+        # The single biggest "awful mouse" complaint: clicking a node yanked
+        # the camera across the scene. Single click = select + highlight +
+        # inspector only; double click (two clicks on the same node within
+        # DBLCLICK_MS) = fly to the node.
+        select_node = re.search(r"function selectNode\(i\)\{.*?\}\n", WEB_VIEWER_HTML)
+        self.assertIsNotNone(select_node)
+        self.assertNotIn("flyToNode", select_node.group(0))
+        self.assertNotIn("flyTo", select_node.group(0))
+        self.assertIn("DBLCLICK_MS=300", WEB_VIEWER_HTML)
+        self.assertIn(
+            "function handleClick(i){let now=performance.now();"
+            "if(G.lastClick&&G.lastClick.i===i&&now-G.lastClick.t<DBLCLICK_MS){"
+            "G.lastClick=null;selectNode(i);flyToNode(i);return}",
+            WEB_VIEWER_HTML,
+        )
+        # The footer hint teaches the new gestures.
+        self.assertIn("double-click to fly · 0 to reset", WEB_VIEWER_HTML)
+
+    def test_web_viewer_navigation_is_inertial_eased_and_reduced_motion_aware(
+        self,
+    ) -> None:
+        # Inertial orbit: drag stays 1:1, release glides with exponential
+        # damping, pointerdown hard-stops the glide.
+        self.assertIn("const ORBIT_DAMPING=0.92", WEB_VIEWER_HTML)
+        self.assertIn(
+            "G.spin.t*=ORBIT_DAMPING;G.spin.p*=ORBIT_DAMPING", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "G.lastInteract=performance.now();G.spin.t=0;G.spin.p=0",
+            WEB_VIEWER_HTML,
+        )
+        # Smooth zoom: the wheel writes a target distance; animate() eases
+        # the actual distance toward it instead of snapping.
+        self.assertIn("ZOOM_EASE=0.18", WEB_VIEWER_HTML)
+        self.assertIn(
+            "G.cam.distTarget=clamp(G.cam.distTarget*Math.exp(e.deltaY*0.0012),40,1600)",
+            WEB_VIEWER_HTML,
+        )
+        self.assertNotIn("G.cam.dist=clamp(G.cam.dist*Math.exp", WEB_VIEWER_HTML)
+        # Reset view: keyboard 0 (unless typing) and the toolbar button.
+        self.assertIn('id="resetViewBtn"', WEB_VIEWER_HTML)
+        self.assertIn(
+            "document.getElementById('resetViewBtn').onclick=resetView",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("if(e.key==='0'&&!e.metaKey&&!e.ctrlKey&&!e.altKey)", WEB_VIEWER_HTML)
+        self.assertIn(
+            "function resetView(){if(!state.nodes.length)return;"
+            "state.userMoved=false;flyToOrigin(Math.max(graphRadius(),40))}",
+            WEB_VIEWER_HTML,
+        )
+        # The continuous sim has no "end": the one-time settle refit fires at
+        # the FIRST sleep after a build, still suppressed once the user has
+        # orbited, zoomed or panned — no camera yank mid-exploration. The
+        # fitted/userMoved flags reset with every rebuilt graph. While the
+        # load reveal is still assembling the graph, the sim refuses to
+        # sleep at all, so the settle refit always waits for reveal
+        # completion.
+        self.assertIn(
+            "function simSleep(s){if(state.reveal&&!state.reveal.done)return;"
+            "s.sleeping=true;if(!s.fitted){s.fitted=true;"
+            "if(!state.userMoved)flyToOrigin(graphRadius())}}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("state.dragging=null;state.userMoved=false", WEB_VIEWER_HTML)
+        # Idle ambience drift and the ring pulse both honor the OS-level
+        # prefers-reduced-motion setting.
+        self.assertIn(
+            "matchMedia('(prefers-reduced-motion: reduce)')", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "if(!REDUCED_MOTION&&downMode===null&&now-G.lastInteract>IDLE_DELAY_MS)"
+            "G.cam.theta+=IDLE_DRIFT",
+            WEB_VIEWER_HTML,
+        )
+
+    def test_web_viewer_hover_dimming_eases_instead_of_strobing(self) -> None:
+        # Sweeping the mouse used to snap every node's color per hover
+        # change (a strobe). Targets are computed once per change;
+        # animate() lerps displayed colors toward them and skips the loop
+        # entirely once settled.
+        self.assertIn("COLOR_EASE=0.3", WEB_VIEWER_HTML)
+        self.assertIn("function refreshHighlight(instant){", WEB_VIEWER_HTML)
+        self.assertIn("G.colorsAnimating=true", WEB_VIEWER_HTML)
+        self.assertIn("if(G.colorsAnimating&&G.atoms){", WEB_VIEWER_HTML)
+        self.assertIn("if(settled)G.colorsAnimating=false", WEB_VIEWER_HTML)
+        self.assertIn("if(maxd<0.005){arr.set(target);return true}", WEB_VIEWER_HTML)
+
+    def test_web_viewer_sim_is_continuous_with_alpha_temperature_and_sleep(
+        self,
+    ) -> None:
+        # The physics brief: a living force simulation where every node's
+        # motion propagates through the network. Forces are scaled by a
+        # decaying alpha (d3-style temperature); the sim never "ends", it
+        # sleeps, and interactions reheat it. All tuning constants are named.
+        self.assertIn(
+            "const ALPHA_DECAY=0.995,ALPHA_MIN=0.003,WAKE_ALPHA=0.3,"
+            "KE_SLEEP=0.0001,FLING_GAIN=0.5,FLING_MAX=6,DRAG_VEL_STALE_MS=90;",
+            WEB_VIEWER_HTML,
+        )
+        # Rebuild = full reheat; the repulsion sample set is refreshed here
+        # and only here.
+        self.assertIn("state.sim={vel,sample,alpha:1,sleeping:false,fitted:false", WEB_VIEWER_HTML)
+        self.assertIn(
+            "function wakeSim(a){let s=state.sim;if(!s)return;"
+            "if(a>s.alpha)s.alpha=a;s.sleeping=false}",
+            WEB_VIEWER_HTML,
+        )
+        # Forces are alpha-scaled (all three: gravity, springs, repulsion).
+        self.assertIn("*grav*a", WEB_VIEWER_HTML)
+        self.assertIn("f=k*(d-rest)/d*a", WEB_VIEWER_HTML)
+        self.assertIn("f=rep/d2*a", WEB_VIEWER_HTML)
+        self.assertIn("s.alpha*=ALPHA_DECAY", WEB_VIEWER_HTML)
+        # Kinetic sleep: alpha-cold OR kinetically still, and a sleeping sim
+        # costs nothing — animate() gates stepping, and matrices are only
+        # rewritten on frames that actually stepped.
+        self.assertIn("if(s.alpha<ALPHA_MIN){simSleep(s);break}", WEB_VIEWER_HTML)
+        self.assertIn(
+            "if(drag==null&&(!n||ke/n<KE_SLEEP)){simSleep(s);break}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "if(state.sim&&!state.sim.sleeping)stepSim(state.sim);",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "if(stepped){updateAtomMatrices();updateBondTransforms()}",
+            WEB_VIEWER_HTML,
+        )
+        # Drag is a kinematic constraint, not a sim kill: nothing writes
+        # state.sim=null anymore; the dragged node is pinned (velocity
+        # zeroed, position owned by the pointer) while springs pull its
+        # neighborhood, and alpha is sustained for the whole drag.
+        self.assertNotIn("state.sim=null", WEB_VIEWER_HTML)
+        self.assertNotIn("s.iter", WEB_VIEWER_HTML)
+        self.assertNotIn("total:160", WEB_VIEWER_HTML)
+        self.assertIn(
+            "if(drag!=null&&!REDUCED_MOTION&&s.alpha<WAKE_ALPHA)s.alpha=WAKE_ALPHA",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "if(i===drag){vel[i*3]=0;vel[i*3+1]=0;vel[i*3+2]=0;continue}",
+            WEB_VIEWER_HTML,
+        )
+        # Release gives the node a fling from smoothed pointer velocity —
+        # unless the pointer paused before letting go — then the network
+        # resettles from WAKE_ALPHA.
+        self.assertIn(
+            "if(performance.now()-s.dragT<=DRAG_VEL_STALE_MS){"
+            "s.vel[idx*3]=clamp(s.dragVX*FLING_GAIN,-FLING_MAX,FLING_MAX);",
+            WEB_VIEWER_HTML,
+        )
+        # Reduced motion: the initial layout still settles (alpha:1 at
+        # build), but drags never reheat — propagation is frozen and the
+        # drag falls back to moving only the grabbed node, with matrices
+        # updated directly since the sim stays asleep.
+        self.assertIn("if(!REDUCED_MOTION)wakeSim(WAKE_ALPHA);", WEB_VIEWER_HTML)
+        self.assertIn(
+            "if(!state.sim||state.sim.sleeping){updateAtomMatrices();"
+            "updateBondTransforms()}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("if(s&&wasMoved>=5&&!REDUCED_MOTION){", WEB_VIEWER_HTML)
 
     def test_web_viewer_display_controls_size_opacity_color_mode(self) -> None:
         # A "Display" toolbar lives beside, not inside, #graphTools — it
@@ -1295,6 +1571,7 @@ class EngineTest(unittest.TestCase):
         # that switches graph sources by data-source.
         self.assertIn(
             '<div class="graph-tools" id="displayTools">'
+            '<button type="button" id="resetViewBtn" title="Reset view (0)">⌂</button>'
             '<button type="button" id="displayBtn">Display</button></div>',
             WEB_VIEWER_HTML,
         )
@@ -1304,18 +1581,31 @@ class EngineTest(unittest.TestCase):
         self.assertIn('id="colorModeMulti"', WEB_VIEWER_HTML)
         self.assertIn('id="colorModeMono"', WEB_VIEWER_HTML)
         self.assertIn('<input type="color" id="monoColorPicker"', WEB_VIEWER_HTML)
-        # Node size and edge opacity apply live (no reload) to the material
-        # already on screen.
+        # Node size and edge opacity apply live (no reload) to the graph
+        # already on screen: the size slider is now the base atom radius, so
+        # it rebuilds the instance matrices (atoms AND bonds — bond radius
+        # derives from it); opacity drives the bond material directly.
         self.assertIn(
-            "if(G.points)G.points.material.size=display.nodeSize;", WEB_VIEWER_HTML
-        )
-        self.assertIn(
-            "if(G.edges)G.edges.material.opacity=display.edgeOpacity;",
+            "display.nodeSize=Number(nodeSizeRange.value);"
+            "if(G.atoms){updateAtomMatrices();updateBondTransforms()}",
             WEB_VIEWER_HTML,
         )
-        # buildGraph must read the persisted/live prefs, never the old
+        self.assertIn(
+            "if(G.bonds)G.bonds.material.opacity=display.edgeOpacity;",
+            WEB_VIEWER_HTML,
+        )
+        # The materials must read the persisted/live prefs, never the old
         # hardcoded 9 / 0.6.
-        self.assertIn("size:display.nodeSize,vertexColors:true", WEB_VIEWER_HTML)
+        self.assertIn(
+            "function atomBaseRadius(){return display.nodeSize*0.38}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("base=atomBaseRadius()", WEB_VIEWER_HTML)
+        self.assertIn(
+            "new THREE.MeshPhongMaterial({shininess:30,transparent:true,"
+            "opacity:display.edgeOpacity})",
+            WEB_VIEWER_HTML,
+        )
         self.assertIn(
             "new THREE.LineBasicMaterial({vertexColors:true,transparent:true,"
             "opacity:display.edgeOpacity})",
@@ -1366,6 +1656,315 @@ class EngineTest(unittest.TestCase):
         # Existing drag-and-drop handler must still be present, unmodified in
         # spirit — paste is additive, not a replacement.
         self.assertIn("addEventListener('drop',async e=>", WEB_VIEWER_HTML)
+
+    def test_web_viewer_feed_excerpt_stacks_blocks_and_fades(self) -> None:
+        # The bug report (screenshot): `.feed-excerpt` combined the
+        # -webkit-box/line-clamp pair with `.md-content`, whose 180px
+        # min-height and block children (h1/p with margins) it inherits —
+        # multi-paragraph markdown painted its lines on top of each other.
+        # Blocks must stack normally, truncated by max-height with a bottom
+        # fade, and the md-content min-height floor must not apply inside
+        # the card.
+        self.assertIn(
+            ".feed-excerpt{overflow:hidden;max-height:120px;min-height:0;"
+            "-webkit-mask-image:linear-gradient(#000 60%,transparent);"
+            "mask-image:linear-gradient(#000 60%,transparent)}",
+            WEB_VIEWER_HTML,
+        )
+        # TWINS: no line-clamp box layout survives anywhere in the page.
+        self.assertNotIn("-webkit-line-clamp", WEB_VIEWER_HTML)
+        self.assertNotIn("display:-webkit-box", WEB_VIEWER_HTML)
+
+    def test_web_viewer_ask_is_a_full_chat_view_not_a_modal(self) -> None:
+        # Ask is a main-area view — a sibling of #graphView/#collection using
+        # the same hidden-toggle pattern switchView uses — not a modal whose
+        # one-shot answer lands in the narrow Inspector.
+        for element_id in (
+            'id="chatView"',
+            'id="chatThread"',
+            'id="chatInput"',
+            'id="chatSend"',
+            'id="chatClear"',
+            'id="askSave"',
+        ):
+            self.assertIn(element_id, WEB_VIEWER_HTML)
+        self.assertNotIn("askModal", WEB_VIEWER_HTML)
+        self.assertNotIn("askGo", WEB_VIEWER_HTML)
+        self.assertNotIn("askQuestion", WEB_VIEWER_HTML)
+        # `.chat{display:flex}` is declared AFTER the shared `.hidden` rule,
+        # so at equal specificity it would win and paint the chat over every
+        # other view; the two-class rule restores the toggle.
+        self.assertIn(".chat.hidden{display:none}", WEB_VIEWER_HTML)
+        # The header Ask button opens the chat view and carries an active
+        # state; the nav view buttons switch away from it normally.
+        self.assertIn(
+            "document.getElementById('askBtn').onclick=openChat", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "document.getElementById('chatView').classList.remove('hidden');"
+            "document.getElementById('askBtn').classList.add('active')",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "document.getElementById('chatView').classList.add('hidden');"
+            "document.getElementById('askBtn').classList.remove('active')",
+            WEB_VIEWER_HTML,
+        )
+        # Enter sends; Shift+Enter stays a newline.
+        self.assertIn(
+            "if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}",
+            WEB_VIEWER_HTML,
+        )
+        # Honest signpost for the new contract: answers cite vault evidence,
+        # and the conversation rides along as follow-up context. The request
+        # body carries the structured `history` field — never a question with
+        # history concatenated into it, which would pollute BM25 retrieval.
+        self.assertIn(
+            "Answers cite evidence from the vault; the conversation is "
+            "context for follow-ups.",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "body:JSON.stringify({question:q,save,history})", WEB_VIEWER_HTML
+        )
+        # Errors join the thread as a quiet bubble, not a toast.
+        self.assertIn(
+            "pushChatTurn({role:'error',text:error.message})", WEB_VIEWER_HTML
+        )
+        self.assertIn(".chat-error{", WEB_VIEWER_HTML)
+
+    def test_web_viewer_chat_thread_persists_capped_and_restores(self) -> None:
+        self.assertIn(
+            "const CHAT_STORAGE_KEY='brainskit-ask-thread',CHAT_TURN_CAP=50",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("localStorage.getItem(CHAT_STORAGE_KEY)", WEB_VIEWER_HTML)
+        self.assertIn(
+            "localStorage.setItem(CHAT_STORAGE_KEY,JSON.stringify("
+            "state.chatThread.slice(-CHAT_TURN_CAP)))",
+            WEB_VIEWER_HTML,
+        )
+        # Restored on boot (script top level), not only on first open.
+        self.assertIn("state.chatThread=loadChatThread()", WEB_VIEWER_HTML)
+        # Clear drops both the in-memory thread and the stored copy.
+        self.assertIn(
+            "document.getElementById('chatClear').onclick=()=>{"
+            "state.chatThread=[];localStorage.removeItem(CHAT_STORAGE_KEY);"
+            "renderChat()}",
+            WEB_VIEWER_HTML,
+        )
+        # Empty state: an invitation plus static example chips that fill the
+        # composer without sending.
+        self.assertIn(
+            "Ask the compiled brain — answers cite the evidence they came from.",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "chip.onclick=()=>{let input=document.getElementById('chatInput');"
+            "input.value=example;growComposer();input.focus()}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertNotIn("input.value=example;sendChat", WEB_VIEWER_HTML)
+        # The in-flight indicator's animation sits behind the reduced-motion
+        # media gate; a reduce-motion OS preference gets steady dots.
+        self.assertIn(
+            "@media(prefers-reduced-motion:no-preference){.chat-thinking i{"
+            "animation:",
+            WEB_VIEWER_HTML,
+        )
+
+    def test_web_viewer_chat_sends_bounded_history_of_completed_exchanges(
+        self,
+    ) -> None:
+        # The client-side bound mirrors the server's MAX_HISTORY_EXCHANGES so
+        # payloads stay small instead of leaning on server-side truncation.
+        self.assertIn(
+            f"CHAT_TURN_CAP=50,CHAT_HISTORY_MAX={MAX_HISTORY_EXCHANGES};",
+            WEB_VIEWER_HTML,
+        )
+        # Only completed exchanges become history: a user turn pairs with the
+        # answer that followed it, and an error clears the pending question —
+        # a question that failed has no answer to quote.
+        self.assertIn(
+            "function chatHistory(){let out=[],question=null;"
+            "for(let turn of state.chatThread){"
+            "if(turn.role==='user'){question=turn.text}"
+            "else if(turn.role==='answer'&&question!=null){"
+            "out.push({question,answer:turn.answer});question=null}"
+            "else if(turn.role==='error'){question=null}}"
+            "return out.slice(-CHAT_HISTORY_MAX)}",
+            WEB_VIEWER_HTML,
+        )
+        # History is snapshotted BEFORE the new user turn joins the thread,
+        # so the question being asked can never pair with a stale answer.
+        send = WEB_VIEWER_HTML[
+            WEB_VIEWER_HTML.index("async function sendChat()"):
+        ]
+        send = send[: send.index("}}") + 2]
+        self.assertLess(
+            send.index("let history=chatHistory()"),
+            send.index("pushChatTurn({role:'user',text:q})"),
+        )
+
+    def test_web_viewer_chat_answer_names_the_answering_model(self) -> None:
+        # The stored turn persists provider/model with the answer, so a
+        # restored thread keeps its chips.
+        self.assertIn(
+            "provider:r.provider?String(r.provider):'',"
+            "model:r.model?String(r.model):''",
+            WEB_VIEWER_HTML,
+        )
+        # The chip renders `provider · model` in the muted meta row — and only
+        # when both are present, so turns stored before the field existed
+        # simply omit it instead of rendering a half-empty chip.
+        self.assertIn(
+            "if(r.provider&&r.model){let mc=document.createElement('span');"
+            "mc.className='chat-model';escText(mc,r.provider+' · '+r.model);"
+            "meta.append(mc)}",
+            WEB_VIEWER_HTML,
+        )
+
+    def test_web_viewer_graph_reveals_connections_on_load(self) -> None:
+        # Load-in choreography: atoms pop in BFS order from the biggest hub,
+        # bonds draw on from their midpoints once both endpoints have begun —
+        # the graph visibly assembles through its connections. All timing
+        # constants are named.
+        self.assertIn(
+            "const REVEAL_SPAN_MIN=1200,REVEAL_SPAN_MAX=2500,"
+            "REVEAL_ATOM_MS=300,REVEAL_BOND_MS=250;",
+            WEB_VIEWER_HTML,
+        )
+        # BFS from index 0 outward; nodes are degree-sorted at build, so index
+        # order IS hub order and every disconnected component joins hubs-first.
+        self.assertIn(
+            "function computeRevealDelays(){let n=state.nodes.length,"
+            "order=new Int32Array(n).fill(-1)",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("delays[i]=order[i]/Math.max(1,n)", WEB_VIEWER_HTML)
+        # Re-armed on EVERY build (it is the load animation, not an intro) and
+        # skipped outright under reduced motion — instant final state.
+        self.assertIn(
+            "state.reveal=(REDUCED_MOTION||!n)?null:{start:performance.now(),"
+            "span:clamp(REVEAL_SPAN_MIN+n/NODES_LIMIT*"
+            "(REVEAL_SPAN_MAX-REVEAL_SPAN_MIN),"
+            "REVEAL_SPAN_MIN,REVEAL_SPAN_MAX),done:false};",
+            WEB_VIEWER_HTML,
+        )
+        # Cubic ease-out scale-pop, applied inside the same matrix rebuild the
+        # sim already owns — no second writer, no per-frame allocations.
+        self.assertIn(
+            "function revealEase(t){t=clamp(t,0,1);let u=1-t;return 1-u*u*u}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "if(rv)r*=Math.max(revealAtomScale(i,rv),0.001);", WEB_VIEWER_HTML
+        )
+        # Bonds gate on BOTH endpoints having begun, then grow from the
+        # midpoint outward along the cylinder axis; the LineSegments fallback
+        # fades edge color in instead.
+        self.assertIn(
+            "Math.max(state.revealDelay[a],state.revealDelay[b])",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "ax=mx+(ax-mx)*g;ay=my+(ay-my)*g;az=mz+(az-mz)*g", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "if(G.bondMode==='line'&&G.bonds){let arr=bondColorArray()",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("arr[i*6+c]=bt[i*6+c]*g", WEB_VIEWER_HTML)
+        # The reveal rides the existing animate() loop off a timestamp —
+        # never a timer.
+        self.assertIn(
+            "if(state.reveal&&!state.reveal.done)stepReveal(now);",
+            WEB_VIEWER_HTML,
+        )
+        self.assertNotIn("setInterval", WEB_VIEWER_HTML)
+        # Any pointer interaction on the canvas snaps the reveal complete —
+        # user intent beats choreography. The snap runs before pointer capture
+        # (so a capture failure cannot swallow it) and before pick() (so the
+        # press lands on full-size atoms).
+        self.assertIn(
+            "if(!G.renderer)return;finishReveal();"
+            "canvas3d.setPointerCapture(e.pointerId);",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn("e.preventDefault();finishReveal();", WEB_VIEWER_HTML)
+        self.assertIn(
+            "function finishReveal(){let rv=state.reveal;if(!rv||rv.done)return;"
+            "rv.done=true;updateAtomMatrices();updateBondTransforms();"
+            "if(G.bondMode==='line')refreshHighlight(true)}",
+            WEB_VIEWER_HTML,
+        )
+
+    def test_web_viewer_atoms_have_rim_light_and_hub_halos(self) -> None:
+        # Fresnel rim: injected into the Phong fragment via onBeforeCompile
+        # (the vendored three has no postprocessing), scaled by the lit
+        # color's luminance so hover-dimmed atoms stay quiet, and placed
+        # before tonemapping/fog so distance still attenuates it.
+        self.assertIn("const RIM_INTENSITY=0.35,RIM_POWER=2.5", WEB_VIEWER_HTML)
+        self.assertIn("amat.onBeforeCompile=shader=>", WEB_VIEWER_HTML)
+        self.assertIn("'#include <output_fragment>'", WEB_VIEWER_HTML)
+        self.assertIn(
+            "float rimLum=dot(gl_FragColor.rgb,vec3(0.299,0.587,0.114));",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "dot(normalize(vViewPosition),normalize(normal))", WEB_VIEWER_HTML
+        )
+        # Hub halos: one additive glow sprite per top-degree atom, positions
+        # synced where bond matrices sync, kept under reduced motion (they
+        # are static, not motion).
+        self.assertIn(
+            "HALO_COUNT=8,HALO_SCALE=2.2,HALO_OPACITY=0.35", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "for(let i=0;i<Math.min(HALO_COUNT,n);i++)", WEB_VIEWER_HTML
+        )
+        self.assertIn(
+            "opacity:HALO_OPACITY,blending:THREE.AdditiveBlending,"
+            "depthWrite:false",
+            WEB_VIEWER_HTML,
+        )
+        # Both bond paths (split cylinders AND the line fallback's early
+        # return) sync halo positions.
+        self.assertIn(
+            "G.bonds.geometry.attributes.position.needsUpdate=true;"
+            "syncHalos();return}",
+            WEB_VIEWER_HTML,
+        )
+        self.assertIn(
+            "G.bonds.instanceMatrix.needsUpdate=true;syncHalos()}",
+            WEB_VIEWER_HTML,
+        )
+
+    def test_web_viewer_services_cards_are_truthful_and_filters_partition(
+        self,
+    ) -> None:
+        # The `web` integration card used to read "disabled" while serving
+        # the very tab displaying it. It now reads live, and the other cards
+        # stop duplicating state between the badge and the detail line.
+        self.assertIn(
+            "if(name==='integrations'&&item.name==='web'){"
+            "badge.className='badge good';badgeText='live';"
+            "details='serving this tab · persistent service '+item.state"
+            "+' · '+(item.managed?'managed':'external')}",
+            WEB_VIEWER_HTML,
+        )
+        # Default integrations detail line: managed/external only — state
+        # lives in the badge alone.
+        self.assertIn(":(item.managed?'managed':'external');", WEB_VIEWER_HTML)
+        self.assertNotIn(":item.state+' · '", WEB_VIEWER_HTML)
+        self.assertIn("escText(badge,badgeText)", WEB_VIEWER_HTML)
+        # A filter group with fewer than 2 distinct values cannot partition
+        # the collection — it is noise and is omitted, for every collection.
+        self.assertIn(
+            "let values=Object.keys(counts).sort();if(values.length<2)return;",
+            WEB_VIEWER_HTML,
+        )
+        self.assertNotIn("if(!values.length)return;", WEB_VIEWER_HTML)
 
     def test_network_mcp_requires_auth_origin_and_protocol_version(self) -> None:
         server = BrainskitMcpHttpServer(("127.0.0.1", 0), BrainskitMcpHttpHandler)
@@ -1722,6 +2321,306 @@ class RetrievalContextApplyContractScopeTest(unittest.TestCase):
         service.lint(semantic=True)
         context = json.loads(fake.variables[0]["context"])
         self.assertNotIn("apply_contract", context)
+
+
+class _SpyRetrieval:
+    """Records every retrieval query while delegating to the real retrieval."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.queries: list[str] = []
+
+    def context(self, query: str, **kwargs) -> dict:
+        self.queries.append(query)
+        return self.inner.context(query, **kwargs)
+
+
+class AskConversationHistoryTest(unittest.TestCase):
+    """`ask` carries the conversation to the model, never to retrieval.
+
+    History exists so a follow-up like "e sobre o code graph?" can resolve its
+    pronouns; it must not leak into the BM25 query (which would bury the
+    current question's terms under every word already discussed) and it must
+    ride the query prompt bounded, oldest-trimmed-first.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        seed.capture(None, text="Evidence about the code graph.", title="Evidence")
+        seed.reindex()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _service(self, fake: FakeJudgment) -> BrainskitService:
+        return BrainskitService(
+            self.vault,
+            self.index,
+            judgment=fake,
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+
+    def _answer(self) -> dict:
+        return {"answer": "x", "citations": [], "uncertainty": ""}
+
+    def test_history_keeps_only_the_last_six_exchanges(self) -> None:
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        service.ask(
+            "e sobre o code graph?",
+            history=[
+                {"question": f"q{n}", "answer": f"a{n}"} for n in range(1, 8)
+            ],
+        )
+        serialized = fake.variables[0]["history"]
+        self.assertNotIn("q1", serialized)
+        self.assertIn("Q: q2", serialized)
+        self.assertIn("Q: q7", serialized)
+        self.assertEqual(serialized.count("Q: "), MAX_HISTORY_EXCHANGES)
+        # Oldest first: the transcript reads in conversation order.
+        self.assertLess(serialized.index("q2"), serialized.index("q7"))
+
+    def test_history_char_budget_trims_oldest_first(self) -> None:
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        service.ask(
+            "e sobre o code graph?",
+            history=[
+                {"question": f"q{n}", "answer": "a" * 2_500} for n in range(1, 4)
+            ],
+        )
+        serialized = fake.variables[0]["history"]
+        self.assertLessEqual(len(serialized), MAX_HISTORY_CHARS)
+        self.assertNotIn("q1", serialized)
+        self.assertNotIn("q2", serialized)
+        self.assertIn("Q: q3", serialized)
+
+    def test_a_single_oversized_exchange_is_truncated_not_dropped(self) -> None:
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        service.ask(
+            "e sobre o code graph?",
+            history=[{"question": "q1", "answer": "a" * (MAX_HISTORY_CHARS + 2_000)}],
+        )
+        serialized = fake.variables[0]["history"]
+        self.assertLessEqual(len(serialized), MAX_HISTORY_CHARS)
+        self.assertIn("Q: q1", serialized)
+
+    def test_retrieval_is_keyed_on_the_bare_current_question(self) -> None:
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        spy = _SpyRetrieval(service.jobs_runner.retrieval)
+        service.jobs_runner.retrieval = spy
+        service.ask(
+            "e sobre o code graph?",
+            history=[{"question": "o que sabemos?", "answer": "um resumo."}],
+        )
+        self.assertEqual(spy.queries, ["e sobre o code graph?"])
+
+    def test_prompt_variables_render_through_the_real_template(self) -> None:
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        service.ask(
+            "e sobre o code graph?",
+            history=[{"question": "o que sabemos?", "answer": "um resumo."}],
+        )
+        variables = fake.variables[0]
+        self.assertIn("Q: o que sabemos?\nA: um resumo.", variables["history"])
+        # The real template must consume every variable `ask` supplies --
+        # `wiki_language` is added by the router the fake replaces.
+        prompt = JobSpecs().prompt("query", {**variables, "wiki_language": "English"})
+        self.assertNotIn("{{", prompt)
+        self.assertIn("Conversation so far", prompt)
+        self.assertIn("Q: o que sabemos?", prompt)
+
+    def test_ask_without_history_still_renders_the_template(self) -> None:
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        service.ask("e sobre o code graph?")
+        variables = fake.variables[0]
+        self.assertEqual(variables["history"], "(none)")
+        prompt = JobSpecs().prompt("query", {**variables, "wiki_language": "English"})
+        self.assertNotIn("{{", prompt)
+
+    def test_ask_result_names_the_answering_provider_and_model(self) -> None:
+        # Read from the same `job_models.query` mapping the router resolves,
+        # not hardcoded: the engine policy routes query to ollama/test.
+        fake = FakeJudgment({"query": [self._answer()]})
+        service = self._service(fake)
+        result = service.ask("e sobre o code graph?")
+        self.assertEqual(result["provider"], "ollama")
+        self.assertEqual(result["model"], "test")
+
+    def test_a_privacy_keyed_mapping_reports_the_routed_model(self) -> None:
+        # The router honours `job_models.query` keyed by effective privacy;
+        # the reported model must follow the same route it took.
+        raw = policy()
+        raw["job_models"]["query"] = {
+            "local-only": {"provider": "ollama", "model": "local-model"},
+            "cloud": {"provider": "ollama", "model": "cloud-model"},
+        }
+        with tempfile.TemporaryDirectory() as scratch:
+            vault = FileVault.initialize(Path(scratch), raw)
+            index = SqliteFtsIndex(vault.index_path)
+            fake = FakeJudgment({"query": [self._answer()]})
+            service = BrainskitService(
+                vault, index, judgment=fake, jobs=JobSpecs(), graph=MarkdownGraph()
+            )
+            service.reindex()
+            # No evidence captured: branches fall back to `_inbox`, whose
+            # policy in the engine config is local-only.
+            result = service.ask("anything")
+        self.assertEqual(result["provider"], "ollama")
+        self.assertEqual(result["model"], "local-model")
+
+
+class WebAskHistoryTest(unittest.TestCase):
+    """`/api/ask` validates conversation history strictly at the boundary."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.fake = FakeJudgment(
+            {"query": [{"answer": "resposta", "citations": [], "uncertainty": ""}]}
+        )
+        self.service = BrainskitService(
+            self.vault,
+            SqliteFtsIndex(self.vault.index_path),
+            judgment=self.fake,
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+        self.service.reindex()
+        self.server = build_server(
+            self.service,
+            host="127.0.0.1",
+            port=0,
+            consumer="human",
+            instance_id="test-instance",
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def _spy_ask(self) -> list[dict]:
+        """Replace `service.ask` with a recorder, returning the record list."""
+
+        asked: list[dict] = []
+
+        def recorder(question, *, save=False, history=None):
+            asked.append({"question": question, "save": save, "history": history})
+            return {"question": question, "answer": "ok", "citations": [],
+                    "uncertainty": "", "saved_to": None,
+                    "provider": "ollama", "model": "test"}
+
+        self.service.ask = recorder
+        return asked
+
+    def _post(self, payload: dict) -> dict:
+        with urlopen(
+            Request(
+                f"{self.base_url}/api/ask",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=5,
+        ) as response:
+            return json.loads(response.read())
+
+    def _reject(self, payload: dict) -> dict:
+        with self.assertRaises(HTTPError) as caught:
+            self._post(payload)
+        self.assertEqual(caught.exception.code, 400)
+        with caught.exception as error:
+            return json.loads(error.read())["error"]
+
+    def test_valid_history_reaches_the_service(self) -> None:
+        asked = self._spy_ask()
+        history = [
+            {"question": "o que sabemos?", "answer": "um resumo."},
+            {"question": "e os hubs?", "answer": "outro resumo."},
+        ]
+        value = self._post({"question": "e sobre o code graph?", "history": history})
+        self.assertTrue(value["ok"])
+        self.assertEqual(asked[0]["history"], history)
+        self.assertEqual(asked[0]["question"], "e sobre o code graph?")
+
+    def test_absent_history_stays_none(self) -> None:
+        asked = self._spy_ask()
+        value = self._post({"question": "e sobre o code graph?"})
+        self.assertTrue(value["ok"])
+        self.assertIsNone(asked[0]["history"])
+
+    def test_history_must_be_a_list(self) -> None:
+        error = self._reject({"question": "q", "history": "not-a-list"})
+        self.assertEqual(error["code"], "validation_error")
+        self.assertEqual(error["details"]["field"], "history")
+
+    def test_history_items_must_be_objects(self) -> None:
+        error = self._reject({"question": "q", "history": ["bare string"]})
+        self.assertEqual(error["details"]["field"], "history[0]")
+
+    def test_history_question_must_be_a_string(self) -> None:
+        error = self._reject(
+            {"question": "q", "history": [{"question": 7, "answer": "a"}]}
+        )
+        self.assertEqual(error["details"]["field"], "history[0].question")
+
+    def test_history_answer_must_be_a_string(self) -> None:
+        error = self._reject(
+            {"question": "q", "history": [{"question": "x", "answer": None}]}
+        )
+        self.assertEqual(error["details"]["field"], "history[0].answer")
+
+    def test_excess_history_is_truncated_silently_before_validation(self) -> None:
+        # The first two items are malformed AND beyond the bound: truncation
+        # drops them before validation, so the request succeeds -- a dropped
+        # item never reaches the model, so rejecting over it would fail
+        # requests the model would answer identically.
+        asked = self._spy_ask()
+        history = ["bad", "also bad"] + [
+            {"question": f"q{n}", "answer": f"a{n}"}
+            for n in range(MAX_HISTORY_EXCHANGES)
+        ]
+        value = self._post({"question": "q", "history": history})
+        self.assertTrue(value["ok"])
+        self.assertEqual(len(asked[0]["history"]), MAX_HISTORY_EXCHANGES)
+        self.assertEqual(asked[0]["history"][0]["question"], "q0")
+
+    def test_rejected_items_are_named_by_their_index_as_sent(self) -> None:
+        # Seven items: the first is truncated away, and the malformed item
+        # must be reported at its position in the list the client sent.
+        history: list = [{"question": "q0", "answer": "a0"}, "malformed"] + [
+            {"question": f"q{n}", "answer": f"a{n}"} for n in range(2, 7)
+        ]
+        error = self._reject({"question": "q", "history": history})
+        self.assertEqual(error["details"]["field"], "history[1]")
+
+    def test_ask_end_to_end_carries_history_provider_and_model(self) -> None:
+        value = self._post(
+            {
+                "question": "e sobre o code graph?",
+                "history": [{"question": "o que sabemos?", "answer": "um resumo."}],
+            }
+        )
+        self.assertTrue(value["ok"])
+        self.assertEqual(value["result"]["answer"], "resposta")
+        self.assertEqual(value["result"]["provider"], "ollama")
+        self.assertEqual(value["result"]["model"], "test")
+        self.assertIn("Q: o que sabemos?", self.fake.variables[0]["history"])
 
 
 class PolicyTest(unittest.TestCase):

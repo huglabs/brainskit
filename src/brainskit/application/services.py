@@ -413,9 +413,15 @@ class BrainskitService:
         """Push the graph to an integration. See `Projections`."""
         return self.projections.integration_sync(name)
 
-    def ask(self, question: str, *, save: bool = False) -> dict[str, Any]:
+    def ask(
+        self,
+        question: str,
+        *,
+        save: bool = False,
+        history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Answer from compiled evidence. See `Jobs`."""
-        return self.jobs_runner.ask(question, save=save)
+        return self.jobs_runner.ask(question, save=save, history=history)
 
     def digest(self, since: str = "7d") -> dict[str, Any]:
         """Generate the configured digest. See `Jobs`."""
