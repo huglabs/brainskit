@@ -9,6 +9,81 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-14
+
+An end-to-end overhaul of the web viewer (`bk web`). Nothing in this release
+changes a configuration value, an error code, or an on-disk artifact — a vault
+that was correct under 0.6.2 needs nothing done before or after this upgrade.
+
+### Added
+
+- The graph renders as a molecule. Every node is an instanced sphere whose
+  radius encodes its degree, lit with Phong shading and a fresnel rim injected
+  through `onBeforeCompile` — the vendored three.js build carries no
+  postprocessing to do it any other way. Edges are half-cylinder bonds split at
+  the midpoint, each half taking its endpoint's colour, so a `sourced_from`
+  bond visibly flows evidence-cyan into the page's kind colour instead of
+  asserting one end's colour for the whole edge. Past 6,000 edges the bonds
+  fall back to gradient `LineSegments`, the eight biggest hubs carry additive
+  halos, and the legend gained a chip explaining the bond convention.
+- The layout runs a continuous force simulation and sleeps when it settles.
+  Springs, repulsion and gravity are scaled by a decaying alpha temperature, so
+  a fresh graph churns into place and a settled one costs nothing per frame
+  until an interaction reheats it. Dragging pins the grabbed atom to the
+  pointer while the springs propagate the pull through the network, and
+  releasing flings it with the pointer's smoothed velocity — measured mid-drag
+  at 120 fps with 1,100 nodes and 10,102 bond instances.
+- The graph assembles itself on load: atoms pop in in BFS order from the
+  biggest hub, and each bond appears only once both of its endpoints exist,
+  growing from its midpoint — so the reveal shows the connections being made
+  rather than presenting a finished tangle. Any interaction interrupts it, it
+  re-arms on every graph build, and under `prefers-reduced-motion` the graph
+  is simply there.
+- Navigation: inertial orbit, eased wheel zoom, click selects without moving
+  the camera, double-click flies to the node, `0` or ⌂ resets, and the camera
+  drifts after six seconds idle. Every ambient motion is gated behind
+  `prefers-reduced-motion`.
+- Ask is a full chat view, replacing the modal and its inspector dump: a
+  message thread, markdown answers carrying the citation count, the
+  uncertainty badge and the saved-to path, a composer that sends on Enter, and
+  a thread persisted to localStorage (fifty turns) with a Clear.
+- `/api/ask` accepts a bounded conversation `history` — the last six exchanges
+  within 4,000 characters, oldest trimmed first, validated field by field. The
+  query job's prompt gains a delimited "Conversation so far" section telling
+  the model that conversation is context for interpreting the question while
+  claims must still come from cited evidence, and retrieval stays keyed on the
+  bare current question, so BM25 is never polluted by chat history. The result
+  — and every chat answer — now names the answering `provider` and `model`,
+  resolved from the vault's job-model config.
+
+### Fixed
+
+- Switching graph sources with a node selected left stale indices behind, so
+  the first hover threw a `TypeError` and highlighting was broken from then on.
+- The selection ring's pulse compounded its own scale every frame, visibly
+  ballooning and deflating, and overlays were sized from the camera distance
+  at the moment of their creation, so they ballooned mid-fly too. Both now
+  derive from stored base units every frame.
+- The graph caption could render underneath the centred toolbar, hiding its
+  tail — "N beyond server cap" — on exactly the large graphs where that tail
+  matters. Zero-count segments ("0 hidden for rendering") no longer render at
+  all.
+- Timeline feed excerpts painted their paragraphs on top of each other — a
+  line-clamp over block children with an inherited min-height. Now a
+  max-height with a fade mask.
+- The capture modal kept the previous capture's title, and neither
+  drag-and-drop capture nor a proposal decision invalidated the cached
+  collections, graph and status — so the viewer went stale after its own
+  writes.
+- Search responses could resolve out of order and overwrite newer results, or
+  repopulate a box the operator had already cleared.
+- The Services view reported the `web` integration "disabled" while that same
+  integration was serving the page saying so. Cards no longer repeat the state
+  in both the detail line and the badge, and single-value filter groups no
+  longer render as noise.
+- The favicon 404'd on every load, and the header wordmark still read
+  "brainkit", left over from before the 0.5.0 rename.
+
 ## [0.6.2] — 2026-08-13
 
 ### Changed — before you upgrade: two paths in your config resolve somewhere else
@@ -450,7 +525,8 @@ First tagged release: the M0–M3 local walking skeleton.
 - Delivery gated on the shipped wheel — built from the sdist, installed in a
   throwaway environment and driven through the real CLI contract.
 
-[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/huglabs/brainskit/releases/tag/v0.7.0
 [0.6.2]: https://github.com/huglabs/brainskit/releases/tag/v0.6.2
 [0.6.1]: https://github.com/huglabs/brainskit/releases/tag/v0.6.1
 [0.6.0]: https://github.com/huglabs/brainskit/releases/tag/v0.6.0
