@@ -20,18 +20,52 @@ from brainskit.domain.model import (
     NotConfiguredError,
     ValidationError,
 )
+from brainskit.domain.privacy import Consumer
+from brainskit.interfaces.errors import (
+    JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_REQUEST,
+    jsonrpc_error_data,
+    present,
+    refusal_envelope,
+)
+
+#: MCP is a machine surface, and this is the scope it reads under wherever no
+#: caller declared one: everything except never-ingest. `search` and `context`
+#: require the caller to declare instead, because their results are the ones
+#: that get forwarded somewhere this server cannot see. Spelled once, so the
+#: three methods that share the decision cannot come to share it unequally.
+MCP_CONSUMER = Consumer.LOCAL.value
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SUPPORTED_VERSIONS = {MCP_PROTOCOL_VERSION}
 MCP_MAX_REQUEST_BYTES = 1_048_576
-MCP_INTERNAL_ERROR = -32603
+MCP_INTERNAL_ERROR = JSONRPC_INTERNAL_ERROR
 _MAX_DISCARDED_BYTES = 4 * MCP_MAX_REQUEST_BYTES
 _MAX_REASON_CHARS = 200
 _FILESYSTEM_PATH = re.compile(r"(?:/[^\s'\"]+){2,}")
 
 
-class ProtocolVersionError(ValidationError):
-    """MCP-Protocol-Version failure that must surface as HTTP 400."""
+class JsonRpcRequestError(ValidationError):
+    """The body parsed, and it is not a JSON-RPC request this server accepts.
+
+    Distinct from every other `ValidationError` because it is a statement about
+    the *envelope*, not about the call inside it -- which is precisely what
+    JSON-RPC's `-32600` means, and precisely what a tool failure is not. The
+    HTTP transport already answers `400` to a body it cannot parse ("a
+    malformed HTTP request, not a successful call that happens to carry an
+    error"); a body that parses but is not a request is the same claim.
+    """
+
+    code = "jsonrpc_request_invalid"
+
+
+class ProtocolVersionError(JsonRpcRequestError):
+    """MCP-Protocol-Version failure that must surface as HTTP 400.
+
+    A `JsonRpcRequestError` so the transport needs one branch rather than two:
+    the Streamable HTTP spec requires the hard 400 here, and the table in
+    `interfaces/errors.py` gives both codes the same row for the same reason.
+    """
 
     code = "protocol_version_invalid"
 
@@ -56,9 +90,9 @@ def run_stdio(service: BrainskitService) -> None:
         except BrainskitError as exc:
             response = _error(
                 request.get("id") if isinstance(request, dict) else None,
-                -32000,
+                present(exc).jsonrpc_code,
                 str(exc),
-                {"code": exc.code, **exc.details},
+                jsonrpc_error_data(exc),
             )
         except Exception as exc:
             _report_internal_error("stdio request", exc)
@@ -176,7 +210,12 @@ class BrainskitMcpHttpHandler(BaseHTTPRequestHandler):
             # A body brainskit cannot even parse is a malformed HTTP request,
             # not a successful call that happens to carry an error.
             self._send_json(
-                _error(None, -32600, "Invalid Request", {"reason": str(exc)}),
+                _error(
+                    None,
+                    JSONRPC_INVALID_REQUEST,
+                    "Invalid Request",
+                    {"reason": str(exc)},
+                ),
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
@@ -185,29 +224,34 @@ class BrainskitMcpHttpHandler(BaseHTTPRequestHandler):
         try:
             self._validate_http_contract(request)
             response = _handle(self.server.service, request)
-        except ProtocolVersionError as exc:
-            # The Streamable HTTP transport requires a hard 400 here so a
-            # conforming client cannot read a version mismatch as success.
-            status = HTTPStatus.BAD_REQUEST
+        except JsonRpcRequestError as exc:
+            # The one family that is an HTTP failure as well as a JSON-RPC one:
+            # the Streamable HTTP transport requires a hard 400 so a conforming
+            # client cannot read a version mismatch as success.
+            presentation = present(exc)
+            status = presentation.http_status
             response = _error(
                 request.get("id"),
-                -32600,
-                "Invalid Request",
-                {"reason": str(exc), **exc.details},
+                presentation.jsonrpc_code,
+                str(exc),
+                jsonrpc_error_data(exc),
             )
-        except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+        except (json.JSONDecodeError, TypeError) as exc:
             response = _error(
                 request.get("id"),
-                -32600,
+                JSONRPC_INVALID_REQUEST,
                 "Invalid Request",
                 {"reason": str(exc)},
             )
         except BrainskitError as exc:
+            # Everything that reached the dispatcher answers 200 with a
+            # JSON-RPC error inside, per the Streamable HTTP spec -- and now
+            # with the same code and the same `data` the stdio transport sends.
             response = _error(
                 request.get("id"),
-                -32000,
+                present(exc).jsonrpc_code,
                 str(exc),
-                {"code": exc.code, **exc.details},
+                jsonrpc_error_data(exc),
             )
         except Exception as exc:
             _report_internal_error("http request", exc)
@@ -283,7 +327,7 @@ class BrainskitMcpHttpHandler(BaseHTTPRequestHandler):
         if request.get("jsonrpc") != "2.0" or not isinstance(
             request.get("method"), str
         ):
-            raise ValidationError("MCP requires JSON-RPC 2.0 and a method")
+            raise JsonRpcRequestError("MCP requires JSON-RPC 2.0 and a method")
         method = str(request["method"])
         if method != "initialize":
             version = self.headers.get("MCP-Protocol-Version")
@@ -294,13 +338,15 @@ class BrainskitMcpHttpHandler(BaseHTTPRequestHandler):
                 )
         mirrored_method = self.headers.get("Mcp-Method")
         if mirrored_method and mirrored_method != method:
-            raise ValidationError("Mcp-Method does not match the JSON-RPC method")
+            raise JsonRpcRequestError(
+                "Mcp-Method does not match the JSON-RPC method"
+            )
         mirrored_name = self.headers.get("Mcp-Name")
         params = request.get("params")
         if mirrored_name and isinstance(params, dict):
             expected_name = params.get("name", params.get("uri"))
             if expected_name is not None and mirrored_name != str(expected_name):
-                raise ValidationError(
+                raise JsonRpcRequestError(
                     "Mcp-Name does not match the JSON-RPC parameters"
                 )
 
@@ -334,7 +380,7 @@ class BrainskitMcpHttpHandler(BaseHTTPRequestHandler):
         authenticate: str | None = None,
         allow: str | None = None,
     ) -> None:
-        body = json.dumps({"ok": False, "error": {"code": code}}).encode()
+        body = json.dumps(refusal_envelope(code)).encode()
         self.send_response(status.value)
         self._security_headers()
         if authenticate:
@@ -419,7 +465,7 @@ def _handle(
     if method == "resources/list":
         readable_pages = sorted(
             str(node["path"])
-            for node in service.graph_data(consumer="local")["nodes"]
+            for node in service.graph_data(consumer=MCP_CONSUMER)["nodes"]
             if str(node["id"]).startswith("page:")
         )
         return _result(
@@ -441,7 +487,7 @@ def _handle(
         if not uri.startswith(prefix):
             raise ValidationError("Unknown resource URI", details={"uri": uri})
         path = uri[len(prefix) :]
-        resource = service.read_resource(f"page:{path}", consumer="local")
+        resource = service.read_resource(f"page:{path}", consumer=MCP_CONSUMER)
         return _result(
             request_id,
             {
@@ -502,9 +548,7 @@ def _call_tool(
         ),
         "integration_status": lambda: service.integration_status(
             str(arguments["name"]) if arguments.get("name") else None,
-            # MCP is a machine surface; `local` is its scope everywhere it
-            # reads without a caller-declared consumer (see resources/*).
-            consumer="local",
+            consumer=MCP_CONSUMER,
         ),
         "integration_up": lambda: service.integration_up(str(arguments["name"])),
         "integration_down": lambda: service.integration_down(
@@ -658,7 +702,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
 def _consumer_schema() -> dict[str, Any]:
     return {
         "type": "string",
-        "enum": ["human", "local", "cloud"],
+        "enum": [consumer.value for consumer in Consumer],
         "description": (
             "Privacy boundary applied to the returned evidence. There is no "
             "default: declare the boundary of whoever will read the result. "

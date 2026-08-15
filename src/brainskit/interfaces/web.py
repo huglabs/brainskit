@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, urlparse
 from brainskit.application.jobs import MAX_HISTORY_EXCHANGES
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import BrainskitError, ValidationError
+from brainskit.domain.privacy import Consumer
+from brainskit.interfaces.errors import error_envelope, present, refusal_envelope
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -53,8 +55,10 @@ def build_server(
     # assembling the server by hand, which is what this function exists to stop.
     if port != 0 and not 1 <= port <= 65535:
         raise ValidationError("Web viewer port must be between 1 and 65535")
-    if consumer not in {"human", "local", "cloud"}:
-        raise ValidationError("Web viewer consumer is invalid")
+    # `Consumer.parse` is the one place an unknown consumer becomes an error
+    # (ADR 0001); a fourth copy of the three names here could only ever go out
+    # of date with it, and its message names the three where this one did not.
+    Consumer.parse(consumer)
     if host not in LOOPBACK_HOSTS and not token:
         raise ValidationError(
             "Remote web viewer binding requires --token-env with a populated variable"
@@ -255,16 +259,10 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
         # not be able to confirm a viewer is even running here, let alone read
         # a vault whose consumer is `human` and therefore withholds nothing.
         if not self._host_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "host_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("host_denied", HTTPStatus.FORBIDDEN)
             return
         if not self._origin_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "origin_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("origin_denied", HTTPStatus.FORBIDDEN)
             return
         if parsed.path in {"/", "/index.html"}:
             self._send_html(WEB_VIEWER_HTML)
@@ -282,10 +280,7 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorized():
-            self._send_json(
-                {"ok": False, "error": {"code": "unauthorized"}},
-                status=HTTPStatus.UNAUTHORIZED,
-            )
+            self._send_refusal("unauthorized", HTTPStatus.UNAUTHORIZED)
             return
         query = parse_qs(parsed.query)
         try:
@@ -341,62 +336,33 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
                     consumer=self.server.consumer
                 )
             else:
-                self._send_json(
-                    {"ok": False, "error": {"code": "not_found"}},
-                    status=HTTPStatus.NOT_FOUND,
-                )
+                self._send_refusal("not_found", HTTPStatus.NOT_FOUND)
                 return
         except (ValueError, BrainskitError) as exc:
-            code = getattr(exc, "code", "invalid_request")
-            details = getattr(exc, "details", {})
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": code,
-                        "message": str(exc),
-                        "details": details,
-                    },
-                },
-                status=HTTPStatus.BAD_REQUEST,
-            )
+            self._send_error(exc)
             return
         self._send_json({"ok": True, "result": value})
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if not self._host_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "host_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("host_denied", HTTPStatus.FORBIDDEN)
             return
         if not self._origin_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "origin_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("origin_denied", HTTPStatus.FORBIDDEN)
             return
         if not self._authorized():
-            self._send_json(
-                {"ok": False, "error": {"code": "unauthorized"}},
-                status=HTTPStatus.UNAUTHORIZED,
-            )
+            self._send_refusal("unauthorized", HTTPStatus.UNAUTHORIZED)
             return
         # The write surface belongs to a person at a keyboard. A viewer bound
         # to a machine consumer (`local`/`cloud`) stays read-only, so a script
         # pointed at a viewer cannot mutate the vault through it.
         if self.server.consumer != "human":
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "writes_refused",
-                        "message": "The web viewer only writes at --consumer human",
-                        "details": {"consumer": self.server.consumer},
-                    },
-                },
-                status=HTTPStatus.FORBIDDEN,
+            self._send_refusal(
+                "writes_refused",
+                HTTPStatus.FORBIDDEN,
+                message="The web viewer only writes at --consumer human",
+                details={"consumer": self.server.consumer},
             )
             return
         try:
@@ -412,25 +378,10 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
                     _need(body, "id"), str(body.get("reason") or "")
                 )
             else:
-                self._send_json(
-                    {"ok": False, "error": {"code": "not_found"}},
-                    status=HTTPStatus.NOT_FOUND,
-                )
+                self._send_refusal("not_found", HTTPStatus.NOT_FOUND)
                 return
         except (ValueError, BrainskitError) as exc:
-            code = getattr(exc, "code", "invalid_request")
-            details = getattr(exc, "details", {})
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": code,
-                        "message": str(exc),
-                        "details": details,
-                    },
-                },
-                status=HTTPStatus.BAD_REQUEST,
-            )
+            self._send_error(exc)
             return
         self._send_json({"ok": True, "result": value})
 
@@ -553,6 +504,38 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
 
         origin = self.headers.get("Origin")
         return origin is None or origin in self.server.allowed_origins
+
+    def _send_error(self, exc: BaseException) -> None:
+        """Answer an error with the status its code means.
+
+        Both handlers used to inline the same fifteen lines and both ended them
+        with `HTTPStatus.BAD_REQUEST`, so a missing page arrived as a bad
+        request and a privacy refusal did too. The status now comes from the
+        one table in `interfaces/errors.py`; a bare `ValueError` (an unparsable
+        query parameter, which this deliberately still catches) keeps the 400
+        it always had.
+        """
+
+        self._send_json(error_envelope(exc), status=present(exc).http_status)
+
+    def _send_refusal(
+        self,
+        code: str,
+        status: HTTPStatus,
+        *,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Answer a guard that refused before any error was raised.
+
+        A denied Host, a foreign Origin, a missing token, an unrouted path:
+        there is no exception to describe, only the name of the rule that said
+        no -- and the status is that rule's, not a code's.
+        """
+
+        self._send_json(
+            refusal_envelope(code, message=message, details=details), status=status
+        )
 
     def _send_json(
         self, value: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK

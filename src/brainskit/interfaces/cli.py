@@ -19,9 +19,9 @@ from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     BrainskitError,
     NotFoundError,
-    PolicyError,
     ValidationError,
 )
+from brainskit.domain.privacy import Consumer
 from brainskit.infrastructure import pyenv
 from brainskit.infrastructure.extractor import (
     GraphifyExtractor,
@@ -34,13 +34,21 @@ from brainskit.infrastructure.integrations import NativeIntegrations, vault_id
 from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainskit.infrastructure.vault import FileVault
 from brainskit.infrastructure.vaults import RegisteredVault, VaultRegistry
-from brainskit.interfaces import console, onboarding, prompt
+from brainskit.interfaces import console, errors, onboarding, prompt
+from brainskit.interfaces.errors import error_envelope, install_hint_for
 
 
 class InternalError(BrainskitError):
     """An unmodelled adapter failure that reached the CLI boundary."""
 
     code = "internal_error"
+
+
+#: The `--consumer` values, derived from the enum that already owns them rather
+#: than spelled into ten `add_argument` calls. `argparse` wants a plain list;
+#: `Consumer` decides what is in it, and `Consumer.parse` is still the only
+#: thing that turns one of these strings into a boundary.
+CONSUMER_CHOICES = [consumer.value for consumer in Consumer]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,13 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     search = commands.add_parser("search", help="Search with FTS5 BM25")
     search.add_argument("query", help="Full-text query")
     search.add_argument("--limit", type=int, default=10, help="Maximum hits to return (default: 10)")
-    search.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
+    search.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary to read under; required with --json")
 
     context = commands.add_parser("context", help="Build a bounded evidence bundle")
     context.add_argument("query", help="Topic to gather evidence for")
     context.add_argument("--limit", type=int, default=8, help="Maximum evidence items to bundle (default: 8)")
     context.add_argument("--max-chars", type=int, default=24_000, help="Truncate the bundle to roughly this many characters")
-    context.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
+    context.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary to read under; required with --json")
 
     apply_command = commands.add_parser(
         "apply", help="Validate and atomically stage wiki writes"
@@ -170,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enrich_apply.add_argument("proposal", help="Proposal JSON path, or - for stdin")
     enrich_list = enrich_sub.add_parser("list", help="Stored edges, privacy-filtered")
-    enrich_list.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
+    enrich_list.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary to read under; required with --json")
     enrich_forget = enrich_sub.add_parser("forget", help="Drop one stored edge")
     enrich_forget.add_argument("id", metavar="ID", help="Full or prefix edge id")
 
@@ -182,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     # with nothing on it saying which boundary it was built under.
     graph.add_argument(
         "--consumer",
-        choices=["human", "local", "cloud"],
+        choices=CONSUMER_CHOICES,
         help="Privacy boundary the written graph is built inside (default: local)",
     )
 
@@ -287,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         reader.add_argument(
             "--consumer",
-            choices=["human", "local", "cloud"],
+            choices=CONSUMER_CHOICES,
             default="local",
             help="The code graph carries repository paths and never leaves the machine",
         )
@@ -309,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Export format: json, graphml, cypher, kuzu, llms-txt, or an integration")
     export.add_argument(
         "--consumer",
-        choices=["human", "local", "cloud"],
+        choices=CONSUMER_CHOICES,
         default="local",
         help=(
             "Privacy boundary written into the export; defaults to local, "
@@ -444,7 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     integration_configure.add_argument("--bolt-port", type=int, help="Bolt port (Neo4j)")
     integration_configure.add_argument("--token-env", help="Environment variable holding the bearer token")
     integration_configure.add_argument(
-        "--consumer", choices=["human", "local", "cloud"],
+        "--consumer", choices=CONSUMER_CHOICES,
         help="Privacy boundary this integration receives")
     integration_status = integration_sub.add_parser("status")
     integration_status.add_argument(
@@ -512,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vaults_sync.add_argument(
         "--consumer",
-        choices=["human", "local", "cloud"],
+        choices=CONSUMER_CHOICES,
         help=(
             "Refused on purpose. Each vault's privacy boundary comes from its "
             "own integration policy; see bk integration configure --consumer"
@@ -522,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     web = commands.add_parser("web", help="Run the complete local web viewer")
     web.add_argument("--host", help="Interface to bind; non-loopback requires --token-env")
     web.add_argument("--port", type=int, help="Port to bind")
-    web.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary the viewer reads under; writes need human")
+    web.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary the viewer reads under; writes need human")
     web.add_argument("--token-env", help="Environment variable holding the bearer token")
     web.add_argument(
         "--allowed-origin",
@@ -547,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--host", help="Interface to bind; non-loopback requires --token-env"
     )
     web_serve.add_argument("--port", type=int, help="Port to bind")
-    web_serve.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary the viewer reads under; writes need human")
+    web_serve.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary the viewer reads under; writes need human")
     web_serve.add_argument(
         "--token-env", help="Environment variable holding the bearer token"
     )
@@ -1212,16 +1220,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             # not failures: declining an integration is the policy working.
             return 1
         return 0
-    except PolicyError as exc:
-        _emit_error(exc, json_mode=args.json)
-        return 3
     except BrainskitError as exc:
+        # One branch, not two. `policy_denied` is the only code that carries a
+        # different status, and the table in `interfaces/errors.py` is where it
+        # says so -- next to what the same code means over HTTP and JSON-RPC,
+        # rather than in an `except` ladder no other surface can read.
         _emit_error(exc, json_mode=args.json)
-        return 2
+        return errors.present(exc).exit_status
     except (OSError, json.JSONDecodeError) as exc:
         wrapped = BrainskitError(str(exc))
         _emit_error(wrapped, json_mode=args.json)
-        return 2
+        return errors.present(wrapped).exit_status
     except prompt.Cancelled as exc:
         # Dismissing a prompt is the operator declining, not the tool failing:
         # same exit status as the interrupt it stands in for, and no error
@@ -1408,7 +1417,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.views()
     if args.command == "graph":
         return service.graph(
-            consumer=args.consumer or "local", html=args.html
+            consumer=_consumer_for_args(args, default=Consumer.LOCAL), html=args.html
         )
     if args.command == "code":
         if args.code_command == "build":
@@ -1423,27 +1432,41 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return service.code_status()
         if args.code_command == "affected":
             return service.code_affected(
-                args.symbol, depth=args.depth, consumer=args.consumer
+                args.symbol,
+                depth=args.depth,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             )
         if args.code_command == "path":
-            return service.code_path(args.source, args.target, consumer=args.consumer)
+            return service.code_path(
+                args.source,
+                args.target,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
+            )
         if args.code_command == "hubs":
-            return service.code_hubs(top=args.top, consumer=args.consumer)
+            return service.code_hubs(
+                top=args.top,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
+            )
         if args.code_command == "communities":
             return service.code_communities(
-                resolution=args.resolution, consumer=args.consumer
+                resolution=args.resolution,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             )
         if args.code_command == "cycles":
             return service.code_cycles(
-                max_length=args.max_length, top=args.top, consumer=args.consumer
+                max_length=args.max_length,
+                top=args.top,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             )
         if args.code_command == "diff":
             against = _read_json(args.graph) if args.graph else None
-            return service.code_diff(against, consumer=args.consumer)
+            return service.code_diff(
+                against, consumer=_consumer_for_args(args, default=Consumer.LOCAL)
+            )
     if args.command == "export":
         return service.export(
             args.target,
-            consumer=args.consumer or "local",
+            consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             enrichment=args.enrichment,
         )
     if args.command == "ingest":
@@ -1619,15 +1642,32 @@ def _guided_init(target: Path) -> onboarding.Outcome:
     return onboarding.run(target)
 
 
-def _consumer_for_args(args: argparse.Namespace) -> str:
+def _consumer_for_args(
+    args: argparse.Namespace, *, default: Consumer = Consumer.HUMAN
+) -> str:
+    """The one place the CLI decides which boundary an unnamed read runs under.
+
+    Two defaults, one rule, because the two are not the same decision. An
+    interactive read defaults to `human` -- the operator is the reader, and the
+    result goes no further than the terminal -- but a `--json` caller is not a
+    person and has to say who is, which is the refusal below. A read whose
+    output is a file or a graph defaults to `local` instead and carries no
+    refusal: the artifact outlives the command, and `human` withholds nothing.
+
+    Both used to be decided at the call site, `local` as a bare
+    `args.consumer or "local"` twice over -- once next to an `argparse`
+    `default="local"` that already said it, so the fallback was dead code
+    stating a rule the parser had stated first.
+    """
+
     if args.consumer:
         return str(args.consumer)
-    if args.json:
+    if default is Consumer.HUMAN and args.json:
         raise ValidationError(
             "Machine-readable output requires --consumer",
-            details={"choices": ["human", "local", "cloud"]},
+            details={"choices": CONSUMER_CHOICES},
         )
-    return "human"
+    return default.value
 
 
 def _watch(
@@ -1897,7 +1937,7 @@ def _bootstrap_code_graph(service: BrainskitService, *, skip: bool) -> dict[str,
         return {
             "state": "skipped",
             "reason": str(exc),
-            "hint": _install_hint_for(exc.details or {}).get("hint"),
+            "hint": install_hint_for(exc.details or {}).get("hint"),
         }
     except Exception as exc:
         # Mirrors _sync_one_vault: an extractor's own failure belongs to this
@@ -2867,44 +2907,14 @@ def _internal_error(exc: BaseException) -> InternalError:
     )
 
 
-def _install_hint_for(details: dict[str, Any]) -> dict[str, Any]:
-    """Turn a `needs` list into the command that works on *this* machine.
-
-    The application layer names what is missing (`{"needs": ["brainskit[code]"]}`)
-    and stops there, because which command installs it is a fact about the
-    running interpreter — not something a layer that must not import
-    infrastructure can know, and not something to hardcode. Every hint that did
-    hardcode it said `pip install …`, which is unrunnable under `uv tool`: that
-    environment ships no `pip`, so the operator either saw a failure or silently
-    installed the package into an unrelated interpreter and hit the identical
-    message on the retry.
-
-    Enriching here, at the one place errors are rendered, means every raiser
-    gets a correct hint without any of them knowing how `bk` was installed.
-    """
-
-    needs = details.get("needs")
-    if not isinstance(needs, list) or not needs or "hint" in details:
-        return details
-    return {**details, "hint": pyenv.install_hint([str(item) for item in needs])}
-
-
 def _emit_error(error: BrainskitError, *, json_mode: bool) -> None:
-    payload = {
-        "ok": False,
-        "error": {
-            "code": error.code,
-            "message": str(error),
-            "details": _install_hint_for(error.details or {}),
-        },
-    }
+    payload = error_envelope(error)
     stream = sys.stdout if json_mode else sys.stderr
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False), file=stream)
     else:
         print(console.style(f"bk: {error}", console.ERR, stream=stream), file=stream)
-        details = _install_hint_for(error.details or {})
-        for line in _human_detail_lines(details, stream=stream):
+        for line in _human_detail_lines(payload["error"]["details"], stream=stream):
             print(line, file=stream)
 
 

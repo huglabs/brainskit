@@ -606,7 +606,15 @@ class McpHttpContractTest(unittest.TestCase):
         self.assertEqual(broken_body["error"]["code"], -32600)
 
     def test_tool_level_validation_stays_a_jsonrpc_error_at_200(self) -> None:
-        """Only transport failures become HTTP errors; tool errors do not."""
+        """Only transport failures become HTTP errors; tool errors do not.
+
+        The HTTP status is the claim this test exists for and it is unchanged.
+        The JSON-RPC code moved from `-32600` to `-32000` when ADR 0006 gave
+        the two transports one table: `-32600` means "the JSON sent is not a
+        valid Request object", and this request object is valid -- it is the
+        tool named inside it that does not exist. stdio has always answered
+        `-32000` here; the divergence was the bug.
+        """
 
         status, body, _ = self._post(
             {
@@ -618,7 +626,10 @@ class McpHttpContractTest(unittest.TestCase):
             version=MCP_PROTOCOL_VERSION,
         )
         self.assertEqual(status, HTTPStatus.OK)
-        self.assertEqual(body["error"]["code"], -32600)
+        self.assertEqual(body["error"]["code"], -32000)
+        # And the machine-readable code now survives the HTTP transport, which
+        # dropped it entirely while it built its own `data` member.
+        self.assertEqual(body["error"]["data"]["code"], "validation_error")
         unknown, unknown_body, _ = self._post(
             {"jsonrpc": "2.0", "id": 9, "method": "no/such/method"},
             version=MCP_PROTOCOL_VERSION,
