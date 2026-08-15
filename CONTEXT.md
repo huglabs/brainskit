@@ -56,3 +56,39 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   and the ageing pass skips `review`, so writing it over `stale` removes the
   page from the loop rather than lowering a badge. `mark_reviewed` refuses,
   which leaves `review` reachable only from `fresh`.
+
+## Apply
+
+- **ApplyTransaction** — the two-phase commit that is the only thing that writes
+  `wiki/`: stage, back up, journal, replace, and undo all of it if the process
+  dies. Lives in `infrastructure/apply_transaction.py`, one `commit(plan)` and
+  one `recover()`. Takes no locks; it is handed ten unlocked accessors rather
+  than the vault, because the vault's public methods each take the lock they
+  need and calling one from inside the transaction would block on a lock this
+  process already holds. The constructor is the audit of what an apply may
+  touch.
+- **lock ordering** — `FileVault.commit_wiki_batch` takes `write.lock`, then
+  `registry.lock`, then `applied.lock`, then `freshness.lock`, and then
+  delegates. Stated once, there. This is why `FreshnessLedger.mark_applied`
+  returns entries instead of writing them: a second writer inside this block
+  would invert the order and deadlock.
+- **committed boundary** — `state: committed` in the journal is the line between
+  losing an interrupted apply and keeping it. Before it recovery restores
+  everything; after it recovery only cleans up. `phase` is written by every step
+  and read by nothing — recovery decides from `replaced`, `inflight`, `backups`
+  and `raw_move`. The phase is a forensic breadcrumb, not a control input.
+- **checkpoint** — one of the ten moments at which the journal on disk has just
+  been brought up to date (`prepared`, `page-inflight`, `page-replaced`,
+  `wiki-written`, `raw-move-inflight`, `raw-move-applied`, `state-written`,
+  `index-written`, `applied-recorded`, `committed`). Named so that "crashed at
+  X" describes a state a real crash can leave, not an instant no journal
+  describes.
+- **FailurePoint** — the injected crash: a checkpoint, optionally narrowed to
+  one page and to the *n*th time it is reached. A constructor argument with no
+  default and no environment variable; `crashing_at` returns a copy, so an
+  engine crashes only because a caller named the point. Production never arms
+  one.
+- **InterruptedApply** — what a `FailurePoint` raises. A `BaseException` on
+  purpose: `commit` rolls back in its own `except Exception`, and a test that
+  asked for a crash wants the half-finished vault a crash leaves, not the tidy
+  rollback an error gets.

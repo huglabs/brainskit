@@ -42,6 +42,7 @@ from typing import Any
 from unittest import mock
 
 from brainskit.infrastructure import vault as vault_module
+from brainskit.infrastructure.apply_transaction import ApplyTransaction
 from brainskit.infrastructure.vault import FileVault
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -189,10 +190,12 @@ class ApplyJournalFixture(ServiceFixture):
                 # The writer rolls back in its own `except` clause. Neutralising
                 # that is what leaves a genuinely half-finished vault on disk,
                 # which is the state this file exists to test recovery against.
+                # The clause lives on `ApplyTransaction` now;
+                # `FileVault._recover_apply_unlocked` is the lock around the
+                # same method, so patching the vault would leave the rollback
+                # this has to suppress running.
                 stack.enter_context(
-                    mock.patch.object(
-                        FileVault, "_recover_apply_unlocked", lambda self: None
-                    )
+                    mock.patch.object(ApplyTransaction, "recover", lambda self: None)
                 )
             yield recorded
 

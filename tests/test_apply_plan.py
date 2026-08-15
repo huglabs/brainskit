@@ -26,6 +26,7 @@ from dataclasses import fields
 from brainskit.application import ports
 from brainskit.application.compilation import ApplyGate
 from brainskit.application.ports import ApplyPlan, VaultPort
+from brainskit.infrastructure.apply_transaction import ApplyTransaction
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.integrations import NativeIntegrations
@@ -56,7 +57,12 @@ class ApplyPlanIsTheWholeArgumentTest(unittest.TestCase):
         )
 
     def test_the_adapter_reads_every_field_of_the_plan(self) -> None:
-        source = inspect.getsource(FileVault.commit_wiki_batch)
+        # Two objects make up the adapter side now: `commit_wiki_batch` owns
+        # the locks and `ApplyTransaction.commit` performs the write, so the
+        # plan has to be read across the pair.
+        source = inspect.getsource(FileVault.commit_wiki_batch) + inspect.getsource(
+            ApplyTransaction.commit
+        )
         unread = [
             field.name
             for field in fields(ApplyPlan)
