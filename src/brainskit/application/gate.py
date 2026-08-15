@@ -10,8 +10,11 @@ The gate governs the vault, not the filesystem: a target that lands outside the
 vault is allowed. Inside the vault, matching is done on path segments so that
 ``wiki/`` covers ``wiki/a.md`` but never ``wikipedia/a.md``.
 
-This module depends on nothing but the standard library, which keeps the
-application layer free of infrastructure and lets the hook path stay fast.
+This module depends on the standard library and on `application.install`, which
+is itself stdlib-only and is where the adapter's filename is decided. That keeps
+the application layer free of infrastructure and the hook path fast, and it
+keeps the gate opening the same file the installer wrote rather than a second
+spelling of it.
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from brainskit.application.install import adapter_path
 
 DEFAULT_DENY_PREFIXES: tuple[str, ...] = ("wiki/", "raw/")
 
@@ -130,7 +135,7 @@ def load_gate_policy(vault_root: Path, agent: str = "claude") -> GatePolicy:
     base = _absolute(_as_text(vault_root))
     if base is None:
         return _defaults(agent, None, "vault root could not be normalised")
-    source = Path(base) / ".brain" / f"agent-{agent}.json"
+    source = Path(base) / adapter_path(agent)
     try:
         raw = source.read_text(encoding="utf-8")
     except (OSError, ValueError, UnicodeDecodeError):

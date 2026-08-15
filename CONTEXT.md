@@ -57,6 +57,40 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   page from the loop rather than lowering a badge. `mark_reviewed` refuses,
   which leaves `review` reachable only from `fresh`.
 
+## Enforcement
+
+- **enforcement layer** — one named way a vault's write discipline is enforced:
+  `write_gate`, `session_status`, `commit_lint`, `instructions`. The first three
+  run and either let a write through or refuse it; `instructions` is
+  **advisory** — it tells an agent the rules and stops nothing, so it is read
+  past by `enforcement_ok` and by the `healthy` headline, and drawn as advisory
+  rather than as a fourth guarantee.
+- **`gated`** — specifically that the write gate is live, never "some layer is
+  on". `session_status` is observability and `commit_lint` catches a bypass only
+  after the fact; letting either imply it would report a guarded vault a Write
+  tool can walk straight into.
+- **AgentInstall** — what `bk hooks install --agent X` writes, as data:
+  the instruction file, the hooks, whether the skill is installed. The one owner
+  of the per-agent table, in `application/install.py`, iterated by the installer
+  and by `Health` so neither can restate it — the divergence ADR 0004 records,
+  and the third instance of the one `ConstantsHaveOneOwnerTest` was written for.
+  An agent with no hooks reports no `write_gate` layer rather than an inactive
+  one: "there is no guard here" and "the guard fell off" are different claims.
+- **adapter** — `.brain/agent-<agent>.json`, the only thing on disk that records
+  an install. It carries the resolved workspace (which is not always the vault)
+  and the gate's deny rules, so `installed_agents` reading the directory is the
+  whole answer to "who is this vault installed for". Its path is `adapter_path`,
+  spelled once, because the gate, the installer and the reader all open it.
+- **workspace vs vault** — `.claude/`, the instruction file and the git
+  pre-commit hook belong to the project an agent is opened on; `.brain/` and the
+  graph belong to the vault. A reader that assumes they are the same directory
+  reports every layer off for any vault nested inside the project it guards.
+- **exercised, not believed** — every enforcement answer except one says an
+  artefact is installed and registered, which is not the claim "a write to
+  `wiki/` is refused". `bk doctor` runs the gate hook on one path it must deny
+  and one it must allow (`enforcing` / `not_enforcing` / `over_blocking` /
+  `unknown` / `absent`), because the hook fails open by design in eight places.
+
 ## Apply
 
 - **ApplyTransaction** — the two-phase commit that is the only thing that writes

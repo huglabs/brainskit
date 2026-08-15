@@ -752,7 +752,8 @@ class AgentInstallTest(unittest.TestCase):
         return cli._install_hooks(self.service, agent, force=force)
 
     def instructions(self, agent: str = "claude") -> str:
-        return (self.root / cli.INSTRUCTION_FILES[agent]).read_text(encoding="utf-8")
+        target = self.root / cli.agent_install(agent).instructions
+        return target.read_text(encoding="utf-8")
 
     def skill_path(self) -> Path:
         return self.root / ".claude" / "skills" / "brainskit" / "SKILL.md"

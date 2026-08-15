@@ -33,6 +33,17 @@ from brainskit.application.freshness import (
     _projection_source_hash,
 )
 from brainskit.application.gate import INSTRUCTION_START
+from brainskit.application.install import (
+    COMMIT_LINT,
+    COMMIT_LINT_MECHANISM,
+    DEFAULT_AGENT,
+    INSTRUCTIONS,
+    WRITE_GATE,
+    AgentHook,
+    adapter_path,
+    agent_install,
+    installed_agents,
+)
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
@@ -736,11 +747,61 @@ class Health:
         directory -- and a layer that is off while everything still reads like
         success is precisely how an invariant ends up guarded by nothing.
 
-        It looks where the agent's configuration actually is, which the adapter
-        records: reading the vault unconditionally would report every layer off
-        for any vault nested inside the project it guards.
+        It answers for the agents that were actually installed, which the
+        adapters under `.brain/` record, and for each of them from the workspace
+        that agent's adapter names. Reading one hardcoded agent was the same
+        class of failure this method exists to catch, one level up: an install
+        for any other agent had its live layers reported off, against a workspace
+        nobody chose and an instruction file nobody wrote.
+
+        A vault with no adapter at all is reported as `DEFAULT_AGENT` -- nothing
+        has been installed yet, and the useful answer is where the layers would
+        land rather than an empty report that reads like a vault with no rules.
+        `agent` is stamped on a layer only when more than one is installed,
+        because it exists to disambiguate and in the overwhelmingly common case
+        there is nothing to disambiguate.
         """
-        root = self._agent_workspace()
+
+        agents = installed_agents(self.vault.root) or (DEFAULT_AGENT,)
+        named = len(agents) > 1
+        layers: list[dict[str, Any]] = []
+        for agent in agents:
+            for layer in self._agent_enforcement(agent):
+                layers.append({**layer, "agent": agent} if named else layer)
+        # Names, not rows: two agents sharing one repository see the same
+        # `commit_lint` and listing it twice would read as two faults.
+        inactive: list[str] = []
+        for layer in layers:
+            name = str(layer["layer"])
+            if not layer["active"] and name not in inactive:
+                inactive.append(name)
+        return {
+            "layers": layers,
+            "inactive": inactive,
+            # Specifically the write gate, not "any non-advisory layer is on".
+            # session_status is observability and commit_lint catches a bypass
+            # only after the fact; neither one keeps a write out of the wiki, so
+            # letting either imply `gated` would report a guarded vault that a
+            # Write tool can still walk straight into.
+            "gated": any(
+                layer["active"] for layer in layers if layer["layer"] == WRITE_GATE
+            ),
+        }
+
+    def _agent_enforcement(self, agent: str) -> list[dict[str, Any]]:
+        """The layers one installed agent has, and whether each is live.
+
+        Which layers those are is not this method's to decide: `hooks install`
+        writes what `application.install` says an agent gets, and brainskit ships
+        Claude Code hooks for `claude` and nothing equivalent for the others. An
+        agent with no hooks therefore reports no `write_gate` row rather than an
+        inactive one -- naming a layer that was never offered reads as a guard
+        that fell off, which is a different and more alarming claim than the true
+        one, and `gated` stays False either way.
+        """
+
+        install = agent_install(agent)
+        root = self._agent_workspace(agent)
         settings_path = root / ".claude" / "settings.json"
         registered: set[str] = set()
         events: dict[str, set[str]] = {}
@@ -790,19 +851,19 @@ class Health:
                     continue
             return False
 
-        def hook_layer(
-            name: str, script: str, event: str, mechanism: str
-        ) -> dict[str, Any]:
-            path = root / ".claude" / "hooks" / script
-            active = path.is_file() and registered_under(event, path)
+        def hook_layer(hook: AgentHook) -> dict[str, Any]:
+            path = root / ".claude" / "hooks" / hook.script
+            active = path.is_file() and registered_under(hook.event, path)
             detail = "active"
             if not path.is_file():
-                detail = f"{script} is not installed"
+                detail = f"{hook.script} is not installed"
             elif not active:
-                detail = f"{script} exists but is not registered under {event}"
+                detail = (
+                    f"{hook.script} exists but is not registered under {hook.event}"
+                )
             return {
-                "layer": name,
-                "mechanism": mechanism,
+                "layer": hook.layer,
+                "mechanism": hook.mechanism,
                 "active": active,
                 "detail": detail,
                 # Named so a reader -- and `bk doctor`, which runs it -- can
@@ -834,9 +895,7 @@ class Health:
             commit_detail = f"{root} is not a git repository"
         else:
             commit_detail = f"{root} has no brainskit pre-commit hook"
-        # The sentinel is duplicated from the installer rather than imported:
-        # the application layer must not depend on interfaces.
-        instructions = root / "CLAUDE.md"
+        instructions = root / install.instructions
         try:
             advisory_active = (
                 instructions.is_file()
@@ -847,47 +906,24 @@ class Health:
         except OSError:
             advisory_active = False
 
-        layers = [
-            hook_layer(
-                "write_gate",
-                "brainskit-gate.sh",
-                "PreToolUse",
-                "Claude Code PreToolUse hook on Write|Edit|MultiEdit",
-            ),
-            hook_layer(
-                "session_status",
-                "brainskit-status.sh",
-                "SessionStart",
-                "Claude Code SessionStart hook reporting vault state",
-            ),
+        return [
+            *(hook_layer(hook) for hook in install.hooks),
             {
-                "layer": "commit_lint",
-                "mechanism": ".git/hooks/pre-commit running bk lint --changed",
+                "layer": COMMIT_LINT,
+                "mechanism": COMMIT_LINT_MECHANISM,
                 "active": commit_active,
                 "detail": commit_detail,
             },
             {
-                "layer": "instructions",
-                "mechanism": "CLAUDE.md managed block",
+                "layer": INSTRUCTIONS,
+                "mechanism": install.instructions_mechanism,
                 "active": advisory_active,
                 "advisory": True,
                 "detail": "active" if advisory_active else "no managed block found",
             },
         ]
-        return {
-            "layers": layers,
-            "inactive": [layer["layer"] for layer in layers if not layer["active"]],
-            # Specifically the write gate, not "any non-advisory layer is on".
-            # session_status is observability and commit_lint catches a bypass
-            # only after the fact; neither one keeps a write out of the wiki, so
-            # letting either imply `gated` would report a guarded vault that a
-            # Write tool can still walk straight into.
-            "gated": any(
-                layer["active"] for layer in layers if layer["layer"] == "write_gate"
-            ),
-        }
 
-    def _agent_workspace(self, agent: str = "claude") -> Path:
+    def _agent_workspace(self, agent: str) -> Path:
         """Where the agent's configuration lives, per the adapter that recorded it.
 
         Falls back to the enclosing project when the vault sits inside one --
@@ -900,7 +936,7 @@ class Health:
         on a vault nested under its own project's `.git`, before `hooks
         install` has ever run there).
         """
-        source = self.vault.root / ".brain" / f"agent-{agent}.json"
+        source = self.vault.root / adapter_path(agent)
         try:
             adapter = json.loads(source.read_text(encoding="utf-8"))
             workspace = adapter.get("workspace")

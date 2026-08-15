@@ -38,6 +38,11 @@ def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
     the viewer only has to name the layer that is off. A hook path names a local
     filesystem layout, and there is no reason to spend that on a caller with no
     use for it.
+
+    `agent` is kept, on the other side of that line: it is present only when the
+    vault is installed for more than one, and without it two identically named
+    rows would render as one layer reported twice. It names an agent, not a
+    machine.
     """
 
     return {
@@ -46,7 +51,7 @@ def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
         "layers": [
             {
                 key: layer[key]
-                for key in ("layer", "mechanism", "active", "advisory")
+                for key in ("layer", "mechanism", "active", "advisory", "agent")
                 if key in layer
             }
             for layer in enforcement.get("layers", [])

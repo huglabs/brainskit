@@ -23,6 +23,16 @@ from brainskit.application.gate import (
     INSTRUCTION_START,
 )
 from brainskit.application.health import redirected_git_hooks_path
+from brainskit.application.install import (
+    BRAND,
+    COMMIT_LINT,
+    COMMIT_LINT_MECHANISM,
+    DEFAULT_AGENT,
+    INSTRUCTIONS,
+    WRITE_GATE,
+    AgentHook,
+    agent_install,
+)
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     BrainskitError,
@@ -1660,19 +1670,6 @@ def _watch(
         time.sleep(interval)
 
 
-INSTRUCTION_FILES = {
-    "claude": "CLAUDE.md",
-    "codex": "AGENTS.md",
-    "gemini": "GEMINI.md",
-    "opencode": "AGENTS.md",
-}
-#: The name this tool installs its artefacts under.
-#
-# Every artefact spells it identically -- `<brand>-gate.sh`, `# <brand>:
-# generated`, `<!-- <brand>:start -->`, `.claude/skills/<brand>/` -- which is
-# what lets one list of former names below cover all four classes at once.
-BRAND = "brainskit"
-
 #: Names this tool shipped under before. A rename has to *migrate* an install,
 #: not duplicate it.
 #
@@ -1731,22 +1728,9 @@ _LEGACY_MANAGED_BLOCKS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 _BLOCK_ANCHOR = "\x00brainskit:managed-block\x00"
 
 
-class ClaudeHook(NamedTuple):
-    """A Claude Code hook brainskit ships, installs and registers."""
-
-    template: str
-    event: str
-    matcher: str | None
-    timeout: int
-
-
-CLAUDE_HOOKS: tuple[ClaudeHook, ...] = (
-    ClaudeHook("brainskit-gate", "PreToolUse", "Write|Edit|MultiEdit", 10),
-    # SessionStart carries no matcher so every session source is covered; the
-    # settings schema treats an absent matcher as "all", which is how the other
-    # session-scoped hooks in a real settings file are written.
-    ClaudeHook("brainskit-status", "SessionStart", None, 15),
-)
+#: The hooks this install writes, read from the registry both sides iterate.
+#: Named here because every function below installs, registers or retires one.
+CLAUDE_HOOKS: tuple[AgentHook, ...] = agent_install(DEFAULT_AGENT).hooks
 
 GATE_REMEDIATION: dict[str, str] = {
     "wiki/": "Wiki pages are written only by the apply gate. Use: bk apply",
@@ -1863,7 +1847,7 @@ def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]
     The first one retired inherits the new block's position, so the contract
     stays where it was last read instead of moving to the end of the file.
     """
-    target = root / INSTRUCTION_FILES[agent]
+    target = root / agent_install(agent).instructions
     block = (
         f"{INSTRUCTION_START}\n"
         f"{_agent_template('instructions', vault).strip()}\n"
@@ -1976,14 +1960,14 @@ def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, An
 
 
 def _write_hook_script(
-    root: Path, vault: Path, hook: ClaudeHook, *, force: bool
+    root: Path, vault: Path, hook: AgentHook, *, force: bool
 ) -> dict[str, Any]:
     """Write one hook script, refusing to clobber a file brainskit did not write.
 
     The sentinel comment is what makes a rewrite safe: a script carrying it is
     ours to replace, and a script without it belongs to the operator.
     """
-    target = root / ".claude" / "hooks" / f"{hook.template}.sh"
+    target = root / ".claude" / "hooks" / hook.script
     content = _hook_script(hook.template, vault, root)
     existed = target.is_file()
     if existed:
@@ -2052,7 +2036,7 @@ def _is_stale_hook_command(command: Any, template: str, current: str) -> bool:
 
 
 def _retire_legacy_hook_scripts(
-    root: Path, installed: Sequence[ClaudeHook]
+    root: Path, installed: Sequence[AgentHook]
 ) -> list[dict[str, Any]]:
     """Remove the hook scripts a former brand left, when they are still ours.
 
@@ -2153,7 +2137,7 @@ def _prune_stale_hook_entries(
 
 
 def _register_claude_hooks(
-    root: Path, entries: Sequence[tuple[ClaudeHook, str]]
+    root: Path, entries: Sequence[tuple[AgentHook, str]]
 ) -> dict[str, Any]:
     """Register hook commands in `.claude/settings.json` without clobbering it.
 
@@ -2264,7 +2248,7 @@ def _install_claude_hook(
     SessionStart hook that says what the vault looks like before the first one.
     """
     scripts: dict[str, Any] = {}
-    registrable: list[tuple[ClaudeHook, str]] = []
+    registrable: list[tuple[AgentHook, str]] = []
     for hook in CLAUDE_HOOKS:
         outcome = _write_hook_script(root, vault, hook, force=force)
         scripts[hook.template] = outcome
@@ -2299,7 +2283,12 @@ def _enforcement_summary(result: dict[str, Any]) -> dict[str, Any]:
     An installer that reports only what it managed to write hides the layers it
     could not, which is exactly how an invariant ends up guarded by nothing at
     all while the install output still reads like success.
+
+    The layers come from `application.install`, which is also what `bk status`
+    reads back. Restating them here is how the two came to disagree: this side
+    knew all four agents and the reader knew one.
     """
+    install = agent_install(result["agent"])
     layers: list[dict[str, Any]] = []
     hook = result.get("claude_hook")
     if isinstance(hook, dict):
@@ -2307,37 +2296,28 @@ def _enforcement_summary(result: dict[str, Any]) -> dict[str, Any]:
         registered = {
             str(item["command"]) for item in settings.get("registered", [])
         }
-        for name, template, mechanism in (
-            (
-                "write_gate",
-                "brainskit-gate",
-                "Claude Code PreToolUse hook on Write|Edit|MultiEdit",
-            ),
-            (
-                "session_status",
-                "brainskit-status",
-                "Claude Code SessionStart hook reporting vault state",
-            ),
-        ):
-            script = hook["scripts"][template]
+        for entry in install.hooks:
+            script = hook["scripts"][entry.template]
             active = script["state"] != "skipped" and script["path"] in registered
             outcome = script if script["state"] == "skipped" else settings
             layers.append(
-                _enforcement_layer(name, mechanism, outcome, active=active)
+                _enforcement_layer(
+                    entry.layer, entry.mechanism, outcome, active=active
+                )
             )
     pre_commit = result["pre_commit"]
     layers.append(
         _enforcement_layer(
-            "commit_lint",
-            ".git/hooks/pre-commit running bk lint --changed",
+            COMMIT_LINT,
+            COMMIT_LINT_MECHANISM,
             pre_commit,
             active=pre_commit["state"] != "skipped",
         )
     )
     layers.append(
         {
-            "layer": "instructions",
-            "mechanism": f"{INSTRUCTION_FILES[result['agent']]} managed block",
+            "layer": INSTRUCTIONS,
+            "mechanism": install.instructions_mechanism,
             "active": True,
             "advisory": True,
         }
@@ -2404,7 +2384,7 @@ def _note_legacy_migration(result: dict[str, Any]) -> None:
     """
 
     lines: list[str] = []
-    instructions = result.get("instructions") or {}
+    instructions = result.get(INSTRUCTIONS) or {}
     for marker in instructions.get("migrated", []):
         lines.append(f"  - retired {marker} in {instructions['path']}")
     hook = result.get("claude_hook")
@@ -2490,19 +2470,22 @@ def _install_hooks(
     # the workspace, and reading that back afterwards would be this check
     # observing its own side effect and concluding all is well.
     advisory = _workspace_advisory(vault, workspace)
-    adapter_path = f".brain/agent-{agent}.json"
+    install = agent_install(agent)
     service.vault.write_generated(
-        adapter_path, json.dumps(_agent_policy(agent, workspace), indent=2) + "\n"
+        install.adapter, json.dumps(_agent_policy(agent, workspace), indent=2) + "\n"
     )
     result: dict[str, Any] = {
         "agent": agent,
-        "adapter": adapter_path,
+        "adapter": install.adapter,
         "workspace": str(workspace),
-        "instructions": _install_instructions(workspace, vault, agent),
+        INSTRUCTIONS: _install_instructions(workspace, vault, agent),
         "pre_commit": _install_pre_commit(workspace, vault, force=force),
     }
-    if agent == "claude":
+    # What an agent gets is registry data, not a test on its name: `bk status`
+    # reads the same two fields back to decide which layers to report.
+    if install.skill:
         result["skill"] = _install_skill(workspace, vault, force=force)
+    if install.hooks:
         result["claude_hook"] = _install_claude_hook(workspace, vault, force=force)
     if advisory is not None:
         result["workspace_advisory"] = advisory
@@ -2562,9 +2545,21 @@ def _probe_write_gate(service: BrainskitService, layers: list[dict[str, Any]]) -
     created. Denying everything is reported too -- a gate that blocks ordinary
     edits is broken in the direction that stops work rather than the direction
     that loses provenance, but it is still broken.
+
+    The layer taken is the first one naming a script, not simply the first one:
+    with two agents installed the report carries a `write_gate` row per agent,
+    and only the agent brainskit ships hooks for has a file behind it. Stopping
+    at the first would report `absent` for an installation whose gate is live.
     """
 
-    entry = next((layer for layer in layers if layer["layer"] == "write_gate"), None)
+    entry = next(
+        (
+            layer
+            for layer in layers
+            if layer["layer"] == WRITE_GATE and layer.get("script")
+        ),
+        None,
+    )
     script = Path(entry["script"]) if entry and entry.get("script") else None
     if script is None or not script.is_file():
         return {
@@ -3054,11 +3049,18 @@ def _enforcement_rows(layers: Sequence[dict[str, Any]]) -> list[list[str]]:
     the vault does not have. It says so in the layer name rather than in colour
     alone: most of this output is read through a pipe, a file or a test capture,
     and colour is stripped in all three.
+
+    A vault installed for two agents reports each agent's layers, and `Health`
+    stamps `agent` on them only then. The name carries it for the same reason it
+    carries `(advisory)`: two `commit_lint` rows with nothing between them read
+    as one layer reported twice.
     """
 
     rows: list[list[str]] = []
     for layer in layers:
         name = str(layer["layer"])
+        if layer.get("agent"):
+            name = f"{name} [{layer['agent']}]"
         detail = str(layer.get("detail", ""))
         if layer.get("advisory"):
             symbol = console.CHECK if layer["active"] else console.CROSS
