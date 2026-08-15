@@ -33,7 +33,7 @@ from typing import Any
 
 from test_engine import policy
 
-from brainskit.application import install
+from brainskit.application import doctor, install
 from brainskit.application.services import BrainskitService
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
@@ -281,13 +281,17 @@ class DoctorProbesTheGateThatExistsTest(InstalledAgentCase):
 
     def test_a_codex_only_install_has_no_gate_to_exercise(self) -> None:
         self.install("codex")
-        probe = cli._probe_write_gate(self.service, self.enforcement()["layers"])
+        probe = doctor.probe_write_gate(
+            self.service.vault, self.enforcement()["layers"]
+        )
         self.assertEqual("absent", probe["state"])
 
     def test_a_claude_install_is_exercised_even_beside_another_agent(self) -> None:
         self.install("codex")
         self.install("claude")
-        probe = cli._probe_write_gate(self.service, self.enforcement()["layers"])
+        probe = doctor.probe_write_gate(
+            self.service.vault, self.enforcement()["layers"]
+        )
         self.assertEqual("enforcing", probe["state"], probe["detail"])
 
 

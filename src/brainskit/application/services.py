@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
 from brainskit.application.codegraph import CodeGraph
 from brainskit.application.compilation import ApplyGate
+from brainskit.application.doctor import doctor_report
 from brainskit.application.enrichment import Enrichment
 from brainskit.application.filing import Filing
 from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.gate import check_write
 from brainskit.application.health import Health
+from brainskit.application.installer import install_agent
 from brainskit.application.jobs import Jobs
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.pages import (
@@ -38,6 +40,7 @@ from brainskit.application.pages import (
 )
 from brainskit.application.ports import (
     CodeExtractorPort,
+    EnvironmentPort,
     GraphPort,
     IntegrationPort,
     JobSpecPort,
@@ -489,6 +492,23 @@ class BrainskitService:
     def status(self) -> dict[str, Any]:
         """Vault health, counts and enforcement state. See `Health`."""
         return self.health.status()
+
+    def install_agent(
+        self, agent: str, *, root: str | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        """Write an agent's install into `root`. See `installer.install_agent`."""
+        return install_agent(self.vault, agent, root=root, force=force)
+
+    def doctor(
+        self, *, environment: EnvironmentPort, grammars: Mapping[str, bool]
+    ) -> dict[str, Any]:
+        """Whether this installation still enforces. See `doctor_report`."""
+        return doctor_report(
+            self.vault,
+            self.health.enforcement(),
+            environment=environment,
+            grammars=grammars,
+        )
 
     def search(
         self, query: str, limit: int = 10, *, consumer: str = "human"

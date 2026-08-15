@@ -178,6 +178,37 @@ class CodeExtractorPort(Protocol):
     def survey(self, root: Path, paths: list[Path] | None = None) -> ScanSurvey: ...
 
 
+class EnvironmentPort(Protocol):
+    """The interpreter `bk` is installed into, as far as a report needs it.
+
+    How brainskit was installed -- `uv tool`, pipx, a virtualenv, the system
+    python -- is `infrastructure`'s to classify, and `bk doctor` has to say so
+    and to name the command that adds a missing grammar *to this one*. So it
+    crosses as a parameter, the way `SyncBoundaryPort` does below, rather than
+    as an import a layer that must not reach for infrastructure would need.
+
+    Read-only throughout: the describer is a frozen value object, and nothing
+    on this side of the boundary has any business writing to it.
+    """
+
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def executable(self) -> str: ...
+
+    #: False when nothing in this environment can produce a working install
+    #: command, in which case `install_hint` explains that instead of emitting
+    #: one that will fail.
+    @property
+    def installable(self) -> bool: ...
+
+    @property
+    def label(self) -> str: ...
+
+    def install_hint(self, packages: Sequence[str]) -> str: ...
+
+
 class SyncBoundaryPort(Protocol):
     """What crosses to an integration adapter: a consumer name and one path
     predicate. Never inside the graph payload -- the graph dict stays pure

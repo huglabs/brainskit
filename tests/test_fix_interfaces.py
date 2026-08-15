@@ -14,6 +14,9 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from brainskit.application import installer
+from brainskit.application.gate import INSTRUCTION_END, INSTRUCTION_START
+from brainskit.application.install import agent_install
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import NotFoundError, ValidationError
 from brainskit.infrastructure.graph import MarkdownGraph
@@ -752,7 +755,7 @@ class AgentInstallTest(unittest.TestCase):
         return cli._install_hooks(self.service, agent, force=force)
 
     def instructions(self, agent: str = "claude") -> str:
-        target = self.root / cli.agent_install(agent).instructions
+        target = self.root / agent_install(agent).instructions
         return target.read_text(encoding="utf-8")
 
     def skill_path(self) -> Path:
@@ -782,8 +785,8 @@ class AgentInstallTest(unittest.TestCase):
         for _ in range(3):
             self.install()
         content = self.instructions()
-        self.assertEqual(content.count(cli.INSTRUCTION_START), 1)
-        self.assertEqual(content.count(cli.INSTRUCTION_END), 1)
+        self.assertEqual(content.count(INSTRUCTION_START), 1)
+        self.assertEqual(content.count(INSTRUCTION_END), 1)
 
     def test_reinstalling_is_byte_identical(self) -> None:
         self.install()
@@ -802,10 +805,8 @@ class AgentInstallTest(unittest.TestCase):
         )
         self.install()
         content = self.instructions()
-        self.assertLess(content.index("# Topo"), content.index(cli.INSTRUCTION_START))
-        self.assertGreater(
-            content.index("## Rodape"), content.index(cli.INSTRUCTION_END)
-        )
+        self.assertLess(content.index("# Topo"), content.index(INSTRUCTION_START))
+        self.assertGreater(content.index("## Rodape"), content.index(INSTRUCTION_END))
 
     def test_an_existing_skill_is_not_replaced_without_force(self) -> None:
         self.skill_path().parent.mkdir(parents=True, exist_ok=True)
@@ -829,11 +830,11 @@ class AgentInstallTest(unittest.TestCase):
     def test_templates_are_packaged_with_the_distribution(self) -> None:
         for name in ("claude-skill", "instructions"):
             with self.subTest(template=name):
-                self.assertTrue(cli._agent_template(name, self.root))
+                self.assertTrue(installer._agent_template(name, self.root))
 
     def test_an_unknown_template_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
-            cli._agent_template("does-not-exist", self.root)
+            installer._agent_template("does-not-exist", self.root)
 
 
 class WebViewerBoundaryTest(unittest.TestCase):

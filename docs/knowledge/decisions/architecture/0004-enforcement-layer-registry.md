@@ -170,3 +170,7 @@ only the rest of the table had not followed.
 - The single-`claude` report — layers, order, keys, details — is unchanged, and
   `tests/test_enforcement_status.py`, `tests/test_hooks_install.py` and
   `tests/test_session_status_hook.py` pass untouched.
+- The writer named throughout this ADR still lived in `interfaces/cli.py` when
+  it was written. **ADR 0005** moves it to `application/installer.py`, beside
+  the readers that were already here; the table this one introduced is what both
+  sides go on iterating.

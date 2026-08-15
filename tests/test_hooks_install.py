@@ -27,6 +27,13 @@ from unittest.mock import patch
 
 from test_code_graph import _HAS_CODE_EXTRA
 
+from brainskit.application import installer
+from brainskit.application.gate import (
+    HOOK_SENTINEL,
+    INSTRUCTION_END,
+    INSTRUCTION_START,
+)
+from brainskit.application.install import BRAND
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import ValidationError
 from brainskit.infrastructure.extractor import GraphifyExtractor
@@ -158,7 +165,7 @@ class HookScriptTest(VaultCase):
                 content = self.script(name).read_text(encoding="utf-8")
                 self.assertNotIn("{{vault}}", content)
                 self.assertIn(str(self.root), content)
-                self.assertIn(cli.HOOK_SENTINEL, content)
+                self.assertIn(HOOK_SENTINEL, content)
 
     def test_a_vault_path_with_spaces_and_quotes_stays_parsable(self) -> None:
         # macOS stores accented components decomposed, and real project paths
@@ -166,7 +173,7 @@ class HookScriptTest(VaultCase):
         # every write it exists to govern.
         awkward = self.root / "Protótipos e 'coisas'"
         awkward.mkdir()
-        rendered = cli._hook_script("brainskit-gate", awkward)
+        rendered = installer._hook_script("brainskit-gate", awkward)
         line = next(
             item for item in rendered.splitlines() if item.startswith("VAULT=")
         )
@@ -208,12 +215,12 @@ class HookScriptTest(VaultCase):
         target.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
         outcome = self.install(force=True)["claude_hook"]["scripts"]["brainskit-gate"]
         self.assertEqual(outcome["state"], "updated")
-        self.assertIn(cli.HOOK_SENTINEL, target.read_text(encoding="utf-8"))
+        self.assertIn(HOOK_SENTINEL, target.read_text(encoding="utf-8"))
 
     def test_a_generated_script_is_repaired_in_place(self) -> None:
         self.install()
         target = self.script("brainskit-gate")
-        target.write_text(f"{cli.HOOK_SENTINEL}\nrotted\n", encoding="utf-8")
+        target.write_text(f"{HOOK_SENTINEL}\nrotted\n", encoding="utf-8")
         target.chmod(0o644)
         outcome = self.install()["claude_hook"]["scripts"]["brainskit-gate"]
         self.assertEqual(outcome["state"], "updated")
@@ -229,7 +236,7 @@ class HookScriptTest(VaultCase):
 
     def test_a_missing_script_template_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
-            cli._hook_script("does-not-exist", self.root)
+            installer._hook_script("does-not-exist", self.root)
 
 
 class SettingsRegistrationTest(VaultCase):
@@ -499,10 +506,10 @@ class PreRenameInstallMigrationTest(VaultCase):
     blocks. That is the state every install predating the rename upgrades into.
     """
 
-    LEGACY = cli.LEGACY_BRANDS[0]
+    LEGACY = installer.LEGACY_BRANDS[0]
 
     def legacy_name(self, template: str) -> str:
-        return template.replace(cli.BRAND, self.LEGACY)
+        return template.replace(BRAND, self.LEGACY)
 
     def legacy_script(self, template: str) -> Path:
         return self.root / ".claude" / "hooks" / f"{self.legacy_name(template)}.sh"
@@ -517,9 +524,9 @@ class PreRenameInstallMigrationTest(VaultCase):
 
         hooks = self.root / ".claude" / "hooks"
         hooks.mkdir(parents=True, exist_ok=True)
-        mark = cli.HOOK_SENTINEL.replace(cli.BRAND, self.LEGACY)
+        mark = HOOK_SENTINEL.replace(BRAND, self.LEGACY)
         entries: dict[str, list[Any]] = {"PreToolUse": [], "SessionStart": []}
-        for hook in cli.CLAUDE_HOOKS:
+        for hook in installer.CLAUDE_HOOKS:
             path = self.legacy_script(hook.template)
             body = f"#!/bin/sh\n{mark} - old\nexit 0\n" if sentinel else "#!/bin/sh\nexit 0\n"
             path.write_text(body, encoding="utf-8")
@@ -534,9 +541,9 @@ class PreRenameInstallMigrationTest(VaultCase):
         )
         (self.root / "CLAUDE.md").write_text(
             "keep above\n\n"
-            f"{cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY)}\n"
+            f"{INSTRUCTION_START.replace(BRAND, self.LEGACY)}\n"
             "old contract\n"
-            f"{cli.INSTRUCTION_END.replace(cli.BRAND, self.LEGACY)}\n\n"
+            f"{INSTRUCTION_END.replace(BRAND, self.LEGACY)}\n\n"
             "keep below\n",
             encoding="utf-8",
         )
@@ -564,7 +571,7 @@ class PreRenameInstallMigrationTest(VaultCase):
         self.install(force=False)
         self.assertEqual(self.commands("PreToolUse"), [str(self.script("brainskit-gate"))])
         self.assertFalse(self.legacy_script("brainskit-gate").exists())
-        self.assertEqual(1, self.instructions().count(cli.INSTRUCTION_START))
+        self.assertEqual(1, self.instructions().count(INSTRUCTION_START))
 
     # the instruction file ----------------------------------------------------
 
@@ -572,8 +579,8 @@ class PreRenameInstallMigrationTest(VaultCase):
         self.seed_pre_rename_install()
         self.install()
         text = self.instructions()
-        self.assertEqual(1, text.count(cli.INSTRUCTION_START))
-        self.assertNotIn(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY), text)
+        self.assertEqual(1, text.count(INSTRUCTION_START))
+        self.assertNotIn(INSTRUCTION_START.replace(BRAND, self.LEGACY), text)
 
     def test_the_block_keeps_the_position_the_former_one_held(self) -> None:
         """Appending would move the contract below whatever the operator wrote
@@ -582,8 +589,8 @@ class PreRenameInstallMigrationTest(VaultCase):
         self.seed_pre_rename_install()
         self.install()
         text = self.instructions()
-        self.assertLess(text.index("keep above"), text.index(cli.INSTRUCTION_START))
-        self.assertLess(text.index(cli.INSTRUCTION_START), text.index("keep below"))
+        self.assertLess(text.index("keep above"), text.index(INSTRUCTION_START))
+        self.assertLess(text.index(INSTRUCTION_START), text.index("keep below"))
 
     def test_a_current_block_beside_a_former_one_keeps_only_the_current(self) -> None:
         """This repository's own state: both blocks present at once."""
@@ -591,25 +598,23 @@ class PreRenameInstallMigrationTest(VaultCase):
         self.seed_pre_rename_install()
         (self.root / "CLAUDE.md").write_text(
             self.instructions()
-            + f"\n{cli.INSTRUCTION_START}\ncurrent\n{cli.INSTRUCTION_END}\n",
+            + f"\n{INSTRUCTION_START}\ncurrent\n{INSTRUCTION_END}\n",
             encoding="utf-8",
         )
         before = self.instructions()
-        self.assertEqual(1, before.count(cli.INSTRUCTION_START))
-        self.assertEqual(
-            1, before.count(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY))
-        )
+        self.assertEqual(1, before.count(INSTRUCTION_START))
+        self.assertEqual(1, before.count(INSTRUCTION_START.replace(BRAND, self.LEGACY)))
         self.install()
         text = self.instructions()
-        self.assertEqual(1, text.count(cli.INSTRUCTION_START))
-        self.assertNotIn(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY), text)
+        self.assertEqual(1, text.count(INSTRUCTION_START))
+        self.assertNotIn(INSTRUCTION_START.replace(BRAND, self.LEGACY), text)
 
     # scripts on disk ---------------------------------------------------------
 
     def test_an_unedited_former_script_is_removed(self) -> None:
         self.seed_pre_rename_install()
         outcome = self.install()["claude_hook"]["legacy"]
-        for hook in cli.CLAUDE_HOOKS:
+        for hook in installer.CLAUDE_HOOKS:
             with self.subTest(hook=hook.template):
                 self.assertFalse(self.legacy_script(hook.template).exists())
         self.assertEqual({"removed"}, {item["state"] for item in outcome})
@@ -620,7 +625,7 @@ class PreRenameInstallMigrationTest(VaultCase):
 
         self.seed_pre_rename_install(sentinel=False)
         outcome = self.install()["claude_hook"]["legacy"]
-        for hook in cli.CLAUDE_HOOKS:
+        for hook in installer.CLAUDE_HOOKS:
             with self.subTest(hook=hook.template):
                 self.assertTrue(self.legacy_script(hook.template).is_file())
         self.assertEqual({"kept"}, {item["state"] for item in outcome})
@@ -664,7 +669,7 @@ class PreRenameInstallMigrationTest(VaultCase):
         warning = buffer.getvalue()
         self.assertIn("RENAME", warning)
         self.assertIn(str(self.legacy_script("brainskit-gate")), warning)
-        self.assertIn(cli.INSTRUCTION_START.replace(cli.BRAND, self.LEGACY), warning)
+        self.assertIn(INSTRUCTION_START.replace(BRAND, self.LEGACY), warning)
         self.assertIn(str(self.root / ".claude" / "skills" / self.LEGACY), warning)
 
     # controls ----------------------------------------------------------------
@@ -686,13 +691,13 @@ class PreRenameInstallMigrationTest(VaultCase):
         breaks that, this fails instead of the migration silently doing nothing.
         """
 
-        self.assertIn(cli.BRAND, cli.INSTRUCTION_START)
-        self.assertIn(cli.BRAND, cli.INSTRUCTION_END)
-        self.assertIn(cli.BRAND, cli.HOOK_SENTINEL)
-        for hook in cli.CLAUDE_HOOKS:
+        self.assertIn(BRAND, INSTRUCTION_START)
+        self.assertIn(BRAND, INSTRUCTION_END)
+        self.assertIn(BRAND, HOOK_SENTINEL)
+        for hook in installer.CLAUDE_HOOKS:
             with self.subTest(hook=hook.template):
-                self.assertTrue(hook.template.startswith(f"{cli.BRAND}-"))
-        self.assertNotIn(cli.BRAND, cli.LEGACY_BRANDS)
+                self.assertTrue(hook.template.startswith(f"{BRAND}-"))
+        self.assertNotIn(BRAND, installer.LEGACY_BRANDS)
 
 
 class EnforcementReportTest(VaultCase):
@@ -1491,7 +1496,7 @@ class PackagingTest(unittest.TestCase):
     def test_the_hook_scripts_resolve_through_importlib_resources(self) -> None:
         for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
-                self.assertIn(cli.HOOK_SENTINEL, cli._hook_script(name, Path("/tmp")))
+                self.assertIn(HOOK_SENTINEL, installer._hook_script(name, Path("/tmp")))
 
     def test_shell_templates_are_declared_as_package_data(self) -> None:
         import tomllib
@@ -1503,7 +1508,7 @@ class PackagingTest(unittest.TestCase):
     def test_every_shipped_hook_template_has_a_declaration(self) -> None:
         templates = REPO_ROOT / "src" / "brainskit" / "templates" / "agents"
         shipped = {path.name for path in templates.glob("*.sh")}
-        expected = {f"{hook.template}.sh" for hook in cli.CLAUDE_HOOKS}
+        expected = {f"{hook.template}.sh" for hook in installer.CLAUDE_HOOKS}
         self.assertEqual(shipped, expected)
 
 

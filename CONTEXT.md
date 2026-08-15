@@ -90,6 +90,25 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   `wiki/` is refused". `bk doctor` runs the gate hook on one path it must deny
   and one it must allow (`enforcing` / `not_enforcing` / `over_blocking` /
   `unknown` / `absent`), because the hook fails open by design in eight places.
+  It lives in `application/doctor.py`, apart from the installer whose output it
+  refuses to take on trust.
+- **decide here, say it there** — where `interfaces/cli.py` ends. Writing an
+  install is `application/installer.py`'s (`install_agent`); the stderr banners
+  naming an inactive layer, a superseded hook, a former brand's debris or an
+  unbuilt code graph are the CLI's, and `_install_hooks` is the four lines that
+  join them. A function that asks the operator anything, or prints, does not
+  cross. See ADR 0005.
+- **EnvironmentPort** — the one thing `bk doctor` cannot ask for itself: which
+  interpreter `bk` was installed into, and how to add a package to it. It is
+  `infrastructure`'s to classify, so it crosses as a required parameter of
+  `doctor()` rather than as an import, the way `SyncBoundaryPort` crosses into
+  `IntegrationPort.sync`. The verdict is still decided on the application side —
+  what counts as healthy is not a fact about the interpreter.
+- **not over MCP** — `install_agent` is on `BrainskitService` and deliberately
+  not a tool. It writes `.claude/settings.json`, the hook scripts and the git
+  hook: that is, it writes the write gate. An agent that can reinstall or
+  `--force` its way through those artefacts holds the switch on the mechanism
+  constraining it, with no operator watching a terminal.
 
 ## Apply
 
