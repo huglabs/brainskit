@@ -24,15 +24,19 @@ replaced without loading the rest.
 | `pages` | The page document format: render, parse, and the text helpers derived from it |
 | `privacy` | The one answer to "may this consumer see this?" |
 | `freshness` | Applied-page state and derived-artefact fingerprints |
+| `capture` | The ingestion path: what enters the vault, and what that entry disturbs |
 | `judgment` | The bounded repair loop every schema-bound job shares |
 | `compilation` | The apply gate — the only path that writes `wiki/` |
 | `retrieval` | BM25 search and the bounded evidence bundle, filtered after expansion |
+| `install` | What an install consists of per agent — the one table its writer and its readers share |
 | `health` | Structural lint, `status`, and the projection report |
 | `filing` | Propose a branch, then wait or execute per branch policy |
 | `projections` | Views, graph, exports and integrations — every path out of the vault |
 | `jobs` | `ask`, `digest`, `resurface`: model output that never reaches `wiki/` |
 | `reader` | The read-only, consumer-scoped surface the web viewer is built on |
 | `gate` | The pre-write hook's decision, standard library only |
+| `installer` | Writing an install: managed blocks, hook scripts, settings registration and the git hook |
+| `doctor` | The write-gate probe and its verdict: an install exercised, not believed |
 
 ## How the knowledge graph is formed
 

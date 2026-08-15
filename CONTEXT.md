@@ -145,3 +145,104 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   purpose: `commit` rolls back in its own `except Exception`, and a test that
   asked for a crash wants the half-finished vault a crash leaves, not the tidy
   rollback an error gets.
+
+## Ingestion
+
+- **Ingestion** — the ingestion path as one object: capture a source, sweep the
+  watched folders, decide what the new source relates to, and heal the state a
+  vanished page leaves. In `application/capture.py`, built at the composition
+  root and handed `vault`, `index` and the `FreshnessLedger`; it constructs no
+  sibling of its own. It is what makes `BrainskitService` a facade that owns
+  nothing rather than nearly nothing — see ADR 0007.
+- **relatedness floor** — a page counts as related to a capture only when it
+  shares at least `_RELATED_MIN_SHARED_TERMS` of the capture's own vocabulary,
+  measured against the page body. BM25 orders the candidates and has no
+  absolute scale, so a rank is not evidence on a small corpus; and the file
+  name contributes only what the document itself corroborates, so a suggestive
+  name cannot stand in for unrelated content. Marking a page is a durable claim
+  on a human's attention, which is why it takes a floor rather than a ranking.
+- **prune, not filter** — `_walk_source` drops an ignored directory from
+  `os.walk`'s traversal instead of rejecting its files afterwards, so
+  `node_modules` costs one comparison rather than a stat per file. The
+  observable difference is the skip count: one for the tree, not one per file
+  inside it.
+- **capture annotates, it never grades** — a capture asks the ledger to mark a
+  page for review and nothing else. `mark_reviewed` carries the never-downgrade
+  rule; this is the caller that used to lack it, and a writer that set the
+  status itself would park a stale page in `review` until the next apply.
+
+## Errors
+
+- **presentation table** — `interfaces/errors.py`'s `PRESENTATIONS`: one row per
+  `error.code`, three columns, one per surface — process exit status, HTTP
+  status, JSON-RPC code. A surface reads the column it speaks and decides
+  nothing itself. Adding a `BrainskitError` subclass without a row fails
+  `ErrorTableHasOneOwnerTest`, which reads every `code = "…"` out of the tree;
+  the fourth thing this repository was restating on both sides of a boundary.
+  See ADR 0006.
+- **status is the family, `code` is the member** — two codes may share an HTTP
+  status (`refused` and `policy_denied` are both 403) because the status
+  narrows what happened and the body's `code` names it. The reverse is what the
+  table exists to stop: one status, `400`, for every error the vault can raise.
+- **remedy decides the status** — the same rule ADR 0002 used to pick the code.
+  `conflict` is 409 because 409 means re-read and resubmit; `not_configured` is
+  501 and never 503, because 503 promises "try again later" and this code's
+  whole content is that retrying is pointless; `model_response_invalid` is 502
+  because brainskit was the gateway and the provider's output was the invalid
+  response. A status that names the wrong remedy sends an agent into a retry
+  loop that cannot terminate — the trap `proposal_id_reuse_error` records.
+- **envelope vs refusal** — `error_envelope(exc)` carries code, message and
+  enriched details; `refusal_envelope(code, …)` is for a guard that refuses
+  before an exception exists (denied Host, foreign Origin, missing token,
+  unrouted path) and omits what it has nothing to say about, rather than
+  emitting empty fields a client must test for.
+- **install hint at the render point** — a `needs` list becomes the command
+  that installs it *on this machine*. It belongs to whichever module renders
+  errors, not to whichever one happens to be the CLI: while it lived in
+  `interfaces/cli.py`, MCP and web callers got `{"needs": [...]}` and no
+  command — the failure the hint was written to end.
+- **reached the dispatcher** — MCP's line between an HTTP failure and a
+  JSON-RPC one. A `JsonRpcRequestError` (bad envelope, mismatched mirror
+  header, unsupported protocol version) is `-32600` **and** a real 400;
+  anything raised by the call inside answers 200 with the error in the body,
+  per the Streamable HTTP spec. So `not_found` is 404 in the viewer and 200
+  over MCP, and that is two protocols, not two tables.
+- **surface default vs domain parse** — `Consumer.parse` (ADR 0001) is the one
+  place an unknown consumer becomes an error. Which boundary an *unnamed* read
+  runs under is the surface's own decision and lives in
+  `_consumer_for_args(args, *, default)`: `human` for an interactive read, with
+  a `--json` caller required to declare instead; `local` for a read whose
+  output is a file or a graph, with no refusal, because the artifact outlives
+  the command.
+
+## Vendored extraction
+
+- **Vendored tree** — `infrastructure/codeanalysis/`, 27,618 lines of Graphify
+  against 22,393 first-party: 57% of this repository is code we may not edit.
+  `NOTICE` is the contract; adaptation lives outside, in the adapter.
+- **graphify alias** — the synthetic top-level package
+  `codeanalysis/__init__.py` registers, so vendored files keep importing each
+  other by upstream's absolute names without being edited. Reach a vendored
+  module through `graphify.<module>` and never by its real dotted path:
+  importing one file both ways imports it twice, under two names, with two sets
+  of module-level state. That is a rule, not a preference — the suite once broke
+  it in nine places and ran against two `_DISPATCH` tables and two resolver
+  registries holding nine identically-named, non-identical resolvers.
+  Enforced as source text by `VendoredModulesAreReachedOnlyThroughTheAliasTest`;
+  the shim itself is the one exemption.
+- **CodeExtractorPort** — the seam brainskit owns over the vendored extractor
+  (`extract`, `available`, `survey`) and the only surface behavioural tests bind
+  to. Binding to `graphify.extract` instead would tie tests to the thing a
+  re-vendor is most likely to move.
+- **Language corpus** — `tests/fixtures/<language>/{source/, expected.json}`,
+  discovered rather than listed, one directory per language. Chosen for spread
+  across the three extractor paradigms (`config-engine`,
+  `standalone-tree-sitter`, `no-grammar`), declared per fixture, not for count.
+  Nodes and edges compared in full as a normalised projection: sorted,
+  path-relative, posix, JSON-native, nothing dropped.
+- **Regeneration verdict** — a golden is a claim about inputs → outputs, so
+  `--regenerate` records the sha256 of every fixture source and classifies
+  before writing: sources changed → written; nothing changed → no-op; sources
+  unchanged and graph changed → **refused**, with the diff. That last case is
+  the regression case by definition, and unlocking it takes a second,
+  differently-named flag. A golden any red build can refresh is not a test.
