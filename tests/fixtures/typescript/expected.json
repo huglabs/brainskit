@@ -1,0 +1,132 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "inventory",
+      "source_file": "inventory.ts",
+      "source_location": "L1",
+      "target": "inventory_item",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "inventory",
+      "source_file": "inventory.ts",
+      "source_location": "L19",
+      "target": "inventory_restock",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "inventory",
+      "source_file": "inventory.ts",
+      "source_location": "L6",
+      "target": "inventory_warehouse",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "inventory_restock",
+      "source_file": "inventory.ts",
+      "source_location": "L20",
+      "target": "inventory_warehouse_add",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "inventory_restock",
+      "source_file": "inventory.ts",
+      "source_location": "L21",
+      "target": "inventory_warehouse_count",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "inventory_warehouse",
+      "source_file": "inventory.ts",
+      "source_location": "L9",
+      "target": "inventory_warehouse_add",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "inventory_warehouse",
+      "source_file": "inventory.ts",
+      "source_location": "L13",
+      "target": "inventory_warehouse_count",
+      "weight": 1.0
+    }
+  ],
+  "language": "typescript",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory",
+      "label": "inventory.ts",
+      "source_file": "inventory.ts",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_item",
+      "label": "Item",
+      "source_file": "inventory.ts",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_restock",
+      "label": "restock()",
+      "source_file": "inventory.ts",
+      "source_location": "L19"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_warehouse",
+      "label": "Warehouse",
+      "source_file": "inventory.ts",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_warehouse_add",
+      "label": ".add()",
+      "source_file": "inventory.ts",
+      "source_location": "L9"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_warehouse_count",
+      "label": ".count()",
+      "source_file": "inventory.ts",
+      "source_location": "L13"
+    }
+  ],
+  "paradigm": "config-engine",
+  "sources": {
+    "inventory.ts": "f29faa9020c7f7a7e7e069f5bb215425f8a8473f83fb35cfbbce44c832b2705f"
+  }
+}

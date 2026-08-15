@@ -1,0 +1,114 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L6",
+      "target": "scheduler_scheduler",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports",
+      "source": "scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L3",
+      "target": "arraylist",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports",
+      "source": "scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L4",
+      "target": "list",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "scheduler_scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L17",
+      "target": "scheduler_scheduler_drain",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "scheduler_scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L13",
+      "target": "scheduler_scheduler_pending",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "scheduler_scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L9",
+      "target": "scheduler_scheduler_submit",
+      "weight": 1.0
+    }
+  ],
+  "language": "java",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "scheduler",
+      "label": "Scheduler.java",
+      "source_file": "Scheduler.java",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "scheduler_scheduler",
+      "label": "Scheduler",
+      "source_file": "Scheduler.java",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "scheduler_scheduler_drain",
+      "label": ".drain()",
+      "source_file": "Scheduler.java",
+      "source_location": "L17"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "scheduler_scheduler_pending",
+      "label": ".pending()",
+      "source_file": "Scheduler.java",
+      "source_location": "L13"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "scheduler_scheduler_submit",
+      "label": ".submit()",
+      "source_file": "Scheduler.java",
+      "source_location": "L9"
+    }
+  ],
+  "paradigm": "config-engine",
+  "sources": {
+    "Scheduler.java": "000cc737251027027f71e555cb01ce07e8e80e8d0abd83692acd80efbe74aeab"
+  }
+}

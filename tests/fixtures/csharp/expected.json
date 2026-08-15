@@ -1,0 +1,300 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "repository",
+      "source_file": "Repository.cs",
+      "source_location": "L3",
+      "target": "csharp_namespace:93a9d4b62c49df49",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "repository",
+      "source_file": "Repository.cs",
+      "source_location": "L5",
+      "target": "repository_fixtures_irepository",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "repository",
+      "source_file": "Repository.cs",
+      "source_location": "L10",
+      "target": "repository_fixtures_repository",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "repository",
+      "source_file": "Repository.cs",
+      "source_location": "L25",
+      "target": "repository_fixtures_seeder",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "metadata": {
+        "scope_kind": "file",
+        "target_fqn": "System.Collections.Generic",
+        "using_kind": "namespace"
+      },
+      "relation": "imports",
+      "source": "repository",
+      "source_file": "Repository.cs",
+      "source_location": "L1",
+      "target": "system_collections_generic",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "repository_fixtures_irepository",
+      "source_file": "Repository.cs",
+      "source_location": "L7",
+      "target": "repository_fixtures_irepository_count",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "metadata": {
+        "ref_token": "IRepository"
+      },
+      "relation": "implements",
+      "source": "repository_fixtures_repository",
+      "source_file": "Repository.cs",
+      "source_location": "L10",
+      "target": "repository_fixtures_irepository",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "repository_fixtures_repository",
+      "source_file": "Repository.cs",
+      "source_location": "L19",
+      "target": "repository_fixtures_repository_count",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "repository_fixtures_repository",
+      "source_file": "Repository.cs",
+      "source_location": "L14",
+      "target": "repository_fixtures_repository_insert",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "field",
+      "metadata": {
+        "ref_token": "List"
+      },
+      "relation": "references",
+      "source": "repository_fixtures_repository",
+      "source_file": "Repository.cs",
+      "source_location": "L12",
+      "target": "list",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "repository_fixtures_seeder",
+      "source_file": "Repository.cs",
+      "source_location": "L27",
+      "target": "repository_fixtures_seeder_seed",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "INFERRED",
+      "confidence_score": 0.8,
+      "context": "call",
+      "relation": "calls",
+      "source": "repository_fixtures_seeder_seed",
+      "source_file": "Repository.cs",
+      "source_location": "L30",
+      "target": "repository_fixtures_repository_count",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "INFERRED",
+      "confidence_score": 0.8,
+      "context": "call",
+      "relation": "calls",
+      "source": "repository_fixtures_seeder_seed",
+      "source_file": "Repository.cs",
+      "source_location": "L29",
+      "target": "repository_fixtures_repository_insert",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "parameter_type",
+      "metadata": {
+        "ref_token": "Repository"
+      },
+      "relation": "references",
+      "source": "repository_fixtures_seeder_seed",
+      "source_file": "Repository.cs",
+      "source_location": "L27",
+      "target": "repository_fixtures_repository",
+      "weight": 1.0
+    }
+  ],
+  "language": "csharp",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "csharp_namespace:93a9d4b62c49df49",
+      "label": "Fixtures",
+      "metadata": {
+        "kind": "csharp_namespace",
+        "namespace": "Fixtures"
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L3",
+      "type": "namespace"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "list",
+      "label": "List",
+      "source_file": ".",
+      "source_location": ""
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository",
+      "label": "Repository.cs",
+      "source_file": "Repository.cs",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_irepository",
+      "label": "IRepository",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L5"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_irepository_count",
+      "label": ".Count()",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L7"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_repository",
+      "label": "Repository",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L10"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_repository_count",
+      "label": ".Count()",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L19"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_repository_insert",
+      "label": ".Insert()",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L14"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_seeder",
+      "label": "Seeder",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L25"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "repository_fixtures_seeder_seed",
+      "label": ".Seed()",
+      "metadata": {
+        "namespace": "Fixtures",
+        "scope_chain": [
+          "s35"
+        ]
+      },
+      "source_file": "Repository.cs",
+      "source_location": "L27"
+    }
+  ],
+  "paradigm": "config-engine",
+  "sources": {
+    "Repository.cs": "6a053a9ab21601fa1f34d8bf4ecc95d6d8d33ebc80d43047cb580e2d0143b07c"
+  }
+}

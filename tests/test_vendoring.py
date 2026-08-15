@@ -498,6 +498,132 @@ class VendoredAnalysisIsUnreachableTest(unittest.TestCase):
         self.assertEqual(importers, ["application/codegraph.py"])
 
 
+class VendoredModulesAreReachedOnlyThroughTheAliasTest(unittest.TestCase):
+    """One file on disk must not become two module objects.
+
+    `codeanalysis/__init__.py` registers a synthetic top-level `graphify`
+    package whose `__path__` points at this directory, so the vendored files
+    can keep importing each other by upstream's own absolute names without
+    being edited. Its docstring then states the condition that makes the alias
+    safe, in a sentence that is a rule rather than a description: *nothing
+    outside this file should import a sibling module here by its real dotted
+    path*. Import one both ways and Python imports the same file twice, under
+    two names, producing two module objects with two sets of module-level
+    state.
+
+    That rule had no enforcement, and the test suite was breaking it. Nine
+    imports in `test_code_grammars.py` reached the vendored tree by its
+    brainskit path while production (`infrastructure/extractor.py`) reaches it
+    through `graphify.*`, so the tests were exercising a second copy of the
+    extractor -- an instance no caller ever runs. Measured rather than
+    reasoned about, on this tree:
+
+        graphify.extract is brainskit…codeanalysis.extract   False
+        same `extract` function object                        False
+        same `_DISPATCH`                                      False
+        same `_XAML_CSHARP_CLASS_CACHE`                       False
+        two resolver registries, 9 resolvers each, no shared object
+        7 vendored modules loaded under the brainskit path,
+        39 under graphify
+
+    Both registries happened to hold resolvers of the same nine names, which is
+    what makes this the quiet kind of bug: everything looks right until state
+    written through one path is read through the other. `extract.py` itself
+    mixes the two styles (`from .cache` beside `from graphify.ids`), so the
+    fork is one import statement away at all times and is invisible in any
+    diff.
+
+    Checked as source text, the way `VENDORED_SOURCE` pins bytes rather than
+    behaviour: an import is a property of the file, so reading the file is the
+    direct measurement. Asserting it at runtime would only catch the modules a
+    given test run happened to import.
+    """
+
+    #: The alias shim, and the one file allowed to name what it aliases -- it
+    #: documents the discipline, and its docstring necessarily spells out the
+    #: path it is telling everyone else not to use.
+    SHIM = VENDORED / "__init__.py"
+
+    VENDOR_PACKAGE = "brainskit.infrastructure.codeanalysis"
+
+    #: The package itself is fine and is what `extractor.py` imports for the
+    #: alias's side effect; a dot and a submodule name after it is the fork.
+    #: Built with `re.escape` so this file does not match its own pattern.
+    SUBMODULE = re.compile(re.escape(VENDOR_PACKAGE) + r"\.[A-Za-z_]\w*")
+
+    def python_files(self) -> list[Path]:
+        roots = (PACKAGE, ROOT / "tests", ROOT / "benchmarks", ROOT / "scripts")
+        return sorted(
+            path
+            for root in roots
+            if root.is_dir()
+            for path in root.rglob("*.py")
+            if "__pycache__" not in path.parts
+        )
+
+    def test_no_module_outside_the_shim_names_a_vendored_submodule(self) -> None:
+        offenders = []
+        for path in self.python_files():
+            if path == self.SHIM:
+                continue
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                match = self.SUBMODULE.search(line)
+                if match:
+                    offenders.append(
+                        f"{path.relative_to(ROOT)}:{number}: {match.group(0)}"
+                    )
+        self.assertEqual(
+            offenders,
+            [],
+            "these reach a vendored module by its real dotted path, which "
+            "imports the file a second time under a second name and gives it "
+            "its own module-level caches. Import it through `graphify.<module>` "
+            f"instead -- after `import {self.VENDOR_PACKAGE}` has registered "
+            f"the alias: {offenders}",
+        )
+
+    def test_the_sweep_actually_reads_the_repository(self) -> None:
+        """Control: an empty sweep would pass the assertion above vacuously."""
+
+        found = self.python_files()
+        self.assertGreater(len(found), 50, "the sweep found almost no source")
+        self.assertIn(self.SHIM, found, "the exempted file is not even scanned")
+
+    def test_the_shim_is_the_only_file_that_needs_the_exemption(self) -> None:
+        """Control: the exemption must be earning its keep, not covering drift.
+
+        If the shim ever stopped naming the path it aliases, the exemption
+        would be dead code that silently widens the moment someone adds a file
+        beside it.
+        """
+
+        self.assertTrue(self.SUBMODULE.search(self.SHIM.read_text(encoding="utf-8")))
+
+    def test_first_party_code_does_reach_the_vendored_tree_through_the_alias(
+        self,
+    ) -> None:
+        """Control: the rule must not be satisfiable by importing nothing.
+
+        `VendoredAnalysisIsUnreachableTest` makes the same argument for
+        `cluster`; this is the general form. A repository that had stopped
+        using the vendored extractor altogether would pass the assertion above
+        while saying nothing about import discipline.
+        """
+
+        importers = [
+            str(path.relative_to(ROOT))
+            for path in self.python_files()
+            if not path.is_relative_to(VENDORED)
+            and re.search(
+                r"\bfrom graphify[. ]|\bimport graphify\b",
+                path.read_text(encoding="utf-8"),
+            )
+        ]
+        self.assertTrue(importers, "nothing imports the vendored tree at all")
+
+
 class ReleaseGateIsolationTest(unittest.TestCase):
     """The gate must not modify the machine it is run on.
 

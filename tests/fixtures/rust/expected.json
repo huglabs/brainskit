@@ -1,0 +1,257 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "parser",
+      "source_file": "parser.rs",
+      "source_location": "L3",
+      "target": "parser_config",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "parser",
+      "source_file": "parser.rs",
+      "source_location": "L33",
+      "target": "parser_load",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "parser",
+      "source_file": "parser.rs",
+      "source_location": "L7",
+      "target": "parser_parse",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports_from",
+      "source": "parser",
+      "source_file": "parser.rs",
+      "source_location": "L1",
+      "target": "hashmap",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "implements",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L27",
+      "target": "parser_parse",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L22",
+      "target": "parser_config_len",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L12",
+      "target": "parser_config_new",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L28",
+      "target": "parser_config_parse",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L18",
+      "target": "parser_config_set",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "field",
+      "relation": "references",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L4",
+      "target": "hashmap",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "generic_arg",
+      "relation": "references",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L4",
+      "target": "string",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "generic_arg",
+      "relation": "references",
+      "source": "parser_config",
+      "source_file": "parser.rs",
+      "source_location": "L4",
+      "target": "string",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "return_type",
+      "relation": "references",
+      "source": "parser_config_new",
+      "source_file": "parser.rs",
+      "source_location": "L12",
+      "target": "self",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "parser_load",
+      "source_file": "parser.rs",
+      "source_location": "L34",
+      "target": "parser_config_new",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "parser_load",
+      "source_file": "parser.rs",
+      "source_location": "L36",
+      "target": "parser_config_parse",
+      "weight": 1.0
+    }
+  ],
+  "language": "rust",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "hashmap",
+      "label": "HashMap",
+      "source_file": ".",
+      "source_location": ""
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser",
+      "label": "parser.rs",
+      "source_file": "parser.rs",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_config",
+      "label": "Config",
+      "source_file": "parser.rs",
+      "source_location": "L3"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_config_len",
+      "label": ".len()",
+      "source_file": "parser.rs",
+      "source_location": "L22"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_config_new",
+      "label": ".new()",
+      "source_file": "parser.rs",
+      "source_location": "L12"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_config_parse",
+      "label": ".parse()",
+      "source_file": "parser.rs",
+      "source_location": "L28"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_config_set",
+      "label": ".set()",
+      "source_file": "parser.rs",
+      "source_location": "L18"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_load",
+      "label": "load()",
+      "source_file": "parser.rs",
+      "source_location": "L33"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "parser_parse",
+      "label": "Parse",
+      "source_file": "parser.rs",
+      "source_location": "L7"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "self",
+      "label": "Self",
+      "source_file": ".",
+      "source_location": ""
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "string",
+      "label": "String",
+      "source_file": ".",
+      "source_location": ""
+    }
+  ],
+  "paradigm": "standalone-tree-sitter",
+  "sources": {
+    "parser.rs": "26d12d5d3b4f283cc230af404b2725b406d7191d6d52a58b1b52c7f4a879e885"
+  }
+}

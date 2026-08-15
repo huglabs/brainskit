@@ -1,0 +1,384 @@
+{
+  "cross_file": true,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "ledger",
+      "source_file": "ledger.py",
+      "source_location": "L6",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "ledger",
+      "source_file": "ledger.py",
+      "source_location": "L26",
+      "target": "ledger_open_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "ledger",
+      "source_file": "ledger.py",
+      "source_location": "L22",
+      "target": "ledger_overdrafterror",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "ledger_account",
+      "source_file": "ledger.py",
+      "source_location": "L13",
+      "target": "ledger_account_credit",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "ledger_account",
+      "source_file": "ledger.py",
+      "source_location": "L17",
+      "target": "ledger_account_debit",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "ledger_account",
+      "source_file": "ledger.py",
+      "source_location": "L9",
+      "target": "ledger_account_init",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "ledger_open_account",
+      "source_file": "ledger.py",
+      "source_location": "L27",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "return_type",
+      "relation": "references",
+      "source": "ledger_open_account",
+      "source_file": "ledger.py",
+      "source_location": "L26",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "inherits",
+      "source": "ledger_overdrafterror",
+      "source_file": "ledger.py",
+      "source_location": "L22",
+      "target": "exception",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "rationale_for",
+      "source": "ledger_rationale_1",
+      "source_file": "ledger.py",
+      "source_location": "L1",
+      "target": "ledger",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "rationale_for",
+      "source": "ledger_rationale_23",
+      "source_file": "ledger.py",
+      "source_location": "L23",
+      "target": "ledger_overdrafterror",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "rationale_for",
+      "source": "ledger_rationale_7",
+      "source_file": "ledger.py",
+      "source_location": "L7",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "postings",
+      "source_file": "postings.py",
+      "source_location": "L15",
+      "target": "postings_bootstrap",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "postings",
+      "source_file": "postings.py",
+      "source_location": "L8",
+      "target": "postings_transfer",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports",
+      "source": "postings",
+      "source_file": "postings.py",
+      "source_location": "L5",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports",
+      "source": "postings",
+      "source_file": "postings.py",
+      "source_location": "L5",
+      "target": "ledger_open_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports",
+      "source": "postings",
+      "source_file": "postings.py",
+      "source_location": "L5",
+      "target": "ledger_overdrafterror",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports_from",
+      "source": "postings",
+      "source_file": "postings.py",
+      "source_location": "L5",
+      "target": "ledger",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "postings_bootstrap",
+      "source_file": "postings.py",
+      "source_location": "L16",
+      "target": "ledger_open_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "return_type",
+      "relation": "references",
+      "source": "postings_bootstrap",
+      "source_file": "postings.py",
+      "source_location": "L15",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "rationale_for",
+      "source": "postings_rationale_1",
+      "source_file": "postings.py",
+      "source_location": "L1",
+      "target": "postings",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "postings_transfer",
+      "source_file": "postings.py",
+      "source_location": "L10",
+      "target": "ledger_overdrafterror",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "parameter_type",
+      "relation": "references",
+      "source": "postings_transfer",
+      "source_file": "postings.py",
+      "source_location": "L8",
+      "target": "ledger_account",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "parameter_type",
+      "relation": "references",
+      "source": "postings_transfer",
+      "source_file": "postings.py",
+      "source_location": "L8",
+      "target": "ledger_account",
+      "weight": 1.0
+    }
+  ],
+  "language": "python",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "exception",
+      "label": "Exception",
+      "source_file": ".",
+      "source_location": ""
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger",
+      "label": "ledger.py",
+      "source_file": "ledger.py",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger_account",
+      "label": "Account",
+      "source_file": "ledger.py",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger_account_credit",
+      "label": ".credit()",
+      "source_file": "ledger.py",
+      "source_location": "L13"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger_account_debit",
+      "label": ".debit()",
+      "source_file": "ledger.py",
+      "source_location": "L17"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger_account_init",
+      "label": ".__init__()",
+      "source_file": "ledger.py",
+      "source_location": "L9"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger_open_account",
+      "label": "open_account()",
+      "source_file": "ledger.py",
+      "source_location": "L26"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "ledger_overdrafterror",
+      "label": "OverdraftError",
+      "source_file": "ledger.py",
+      "source_location": "L22"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "rationale",
+      "id": "ledger_rationale_1",
+      "label": "The definitions `postings.py` imports, so the corpus has a cross-file edge.",
+      "source_file": "ledger.py",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "rationale",
+      "id": "ledger_rationale_23",
+      "label": "Raised when a debit would take an account below zero.",
+      "source_file": "ledger.py",
+      "source_location": "L23"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "rationale",
+      "id": "ledger_rationale_7",
+      "label": "A balance that can be credited and debited.",
+      "source_file": "ledger.py",
+      "source_location": "L7"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "postings",
+      "label": "postings.py",
+      "source_file": "postings.py",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "postings_bootstrap",
+      "label": "bootstrap()",
+      "source_file": "postings.py",
+      "source_location": "L15"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "rationale",
+      "id": "postings_rationale_1",
+      "label": "Imports from `ledger.py`: the file that makes this fixture cross-file.",
+      "source_file": "postings.py",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "postings_transfer",
+      "label": "transfer()",
+      "source_file": "postings.py",
+      "source_location": "L8"
+    }
+  ],
+  "paradigm": "config-engine",
+  "sources": {
+    "ledger.py": "e1c7fa36bbb6d4ff872be14fed496fab93cb54a88c939c92b2c9f6da50cd3df8",
+    "postings.py": "8c7be2d5b65bbedc1503c47b480f1a0c31b7692bbc75a1092d63b0553204fb86"
+  }
+}

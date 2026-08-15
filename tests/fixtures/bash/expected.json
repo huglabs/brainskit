@@ -1,0 +1,200 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "release",
+      "source_file": "release.sh",
+      "source_location": "L1",
+      "target": "release_sh__entry",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "defines",
+      "source": "release",
+      "source_file": "release.sh",
+      "source_location": "L10",
+      "target": "release_clean",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "defines",
+      "source": "release",
+      "source_file": "release.sh",
+      "source_location": "L6",
+      "target": "release_log",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "defines",
+      "source": "release",
+      "source_file": "release.sh",
+      "source_location": "L21",
+      "target": "release_main",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "defines",
+      "source": "release",
+      "source_file": "release.sh",
+      "source_location": "L15",
+      "target": "release_package",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "release_clean",
+      "source_file": "release.sh",
+      "source_location": "L11",
+      "target": "release_log",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "release_main",
+      "source_file": "release.sh",
+      "source_location": "L23",
+      "target": "release_log",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "release_main",
+      "source_file": "release.sh",
+      "source_location": "L22",
+      "target": "release_package",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "release_package",
+      "source_file": "release.sh",
+      "source_location": "L16",
+      "target": "release_clean",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "release_package",
+      "source_file": "release.sh",
+      "source_location": "L18",
+      "target": "release_log",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "release_sh__entry",
+      "source_file": "release.sh",
+      "source_location": "L26",
+      "target": "release_main",
+      "weight": 1.0
+    }
+  ],
+  "language": "bash",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "release",
+      "label": "release.sh",
+      "metadata": {
+        "kind": "file",
+        "language": "bash"
+      },
+      "source_file": "release.sh",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "release_clean",
+      "label": "clean()",
+      "metadata": {
+        "kind": "bash_function",
+        "language": "bash"
+      },
+      "source_file": "release.sh",
+      "source_location": "L10"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "release_log",
+      "label": "log()",
+      "metadata": {
+        "kind": "bash_function",
+        "language": "bash"
+      },
+      "source_file": "release.sh",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "release_main",
+      "label": "main()",
+      "metadata": {
+        "kind": "bash_function",
+        "language": "bash"
+      },
+      "source_file": "release.sh",
+      "source_location": "L21"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "release_package",
+      "label": "package()",
+      "metadata": {
+        "kind": "bash_function",
+        "language": "bash"
+      },
+      "source_file": "release.sh",
+      "source_location": "L15"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "release_sh__entry",
+      "label": "release.sh script",
+      "metadata": {
+        "kind": "bash_entrypoint",
+        "language": "bash"
+      },
+      "source_file": "release.sh",
+      "source_location": "L1"
+    }
+  ],
+  "paradigm": "standalone-tree-sitter",
+  "sources": {
+    "release.sh": "8746fa15b66a7b5bef0161b36bd4ff5fb5358ed4902424fc4f3265cbb663527d"
+  }
+}

@@ -1,0 +1,122 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "main",
+      "source_file": "main.tf",
+      "source_location": "L6",
+      "target": "source_aws_s3_bucket_artifacts",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "main",
+      "source_file": "main.tf",
+      "source_location": "L10",
+      "target": "source_aws_s3_bucket_versioning_artifacts",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "main",
+      "source_file": "main.tf",
+      "source_location": "L18",
+      "target": "source_output_artifacts_bucket_arn",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "main",
+      "source_file": "main.tf",
+      "source_location": "L1",
+      "target": "source_var_bucket_name",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "source": "source_aws_s3_bucket_artifacts",
+      "source_file": "main.tf",
+      "source_location": "L7",
+      "target": "source_var_bucket_name",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "source": "source_aws_s3_bucket_versioning_artifacts",
+      "source_file": "main.tf",
+      "source_location": "L11",
+      "target": "source_aws_s3_bucket_artifacts",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "source": "source_output_artifacts_bucket_arn",
+      "source_file": "main.tf",
+      "source_location": "L19",
+      "target": "source_aws_s3_bucket_artifacts",
+      "weight": 1.0
+    }
+  ],
+  "language": "terraform",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "main",
+      "label": "main.tf",
+      "source_file": "main.tf",
+      "source_location": null
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_aws_s3_bucket_artifacts",
+      "label": "aws_s3_bucket.artifacts",
+      "source_file": "main.tf",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_aws_s3_bucket_versioning_artifacts",
+      "label": "aws_s3_bucket_versioning.artifacts",
+      "source_file": "main.tf",
+      "source_location": "L10"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_output_artifacts_bucket_arn",
+      "label": "output.artifacts_bucket_arn",
+      "source_file": "main.tf",
+      "source_location": "L18"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_var_bucket_name",
+      "label": "var.bucket_name",
+      "source_file": "main.tf",
+      "source_location": "L1"
+    }
+  ],
+  "paradigm": "standalone-tree-sitter",
+  "sources": {
+    "main.tf": "e9db2fc29519d3edf5be0bd0f66e9932ca0754f10e49392c3d7afdeffe34cf7e"
+  }
+}

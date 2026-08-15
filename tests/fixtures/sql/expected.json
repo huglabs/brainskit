@@ -1,0 +1,104 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "schema",
+      "source_file": "schema.sql",
+      "source_location": "L1",
+      "target": "schema_authors",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "schema",
+      "source_file": "schema.sql",
+      "source_location": "L6",
+      "target": "schema_books",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "schema",
+      "source_file": "schema.sql",
+      "source_location": "L14",
+      "target": "schema_books_with_authors",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "source": "schema_books",
+      "source_file": "schema.sql",
+      "source_location": "L6",
+      "target": "schema_authors",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "reads_from",
+      "source": "schema_books_with_authors",
+      "source_file": "schema.sql",
+      "source_location": "L19",
+      "target": "schema_authors",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "reads_from",
+      "source": "schema_books_with_authors",
+      "source_file": "schema.sql",
+      "source_location": "L18",
+      "target": "schema_books",
+      "weight": 1.0
+    }
+  ],
+  "language": "sql",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "schema",
+      "label": "schema.sql",
+      "source_file": "schema.sql",
+      "source_location": null
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "schema_authors",
+      "label": "authors",
+      "source_file": "schema.sql",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "schema_books",
+      "label": "books",
+      "source_file": "schema.sql",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "schema_books_with_authors",
+      "label": "books_with_authors",
+      "source_file": "schema.sql",
+      "source_location": "L14"
+    }
+  ],
+  "paradigm": "standalone-tree-sitter",
+  "sources": {
+    "schema.sql": "b2a70afd5a0b9ca7c58a6949526460ad0cf1cb4cb2d6164ca1022183516cea57"
+  }
+}

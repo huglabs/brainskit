@@ -1,0 +1,381 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline",
+      "source_file": "pipeline.json",
+      "source_location": "L6",
+      "target": "pipeline_properties",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline",
+      "source_file": "pipeline.json",
+      "source_location": "L5",
+      "target": "pipeline_required",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline",
+      "source_file": "pipeline.json",
+      "source_location": "L2",
+      "target": "pipeline_schema",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline",
+      "source_file": "pipeline.json",
+      "source_location": "L3",
+      "target": "pipeline_title",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline",
+      "source_file": "pipeline.json",
+      "source_location": "L4",
+      "target": "pipeline_type",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_items_properties",
+      "source_file": "pipeline.json",
+      "source_location": "L18",
+      "target": "pipeline_properties_command",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_items_properties",
+      "source_file": "pipeline.json",
+      "source_location": "L15",
+      "target": "pipeline_properties_id",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties",
+      "source_file": "pipeline.json",
+      "source_location": "L7",
+      "target": "pipeline_properties_name",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties",
+      "source_file": "pipeline.json",
+      "source_location": "L24",
+      "target": "pipeline_properties_retries",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties",
+      "source_file": "pipeline.json",
+      "source_location": "L10",
+      "target": "pipeline_properties_stages",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_command",
+      "source_file": "pipeline.json",
+      "source_location": "L19",
+      "target": "pipeline_command_type",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_id",
+      "source_file": "pipeline.json",
+      "source_location": "L16",
+      "target": "pipeline_id_type",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_name",
+      "source_file": "pipeline.json",
+      "source_location": "L8",
+      "target": "pipeline_name_type",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_retries",
+      "source_file": "pipeline.json",
+      "source_location": "L26",
+      "target": "pipeline_retries_minimum",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_retries",
+      "source_file": "pipeline.json",
+      "source_location": "L25",
+      "target": "pipeline_retries_type",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_stages",
+      "source_file": "pipeline.json",
+      "source_location": "L12",
+      "target": "pipeline_stages_items",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_properties_stages",
+      "source_file": "pipeline.json",
+      "source_location": "L11",
+      "target": "pipeline_stages_type",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "extends",
+      "source": "pipeline_required",
+      "source_file": "pipeline.json",
+      "source_location": "L5",
+      "target": "ref_stages",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_stages_items",
+      "source_file": "pipeline.json",
+      "source_location": "L14",
+      "target": "pipeline_items_properties",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "pipeline_stages_items",
+      "source_file": "pipeline.json",
+      "source_location": "L13",
+      "target": "pipeline_items_type",
+      "weight": 1.0
+    }
+  ],
+  "language": "json",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline",
+      "label": "pipeline.json",
+      "source_file": "pipeline.json",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_command_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L19"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_id_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L16"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_items_properties",
+      "label": "properties",
+      "source_file": "pipeline.json",
+      "source_location": "L14"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_items_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L13"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_name_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L8"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_properties",
+      "label": "properties",
+      "source_file": "pipeline.json",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_properties_command",
+      "label": "command",
+      "source_file": "pipeline.json",
+      "source_location": "L18"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_properties_id",
+      "label": "id",
+      "source_file": "pipeline.json",
+      "source_location": "L15"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_properties_name",
+      "label": "name",
+      "source_file": "pipeline.json",
+      "source_location": "L7"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_properties_retries",
+      "label": "retries",
+      "source_file": "pipeline.json",
+      "source_location": "L24"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_properties_stages",
+      "label": "stages",
+      "source_file": "pipeline.json",
+      "source_location": "L10"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_required",
+      "label": "required",
+      "source_file": "pipeline.json",
+      "source_location": "L5"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_retries_minimum",
+      "label": "minimum",
+      "source_file": "pipeline.json",
+      "source_location": "L26"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_retries_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L25"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_schema",
+      "label": "$schema",
+      "source_file": "pipeline.json",
+      "source_location": "L2"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_stages_items",
+      "label": "items",
+      "source_file": "pipeline.json",
+      "source_location": "L12"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_stages_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L11"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_title",
+      "label": "title",
+      "source_file": "pipeline.json",
+      "source_location": "L3"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "pipeline_type",
+      "label": "type",
+      "source_file": "pipeline.json",
+      "source_location": "L4"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "concept",
+      "id": "ref_stages",
+      "label": "stages",
+      "source_file": "pipeline.json",
+      "source_location": "L5"
+    }
+  ],
+  "paradigm": "standalone-tree-sitter",
+  "sources": {
+    "pipeline.json": "1b7978740b4ec7c5d44e2359a20f1d52b5fef3fcf218b37e7f72043e622e0cfb"
+  }
+}
