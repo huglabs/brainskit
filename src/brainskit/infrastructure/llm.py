@@ -93,9 +93,7 @@ class JobSpecs:
         return template
 
     def schema(self, job: str) -> dict[str, Any] | None:
-        resource = files("brainskit").joinpath(
-            "jobs", "_output-schemas", f"{job}.json"
-        )
+        resource = files("brainskit").joinpath("jobs", "_output-schemas", f"{job}.json")
         if not resource.is_file():
             return None
         schema: dict[str, Any] = json.loads(resource.read_text(encoding="utf-8"))
@@ -169,10 +167,7 @@ class PolicyJudgmentRouter:
             raise NotConfiguredError(
                 "Job model mapping is invalid", details={"job": job}
             )
-        if (
-            effective_privacy == PrivacyMode.LOCAL_ONLY
-            and provider_name != "ollama"
-        ):
+        if effective_privacy == PrivacyMode.LOCAL_ONLY and provider_name != "ollama":
             raise PolicyError(
                 "Local-only content can only be routed to Ollama",
                 details={"branches": sorted(policies), "provider": provider_name},
@@ -208,6 +203,7 @@ class OpenAICompatibleDriver:
         timeout: float = 120,
         provider: str = "",
         api_key_env: str = "",
+        reasoning: dict[str, Any] | None = None,
     ):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key
@@ -215,6 +211,7 @@ class OpenAICompatibleDriver:
         self.timeout = timeout
         self.provider = provider
         self.api_key_env = api_key_env
+        self.reasoning = reasoning
 
     def complete(
         self, prompt: str, *, model: str, output_schema: dict[str, Any] | None
@@ -224,6 +221,8 @@ class OpenAICompatibleDriver:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
         }
+        if self.reasoning is not None:
+            payload["reasoning"] = self.reasoning
         if output_schema:
             # Strict decoding rejects a schema it cannot compile, so send the
             # projection rather than the vault's schema: `metadata` is optional
@@ -243,21 +242,56 @@ class OpenAICompatibleDriver:
             "Content-Type": "application/json",
             **self.extra_headers,
         }
-        response = _post_json(
-            self.url,
-            payload,
-            headers,
-            self.timeout,
-            context=ProviderContext(
-                provider=self.provider,
-                api_key_env=self.api_key_env,
-                model=model,
-            ),
+        context = ProviderContext(
+            provider=self.provider,
+            api_key_env=self.api_key_env,
+            model=model,
         )
         try:
-            return str(response["choices"][0]["message"]["content"])
+            response = _post_json(
+                self.url, payload, headers, self.timeout, context=context
+            )
+        except ValidationError as exc:
+            if "reasoning" not in payload or not _rejected_reasoning_option(exc):
+                raise
+            # Some endpoints serve only reasoning variants and reject being
+            # asked to skip it. Suppression is a cost and latency preference,
+            # never a correctness one, so drop it and answer the job rather
+            # than failing on an operator's choice of model.
+            payload.pop("reasoning")
+            response = _post_json(
+                self.url, payload, headers, self.timeout, context=context
+            )
+        try:
+            choice = response["choices"][0]
+            content = str(choice["message"]["content"] or "")
         except (KeyError, IndexError, TypeError) as exc:
-            raise ModelResponseError("Provider returned an unexpected response") from exc
+            raise ModelResponseError(
+                "Provider returned an unexpected response"
+            ) from exc
+        if not content.strip():
+            # A reasoning model that spends its completion budget thinking
+            # returns a well-formed response whose content is empty. Parsing
+            # that as output sends the repair loop after a schema violation it
+            # cannot fix -- three attempts, three empty strings, and an error
+            # naming JSON rather than the cause. `finish_reason` is what
+            # distinguishes the two live cases: `error` upstream, or a `stop`
+            # that stopped before writing anything.
+            raise ModelResponseError(
+                "Provider returned an empty completion",
+                details={
+                    "provider": self.provider,
+                    "model": model,
+                    "finish_reason": choice.get("finish_reason"),
+                    "remedy": (
+                        "Reasoning consumed the completion. Set "
+                        f"providers.{self.provider or '<provider>'}.reasoning "
+                        "to suppress it, or choose a model that answers "
+                        "without it."
+                    ),
+                },
+            )
+        return content
 
 
 class AnthropicDriver:
@@ -366,7 +400,9 @@ class AnthropicDriver:
                 if isinstance(block, dict) and block.get("type") == "text"
             )
         except (KeyError, TypeError) as exc:
-            raise ModelResponseError("Provider returned an unexpected response") from exc
+            raise ModelResponseError(
+                "Provider returned an unexpected response"
+            ) from exc
         if not text.strip():
             raise ModelResponseError(
                 "Provider returned no text content",
@@ -408,7 +444,9 @@ class OllamaDriver:
         try:
             return str(response["message"]["content"])
         except (KeyError, TypeError) as exc:
-            raise ModelResponseError("Provider returned an unexpected response") from exc
+            raise ModelResponseError(
+                "Provider returned an unexpected response"
+            ) from exc
 
 
 def _structured_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -520,6 +558,41 @@ def _rejected_structured_output(error: ValidationError) -> bool:
     return "output_config" in body or "output config" in body
 
 
+def _rejected_reasoning_option(error: ValidationError) -> bool:
+    """True when a 400 blames the reasoning parameter, not the payload.
+
+    Narrow for the same reason as `_rejected_structured_output`: retrying a
+    400 that meant something else drops a parameter the operator asked for and
+    then fails again for the original reason, reporting the wrong cause.
+    """
+
+    details = error.details
+    if details.get("status") != 400:
+        return False
+    return "reasoning" in str(details.get("response", "")).lower()
+
+
+def _reasoning_option(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the operator-supplied reasoning control, if any.
+
+    Passed through rather than modelled, because the shape belongs to the
+    provider -- OpenRouter alone accepts `effort`, `max_tokens`, `enabled` and
+    `exclude`, and encoding that here would date the moment one is added.
+    Absent means "send nothing", which is the pre-existing behaviour; a model
+    that reasons by default keeps doing so until an operator says otherwise.
+    """
+
+    if "reasoning" not in config:
+        return None
+    reasoning = config.get("reasoning")
+    if not isinstance(reasoning, dict):
+        raise NotConfiguredError(
+            "Provider reasoning option must be an object",
+            details={"field": "reasoning"},
+        )
+    return {str(key): value for key, value in reasoning.items()}
+
+
 def _create_driver(name: str, config: dict[str, Any]) -> ProviderDriver:
     timeout = float(config.get("timeout_seconds", 120))
     if name == "ollama":
@@ -550,12 +623,12 @@ def _create_driver(name: str, config: dict[str, Any]) -> ProviderDriver:
         base_url=_required(config, "base_url", provider=name),
         api_key=api_key,
         extra_headers={
-            str(key): str(value)
-            for key, value in config.get("headers", {}).items()
+            str(key): str(value) for key, value in config.get("headers", {}).items()
         },
         timeout=timeout,
         provider=name,
         api_key_env=api_key_env,
+        reasoning=_reasoning_option(config),
     )
 
 
@@ -620,9 +693,7 @@ class ProviderContext:
     model: str = ""
 
 
-def _http_failure(
-    status: int, body: str, context: ProviderContext
-) -> ValidationError:
+def _http_failure(status: int, body: str, context: ProviderContext) -> ValidationError:
     """Code an HTTP failure by what the caller has to do differently.
 
     Every status used to be `validation_error` -- *"the request itself is wrong,
@@ -667,9 +738,7 @@ def _http_failure(
             f"this model or endpoint. Check the account's entitlements, "
             f"billing and region -- rewriting the request will not clear this."
         )
-        return NotConfiguredError(
-            "Provider refused this key's access", details=details
-        )
+        return NotConfiguredError("Provider refused this key's access", details=details)
 
     if status == 404:
         details["hint"] = (

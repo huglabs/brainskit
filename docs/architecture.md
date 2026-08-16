@@ -99,6 +99,31 @@ schema-bound and determinism matters.
 }
 ```
 
+A reasoning model routed to an OpenAI-compatible provider can spend its whole
+completion budget thinking and return an empty answer. `providers.<name>.reasoning`
+is forwarded verbatim to control that; it is absent by default, so a model that
+reasons keeps doing so until an operator says otherwise. The shape belongs to the
+provider — OpenRouter alone accepts `effort`, `max_tokens`, `enabled` and
+`exclude` — so it is passed through rather than modelled here. An endpoint that
+refuses to skip reasoning is retried without the option, because suppression is a
+cost and latency preference and never a correctness one.
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "reasoning": { "enabled": false, "exclude": true }
+    }
+  }
+}
+```
+
+An empty completion is refused rather than returned. Passing it on sends the
+repair loop after a schema violation no retry can fix; the refusal names
+`finish_reason` and the option above instead.
+
 Anthropic, OpenAI, OpenRouter and Ollama are interchangeable drivers behind one
 job contract. Provider neutrality is a requirement rather than a preference:
 `local-only` evidence is routed to Ollama or not at all.
