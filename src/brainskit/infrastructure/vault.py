@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -31,6 +30,7 @@ from brainskit.domain.model import (
 )
 from brainskit.infrastructure.apply_transaction import ApplyTransaction
 from brainskit.infrastructure.converters import extract_document, guess_media_type
+from brainskit.infrastructure.filelock import file_lock
 from brainskit.infrastructure.index import SqliteFtsIndex
 
 #: The only directories `write_generated` may write into. Everything here is
@@ -953,34 +953,20 @@ class FileVault:
     @contextmanager
     def _registry_lock(self, *, shared: bool) -> Iterator[None]:
         path = self.root / ".brain" / "registry.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        with file_lock(path, shared=shared):
+            yield
 
     @contextmanager
     def _state_lock(self, name: str, *, shared: bool) -> Iterator[None]:
         path = self.root / ".brain" / f"{name}.lock"
-        with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        with file_lock(path, shared=shared):
+            yield
 
     @contextmanager
     def _write_lock(self) -> Iterator[None]:
         path = self.root / ".brain" / "write.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        with file_lock(path, shared=False):
+            yield
 
 
 def _resolve_record(
