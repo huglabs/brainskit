@@ -1,0 +1,39 @@
+{
+  "name": "dsh-brainskit",
+  "version": "0.1.0",
+  "description": "Brainskit durable memory bridge for DeepSeek Harness",
+  "type": "module",
+  "main": "index.js",
+  "exports": "./index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.pt-BR.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huglabs/brainskit.git",
+    "directory": "plugins/dsh-brainskit"
+  },
+  "keywords": [
+    "brainskit",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "mcp",
+    "memory"
+  ],
+  "license": "Apache-2.0",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

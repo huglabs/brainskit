@@ -11,6 +11,13 @@ artifact was built from is the durable record of what shipped.
 
 ### Added
 
+- An installable `dsh-brainskit` bundle under `plugins/dsh-brainskit`. It
+  launches Brainskit over stdio through DSH's official MCP client, contributes
+  privacy-aware memory guidance, and denies mutable wiki, filing and
+  integration operations unless the operator explicitly sets
+  `BRAINSKIT_ALLOW_MUTATIONS=1`. Append-only capture and retrieval stay
+  available in the default posture.
+
 - `providers.<name>.reasoning` on the OpenAI-compatible driver, forwarded
   verbatim to the provider. Absent by default, so a model that reasons keeps
   doing so until an operator says otherwise. Measured on OpenRouter with
