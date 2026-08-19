@@ -18,6 +18,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from brainskit.application.jobs import MAX_HISTORY_CHARS, MAX_HISTORY_EXCHANGES
+from brainskit.application.ports import ApplyPlan
 from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
@@ -344,6 +345,88 @@ class EngineTest(unittest.TestCase):
         result = response["result"]["structuredContent"]
         self.assertEqual(result["integrations"][0]["name"], "web")
         self.assertEqual(result["integrations"][0]["state"], "disabled")
+
+    def test_integration_status_hides_machine_layout_from_machine_consumers(
+        self,
+    ) -> None:
+        # One canary per disclosure class the sanctioned fix strips: a
+        # filesystem path, a directory name, a DSN, env-var names, and the
+        # runtime file listing / paths / container name a sync leaves behind.
+        self.service.integration_configure(
+            "obsidian",
+            options={
+                "path": str(self.root / "mirror-canary"),
+                "subdirectory": "layout-canary-subdir",
+            },
+        )
+        self.service.integration_configure(
+            "neo4j",
+            enabled=True,
+            managed=False,
+            options={
+                "uri": "bolt://dsn-canary-host:7687",
+                "user": "neo4j",
+                "password_env": "BRAINSKIT_CANARY_NEO4J_PASSWORD",
+                "database": "graphdb",
+                "consumer": "local",
+            },
+        )
+        self.service.integration_configure(
+            "postgres",
+            enabled=True,
+            managed=False,
+            options={
+                "dsn_env": "BRAINSKIT_CANARY_PG_DSN",
+                "consumer": "local",
+            },
+        )
+
+        def seed(state: dict) -> dict:
+            rows = state.setdefault("integrations", {})
+            rows["obsidian"] = {
+                "last_sync_at": "2026-08-14T00:00:00+00:00",
+                "path": "/tmp/canary-managed-root",
+                "managed_files": ["wiki/canary-page.md"],
+                "managed_file_count": 1,
+            }
+            rows["postgres"] = {"container": "canary-container"}
+            rows["web"] = {"log": "/tmp/canary-web.log", "pid": 4242}
+            return state
+
+        self.vault.mutate_state("integration-state", seed)
+
+        canaries = (
+            "mirror-canary",
+            "layout-canary-subdir",
+            "bolt://",
+            "BRAINSKIT_CANARY",
+            "canary-managed-root",
+            "canary-page.md",
+            "canary-container",
+            "canary-web.log",
+        )
+        human = self.service.integration_status()
+        serialized_human = json.dumps(human)
+        self.assertNotIn("consumer", human)
+        for canary in canaries:
+            self.assertIn(canary, serialized_human)
+        for consumer in ("local", "cloud"):
+            with self.subTest(consumer=consumer):
+                machine = self.service.integration_status(consumer=consumer)
+                serialized = json.dumps(machine)
+                self.assertEqual(consumer, machine["consumer"])
+                for canary in canaries:
+                    self.assertNotIn(canary, serialized)
+                by_name = {row["name"]: row for row in machine["integrations"]}
+                # The question the row exists to answer still is answered.
+                self.assertIn("state", by_name["neo4j"])
+                self.assertTrue(by_name["neo4j"]["enabled"])
+                self.assertEqual("local", by_name["neo4j"]["options"]["consumer"])
+                self.assertEqual("graphdb", by_name["neo4j"]["options"]["database"])
+                self.assertEqual(4242, by_name["web"]["runtime"]["pid"])
+                self.assertEqual(
+                    1, by_name["obsidian"]["runtime"]["managed_file_count"]
+                )
 
     def test_apply_is_idempotent_and_rejects_stale_updates(self) -> None:
         captured = self.service.capture(None, text="Evidence", title="Evidence")
@@ -772,19 +855,40 @@ class EngineTest(unittest.TestCase):
         trap = re.compile(r"[\w.\[\]]+\|\|'[^']*'\+")
         self.assertEqual(trap.findall(script.group(1)), [])
 
-    def test_web_viewer_fog_range_contains_every_node_small_and_large_graph(self) -> None:
-        # Locks the shipped formula so the Python mirror below cannot drift
-        # from what actually ships.
+    def test_web_viewer_fog_range_contains_every_node_at_every_zoom(self) -> None:
+        # This test used to check the fog range at one distance -- the one a
+        # fly-to happens to end at -- and passed the whole time scrolling out
+        # rendered a black screen: the wheel takes the camera to 1600 while a
+        # fog fitted around a ~300-unit graph ends at ~1670, so every node sat
+        # at or past the far plane and was drawn in the fog colour. The range
+        # has to hold across the whole zoom range, so the fog is refit from
+        # the camera's *current* distance on every frame.
+        self.assertIn("const FOG_NEAR_K=1.5,FOG_FAR_K=2.5,FOG_REFIT_MS=200;", WEB_VIEWER_HTML)
         self.assertIn(
-            "function flyToOrigin(R,from){let camDistTarget=Math.max(150,R*2.7);",
+            "function fitFog(dist){if(!G.scene||!G.scene.fog)return;let R=fogRadius();"
+            "G.scene.fog.near=Math.max(1,dist-R*FOG_NEAR_K);"
+            "G.scene.fog.far=dist+R*FOG_FAR_K}",
             WEB_VIEWER_HTML,
         )
-        self.assertIn(
-            "G.scene.fog.near=Math.max(20,camDistTarget-R*1.5);"
-            "G.scene.fog.far=camDistTarget+R*2.5",
-            WEB_VIEWER_HTML,
-        )
+        self.assertIn("fitFog(G.cam.dist);setCamera();", WEB_VIEWER_HTML)
+        # Nothing else may pin the fog to one distance behind the loop's back.
+        self.assertNotIn("G.scene.fog.near=Math.max(20,", WEB_VIEWER_HTML)
         self.assertIn("fog:false", WEB_VIEWER_HTML)  # star field ignores graph zoom
+
+        def fog_bounds(radius: float, dist: float) -> tuple[float, float]:
+            return max(1.0, dist - radius * 1.5), dist + radius * 2.5
+
+        # 40 = buildGraph's clamp floor; 600 = the real ~81-node knowledge
+        # graph this bug was root-caused against; 3000 = a synthetic
+        # large-graph radius, well past a ~1000+ node code graph. The
+        # distances are the wheel clamp's own ends plus the fitted distance
+        # each radius settles at.
+        for radius in (40, 600, 3000):
+            for dist in (40, max(150.0, radius * 2.7), 1600):
+                near, far = fog_bounds(radius, dist)
+                self.assertGreaterEqual(far, dist + radius, (radius, dist))
+                if dist - radius >= 1:
+                    self.assertLessEqual(near, dist - radius, (radius, dist))
 
     def test_web_viewer_hover_overlays_scale_with_camera_distance(self) -> None:
         # The bug report: a near-empty (2-node) vault has a graph radius
@@ -868,22 +972,6 @@ class EngineTest(unittest.TestCase):
             "invalidateData();if(state.source!=='code')loadGraph(state.source);load()",
             WEB_VIEWER_HTML,
         )
-
-        def fog_bounds(radius: float) -> tuple[float, float, float]:
-            cam_dist_target = max(150.0, radius * 2.7)
-            near = max(20.0, cam_dist_target - radius * 1.5)
-            far = cam_dist_target + radius * 2.5
-            return cam_dist_target, near, far
-
-        # 40 = buildGraph's clamp floor; 600 = the real ~81-node knowledge
-        # graph this bug was root-caused against; 3000 = a synthetic
-        # large-graph radius, well past a ~1000+ node code graph.
-        for radius in (40, 600, 3000):
-            cam_dist_target, near, far = fog_bounds(radius)
-            nearest_possible_node = cam_dist_target - radius
-            farthest_possible_node = cam_dist_target + radius
-            self.assertLessEqual(near, nearest_possible_node, radius)
-            self.assertGreaterEqual(far, farthest_possible_node, radius)
 
     def test_web_viewer_static_assets_cache_while_dynamic_responses_do_not(self) -> None:
         server = build_server(
@@ -2930,14 +3018,16 @@ class ProposalIdReuseNamesATerminatingRemedyTest(unittest.TestCase):
 
         with self.assertRaises(ValidationError) as refused:
             self.vault.commit_wiki_batch(
-                {},
-                {},
-                {},
-                "agent-turn-1",
-                "0" * 64,
-                {},
-                None,
-                lambda records: 0,
+                ApplyPlan(
+                    pages={},
+                    expected_versions={},
+                    source_statuses={},
+                    proposal_id="agent-turn-1",
+                    request_hash="0" * 64,
+                    freshness_updates={},
+                    raw_move=None,
+                    index_rebuild=lambda records: 0,
+                )
             )
         locked = refused.exception
         gate = self.refusal(

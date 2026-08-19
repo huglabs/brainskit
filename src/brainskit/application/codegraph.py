@@ -41,7 +41,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from brainskit.application.ports import CodeExtractorPort, VaultPort
-from brainskit.application.privacy import _validate_consumer
 from brainskit.domain.model import (
     NotConfiguredError,
     NotFoundError,
@@ -51,6 +50,7 @@ from brainskit.domain.model import (
     ValidationError,
     utc_now,
 )
+from brainskit.domain.privacy import Consumer
 
 # The extractor's own id recipe, imported rather than copied. Node identity has
 # to agree with what the extractor minted — `import_graph` cannot re-derive an
@@ -1193,11 +1193,11 @@ class CodeGraph:
         )
 
     def _read(self, consumer: str) -> dict[str, Any]:
-        _validate_consumer(consumer)
+        parsed = Consumer.parse(consumer)
         # The boundary is checked before the graph is opened, not after it is
         # traversed: there is no filtering step that could be forgotten because
         # a code graph is all-or-nothing to a given consumer.
-        if consumer == "cloud":
+        if parsed is Consumer.CLOUD:
             raise RefusalError(
                 "The code graph is local-only",
                 details={

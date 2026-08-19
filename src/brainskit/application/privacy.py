@@ -1,44 +1,40 @@
 """The privacy boundary: which evidence a named consumer may receive.
 
-This is the smallest module in the application layer and the one with the most
-callers, which is the point. Search, context, export, the graph, the web reader
-and every integration have to answer "may this consumer see this?" identically;
-a second implementation of that question is a leak waiting to happen.
+Search, context, export, the graph, the web reader and every integration have
+to answer "may this consumer see this?" identically; a second implementation
+of that question is a leak waiting to happen.
 
-Pure functions only -- the decision depends on the branch a source lives in and
-the consumer that asked, never on how the caller reached it.
+The pure rules -- the consumer lattice, the strictest-privacy fold, branch
+policy resolution -- live in `brainskit.domain.privacy`. What this module owns
+is the binding of those rules to one vault: `for_consumer(consumer, vault)`
+builds the request-scoped `PrivacyBoundary` whose methods are the one answer
+for that consumer against that vault. Page-level provenance resolution stays
+here because `parse_frontmatter` does, and the boundary reads page content
+through the vault at decision time when resolving it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Mapping
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlparse
 
 from brainskit.application.pages import parse_frontmatter
-from brainskit.domain.model import (
-    PolicyError,
-    PrivacyMode,
-    SourceRecord,
-    ValidationError,
+from brainskit.application.ports import VaultPort
+from brainskit.domain.model import PrivacyMode, SourceRecord
+from brainskit.domain.privacy import (
+    Consumer,
+    branch_privacy,
+    record_branch,
+    strictest_privacy,
 )
 
-
-def _is_url(value: str) -> bool:
-    return urlparse(value).scheme in {"http", "https"}
-
-
-def _view_branch(record: SourceRecord) -> str:
-    parts = PurePosixPath(record.path).parts
-    return parts[1] if len(parts) > 1 else "unknown"
-
-
-def _record_branch(record: SourceRecord) -> str:
-    parts = PurePosixPath(record.path).parts
-    if len(parts) < 2 or parts[0] != "raw":
-        raise ValidationError("Source is outside raw/", details={"path": record.path})
-    return parts[1]
+__all__ = [
+    "Consumer",
+    "PrivacyBoundary",
+    "for_consumer",
+]
 
 
 def _evidence_branches(
@@ -48,64 +44,18 @@ def _evidence_branches(
 ) -> list[str]:
     content_hash = hit.get("content_hash")
     if content_hash and content_hash in records:
-        return [_record_branch(records[content_hash])]
+        return [record_branch(records[content_hash])]
     metadata, _ = parse_frontmatter(content)
     source_hashes = metadata.get("sources", [])
     if not isinstance(source_hashes, list):
         return []
     return sorted(
         {
-            _record_branch(records[content_hash])
+            record_branch(records[content_hash])
             for content_hash in source_hashes
             if content_hash in records
         }
     )
-
-
-def _context_branches(context: dict[str, Any]) -> list[str]:
-    branches = sorted(
-        {
-            branch
-            for evidence in context.get("evidence", [])
-            for branch in evidence.get("branches", [])
-        }
-    )
-    return branches or ["_inbox"]
-
-
-def _privacy_for_record(config: Any, record: SourceRecord) -> PrivacyMode:
-    branch = _record_branch(record)
-    return PrivacyMode(_branch_policy(config, branch).privacy)
-
-
-def _branch_policy(config: Any, branch: str) -> Any:
-    """The policy governing `branch`, or a refusal naming it.
-
-    This was `config.branches[branch]`, a direct subscript, where
-    `infrastructure/llm.py` already used `.get()` and raised `PolicyError` for
-    the identical question. A file dropped into a directory that is not a
-    configured branch -- then registered by the *documented* `bk reconcile` --
-    made `search`, `browse_sources`, `graph_data` and `export` raise a bare
-    `KeyError`. Not being a `BrainskitError`, it bypassed the JSON envelope and
-    the exit codes: an unhandled traceback on the CLI, a 500 in the viewer.
-    """
-
-    if branch == "_inbox":
-        return config.inbox_policy
-    policy = config.branches.get(branch)
-    if policy is None:
-        raise PolicyError(
-            "No privacy policy exists for this branch",
-            details={
-                "branch": branch,
-                "configured": sorted(config.branches),
-                "hint": (
-                    "Move the source into a configured branch with bk file, "
-                    "or add the branch to the vault policy"
-                ),
-            },
-        )
-    return policy
 
 
 def _evidence_privacy(
@@ -116,7 +66,7 @@ def _evidence_privacy(
 ) -> PrivacyMode:
     content_hash = hit.get("content_hash")
     if content_hash and content_hash in records:
-        return _privacy_for_record(config, records[content_hash])
+        return branch_privacy(config, record_branch(records[content_hash]))
     metadata, _ = parse_frontmatter(content)
     source_hashes = metadata.get("sources", [])
     if not isinstance(source_hashes, list):
@@ -143,7 +93,7 @@ def _evidence_privacy(
         # to tell. `Enrichment.privacy_of` already answers this identically.
         return PrivacyMode.NEVER_INGEST
     return strictest_privacy(
-        (_privacy_for_record(config, record) for record in resolved),
+        (branch_privacy(config, record_branch(record)) for record in resolved),
         # Unreachable: `resolved` is non-empty and fully resolved by here. Stated
         # anyway, because the parameter exists precisely so that no call site can
         # leave the question implicit.
@@ -151,48 +101,110 @@ def _evidence_privacy(
     )
 
 
-def strictest_privacy(
-    modes: Iterable[PrivacyMode], *, on_empty: PrivacyMode
-) -> PrivacyMode:
-    """The most restrictive policy in `modes`.
+def for_consumer(consumer: str | Consumer, vault: VaultPort) -> PrivacyBoundary:
+    """The one constructor: parse the consumer once, snapshot the vault once."""
 
-    Named and shared rather than repeated: derived evidence and model-inferred
-    enrichment both answer "what may this be shown to" by taking the strictest
-    policy across everything that contributed, which is the same rule the
-    judgment router applies when evidence spans branches. Two copies of a
-    privacy rule is one copy too many -- the second is where they drift.
+    return PrivacyBoundary(consumer, vault)
 
-    `on_empty` is required, and that is the whole point. This function used to
-    default an empty `modes` to `CLOUD`, justified by a docstring asserting that
-    *every* caller checks provenance resolves first. `_evidence_privacy` was a
-    caller that did not, so forgetting a `never-ingest` source declassified every
-    page built from it. An invariant that is asserted rather than enforced is
-    documentation of a bug that has not happened yet; making the answer a
-    required argument means the next caller cannot omit the decision by
-    accident.
+
+class PrivacyBoundary:
+    """Every privacy question one consumer can ask of one vault.
+
+    Request-scoped by convention: the boundary snapshots the registry and the
+    config at construction, so every answer it gives describes the vault as it
+    stood at that moment. Build one per request and let it go -- never cache a
+    boundary across writes, or it answers for a vault that no longer exists.
+    The one read it defers is page content (`evidence_privacy`, `allows_path`),
+    fetched through the vault at decision time -- the same instant it is read
+    today -- which is what closes the TOCTOU window a pre-read manifest had.
     """
 
-    collected = set(modes)
-    if not collected:
-        return on_empty
-    if PrivacyMode.NEVER_INGEST in collected:
-        return PrivacyMode.NEVER_INGEST
-    if PrivacyMode.LOCAL_ONLY in collected:
-        return PrivacyMode.LOCAL_ONLY
-    return PrivacyMode.CLOUD
+    def __init__(self, consumer: str | Consumer, vault: VaultPort) -> None:
+        self.consumer = Consumer.parse(consumer)
+        self._vault = vault
+        self._records: dict[str, SourceRecord] = dict(vault.registry())
+        self._config = vault.config()
+        self.records: Mapping[str, SourceRecord] = MappingProxyType(self._records)
 
+    def allows(self, privacy: PrivacyMode) -> bool:
+        return self.consumer.allows(privacy)
 
-def _validate_consumer(consumer: str) -> None:
-    if consumer not in {"human", "local", "cloud"}:
-        raise ValidationError(
-            "Consumer must be human, local, or cloud",
-            details={"consumer": consumer},
-        )
+    def record_privacy(self, record: SourceRecord) -> PrivacyMode:
+        return branch_privacy(self._config, record_branch(record))
 
+    def allows_record(self, record: SourceRecord) -> bool:
+        return self.allows(self.record_privacy(record))
 
-def _consumer_allows(consumer: str, privacy: PrivacyMode) -> bool:
-    if consumer == "human":
+    def evidence_privacy(
+        self, hit: dict[str, Any], content: str | None = None
+    ) -> PrivacyMode:
+        if content is None:
+            content = self._vault.read_text(str(hit["path"]))
+        return _evidence_privacy(hit, content, self._records, self._config)
+
+    def allows_evidence(self, hit: dict[str, Any], content: str | None = None) -> bool:
+        return self.allows(self.evidence_privacy(hit, content))
+
+    def evidence_branches(self, hit: dict[str, Any], content: str) -> list[str]:
+        return _evidence_branches(hit, content, self._records)
+
+    def branch_privacy(self, branch: str) -> PrivacyMode:
+        return branch_privacy(self._config, branch)
+
+    def split_records(self) -> tuple[dict[str, SourceRecord], int]:
+        """The records this consumer may see, and how many were redacted.
+
+        The count is deliberately all a caller learns about the redacted side:
+        a redacted source contributes nothing -- not its body, not its
+        filename, not its branch.
+        """
+
+        visible: dict[str, SourceRecord] = {}
+        redacted = 0
+        for content_hash, record in self._records.items():
+            if self.allows_record(record):
+                visible[content_hash] = record
+            else:
+                redacted += 1
+        return visible, redacted
+
+    def allows_path(self, relative: PurePosixPath) -> bool:
+        """Whether a vault-relative path may be copied out to this consumer.
+
+        The egress rule. The graph object was filtered carefully and then sync
+        chose files by walking the filesystem, so the boundary never reached
+        the copy: the compiled page leaked under default options and raw
+        never-ingest bytes leaked under `include_raw` -- into what is usually
+        an iCloud- or Dropbox-backed directory.
+
+        Wiki pages are judged by reading their content and resolving the
+        frontmatter provenance, at decision time. Raw files are judged by the
+        branch the path names, the way `record_branch` reads it, rather than
+        by a registry lookup: a file that landed in the inbox but has not been
+        reconciled yet still sits in a branch whose policy is known, and
+        refusing it would over-block the one directory files arrive in. A path
+        under a branch nobody configured has no policy that says it may leave,
+        so only a human may take it. Everything else (`views/`, `graph/`)
+        passes: `ProjectionService.integration_sync` regenerates those
+        filtered under this same consumer immediately before the copy -- they
+        used to be the only tree that was ever safe, and they were safe by
+        that accident rather than by this decision.
+        """
+
+        posix = relative.as_posix()
+        if posix.startswith("wiki/"):
+            content = self._vault.read_text(posix)
+            privacy = _evidence_privacy(
+                {"path": posix}, content, self._records, self._config
+            )
+            return self.allows(privacy)
+        if posix.startswith("raw/"):
+            parts = relative.parts
+            branch = parts[1] if len(parts) > 1 else ""
+            if branch == "_inbox":
+                return self.allows(PrivacyMode(self._config.inbox_policy.privacy))
+            branch_policy = self._config.branches.get(branch)
+            if branch_policy is None:
+                return self.consumer is Consumer.HUMAN
+            return self.allows(PrivacyMode(branch_policy.privacy))
         return True
-    if consumer == "local":
-        return privacy != PrivacyMode.NEVER_INGEST
-    return privacy == PrivacyMode.CLOUD

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
@@ -496,6 +497,28 @@ class GraphDataConsumerContractTest(ServiceFixture):
         self.assertGreaterEqual(payload["redacted_nodes"], 1)
 
 
+class IntegrationStatusConsumerForwardingTest(ServiceFixture):
+    """The facade hands the caller's boundary to projections untouched.
+
+    `human` stays the default so the interactive CLI keeps today's payload;
+    an interface that serves a machine must say so explicitly.
+    """
+
+    def test_the_facade_forwards_name_and_consumer(self) -> None:
+        calls: list[tuple[Any, str]] = []
+
+        def recorder(name: str | None = None, *, consumer: str = "human") -> dict:
+            calls.append((name, consumer))
+            return {"count": 0, "integrations": []}
+
+        with mock.patch.object(
+            self.service.projections, "integration_status", recorder
+        ):
+            self.service.integration_status("web", consumer="cloud")
+            self.service.integration_status()
+        self.assertEqual(calls, [("web", "cloud"), (None, "human")])
+
+
 class ContextRedactionTest(ServiceFixture):
     """`context` is the cloud payload: it may count redactions, never name them."""
 
@@ -970,7 +993,8 @@ class ObsidianSyncFiltersFilesTest(ServiceFixture):
 class UnconfiguredBranchRaisesPolicyErrorTest(ServiceFixture):
     """A bare `KeyError` escaped four read paths after the documented healing.
 
-    `_privacy_for_record` subscripted `config.branches[branch]` directly, where
+    The record-privacy rule (now `branch_privacy` in `domain/privacy.py`)
+    subscripted `config.branches[branch]` directly, where
     `infrastructure/llm.py` uses `.get()` + `PolicyError` for the identical
     question. Drop a file into a directory that is not a configured branch, run
     the *documented* `bk reconcile`, and `search`, `browse_sources`,
@@ -1047,14 +1071,14 @@ class StrictestPrivacyRefusesToGuessTest(ServiceFixture):
     """
 
     def test_an_empty_iterable_requires_an_explicit_answer(self) -> None:
-        from brainskit.application.privacy import strictest_privacy
+        from brainskit.domain.privacy import strictest_privacy
 
         with self.assertRaises(TypeError):
             strictest_privacy(iter(()))  # type: ignore[call-arg]
 
     def test_the_explicit_answer_is_honoured(self) -> None:
-        from brainskit.application.privacy import strictest_privacy
         from brainskit.domain.model import PrivacyMode
+        from brainskit.domain.privacy import strictest_privacy
 
         self.assertEqual(
             strictest_privacy(iter(()), on_empty=PrivacyMode.NEVER_INGEST),
@@ -1064,8 +1088,8 @@ class StrictestPrivacyRefusesToGuessTest(ServiceFixture):
     def test_a_non_empty_iterable_still_takes_the_strictest(self) -> None:
         """Control: the actual rule must be unchanged."""
 
-        from brainskit.application.privacy import strictest_privacy
         from brainskit.domain.model import PrivacyMode
+        from brainskit.domain.privacy import strictest_privacy
 
         self.assertEqual(
             strictest_privacy(

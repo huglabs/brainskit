@@ -6,17 +6,16 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import tempfile
 import unicodedata
-import uuid
-from collections.abc import Callable, Iterator
-from contextlib import closing, contextmanager
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
+from brainskit.application.ports import ApplyPlan, SearchIndexPort
 from brainskit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
     WIKI_DIRECTORIES,
@@ -28,10 +27,11 @@ from brainskit.domain.model import (
     ValidationError,
     VaultConfig,
     normalize_branch,
-    proposal_id_reuse_error,
     utc_now,
 )
+from brainskit.infrastructure.apply_transaction import ApplyTransaction
 from brainskit.infrastructure.converters import extract_document, guess_media_type
+from brainskit.infrastructure.index import SqliteFtsIndex
 
 #: The only directories `write_generated` may write into. Everything here is
 #: derived from `raw/` and `wiki/`, which are the source of truth.
@@ -116,6 +116,23 @@ class FileVault:
                 "Not a brainskit vault",
                 details={"vault": str(self.root), "hint": "Run bk init first"},
             )
+        #: The two-phase commit engine. Handed the unlocked accessors it needs
+        #: and nothing else -- see `ApplyTransaction`'s docstring for why it
+        #: must not be given the vault itself. Constructed without a failure
+        #: point, which is the only shape production ever builds.
+        self._apply = ApplyTransaction(
+            self.root,
+            resolve=self._resolve_relative,
+            read_registry=self._read_registry_unlocked,
+            write_registry=self._write_registry_unlocked,
+            read_state=self._read_state_unlocked,
+            write_state=self._write_state_unlocked,
+            branches=self._configured_branches,
+            page_version=self.wiki_version,
+            resolve_record=_resolve_record,
+            write_json=self._write_json,
+            write_text=self._write_text,
+        )
         with self._write_lock():
             self._ensure_runtime_state_unlocked()
             self._recover_apply_unlocked()
@@ -642,253 +659,24 @@ class FileVault:
         content_hash, _ = _hash_file(path)
         return content_hash
 
-    def commit_wiki_batch(
-        self,
-        pages: dict[str, str],
-        expected_versions: dict[str, str | None],
-        source_statuses: dict[str, str],
-        proposal_id: str,
-        request_hash: str,
-        freshness_updates: dict[str, dict[str, Any]],
-        raw_move: tuple[str, str] | None,
-        index_rebuild: Callable[[dict[str, SourceRecord]], int],
-    ) -> dict[str, Any]:
+    def commit_wiki_batch(self, plan: ApplyPlan) -> dict[str, Any]:
+        """Take the locks an apply needs, then let `ApplyTransaction` commit.
+
+        The lock ordering is load-bearing and is stated only here: `write.lock`,
+        then the registry, then `applied`, then `freshness`. `FreshnessLedger`
+        documents the same order from the other side -- `mark_applied` returns
+        entries instead of writing them precisely because a second writer
+        inside this block would take the freshness lock before the registry one
+        and deadlock against this. Whatever the engine grows to do, it does it
+        under these four locks and takes none of its own.
+        """
+
         with self._write_lock():
             self._recover_apply_unlocked()
             with self._registry_lock(shared=False), self._state_lock(
                 "applied", shared=False
             ), self._state_lock("freshness", shared=False):
-                applied = self._read_state_unlocked("applied")
-                prior = applied.get("proposals", {}).get(proposal_id)
-                if isinstance(prior, dict):
-                    if prior.get("request_hash") != request_hash:
-                        # The gate checked this before taking the lock; this is
-                        # the authoritative answer, and it has to be the *same*
-                        # answer, so both raise through one constructor.
-                        raise proposal_id_reuse_error(
-                            proposal_id,
-                            applied_request_hash=prior.get("request_hash"),
-                            request_hash=request_hash,
-                        )
-                    return {**prior, "idempotent": True}
-                for relative, expected in expected_versions.items():
-                    observed = self.wiki_version(relative)
-                    if observed != expected:
-                        raise ConflictError(
-                            "Wiki page changed after context was built",
-                            details={
-                                "path": relative,
-                                "expected": expected,
-                                "observed": observed,
-                            },
-                        )
-                records = self._read_registry_unlocked()
-                raw_move_entry: dict[str, Any] | None = None
-                if raw_move:
-                    content_hash, branch = raw_move
-                    branch = normalize_branch(branch)
-                    if branch not in self.config().branches:
-                        raise NotConfiguredError(
-                            "Destination branch is not configured",
-                            details={"branch": branch},
-                        )
-                    record = _resolve_record(records, content_hash)
-                    source = self._resolve_relative(record.path)
-                    if not source.is_file():
-                        raise NotFoundError(
-                            "Registered source file is missing",
-                            details={"path": record.path},
-                        )
-                    destination = self._transaction_move_destination(
-                        source, branch, record.content_hash
-                    )
-                    raw_move_entry = {
-                        "content_hash": record.content_hash,
-                        "source": source.relative_to(self.root).as_posix(),
-                        "destination": destination.relative_to(self.root).as_posix(),
-                        "inflight": False,
-                        "moved": False,
-                    }
-                transaction_id = uuid.uuid4().hex
-                transaction_root = (
-                    self.root / ".brain" / "transactions" / transaction_id
-                )
-                staged_root = transaction_root / "staged"
-                backup_root = transaction_root / "backups"
-                staged_root.mkdir(parents=True, exist_ok=True)
-                backup_root.mkdir(parents=True, exist_ok=True)
-                entries: list[dict[str, Any]] = []
-                for index, (relative, content) in enumerate(sorted(pages.items())):
-                    pure = PurePosixPath(relative)
-                    if (
-                        not pure.parts
-                        or pure.parts[0] != "wiki"
-                        or pure.suffix != ".md"
-                    ):
-                        raise ValidationError(
-                            "Apply can write only Markdown pages under wiki/",
-                            details={"path": relative},
-                        )
-                    target = self._resolve_relative(relative)
-                    staged = staged_root / f"{index}.md"
-                    _atomic_text(staged, content)
-                    backup = backup_root / f"{index}.md"
-                    existed = target.is_file()
-                    if existed:
-                        shutil.copy2(target, backup)
-                    entries.append(
-                        {
-                            "path": relative,
-                            "staged": staged.relative_to(self.root).as_posix(),
-                            "backup": (
-                                backup.relative_to(self.root).as_posix()
-                                if existed
-                                else None
-                            ),
-                            "existed": existed,
-                        }
-                    )
-                backup_targets = [
-                    ".brain/registry.json",
-                    ".brain/applied.json",
-                    ".brain/freshness.json",
-                    ".brain/index.db",
-                    ".brain/index.db-shm",
-                    ".brain/index.db-wal",
-                ]
-                backups: list[dict[str, Any]] = []
-                for index, relative in enumerate(backup_targets):
-                    target = self._resolve_relative(relative)
-                    existed = target.is_file()
-                    backup = backup_root / f"state-{index}.bak"
-                    if existed:
-                        shutil.copy2(target, backup)
-                    backups.append(
-                        {
-                            "target": relative,
-                            "backup": (
-                                backup.relative_to(self.root).as_posix()
-                                if existed
-                                else None
-                            ),
-                            "existed": existed,
-                        }
-                    )
-                journal = {
-                    "version": 2,
-                    "transaction_id": transaction_id,
-                    "proposal_id": proposal_id,
-                    "state": "committing",
-                    "phase": "prepared",
-                    "entries": entries,
-                    "replaced": [],
-                    "inflight": None,
-                    "backups": backups,
-                    "raw_move": raw_move_entry,
-                }
-                journal_path = self.root / ".brain" / "apply-journal.json"
-                _atomic_json(journal_path, journal)
-                try:
-                    for entry in entries:
-                        target = self._resolve_relative(entry["path"])
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        journal["inflight"] = entry["path"]
-                        _atomic_json(journal_path, journal)
-                        os.replace(self._resolve_relative(entry["staged"]), target)
-                        replaced_paths = journal["replaced"]
-                        if not isinstance(replaced_paths, list):
-                            raise ValidationError("Apply journal is corrupt")
-                        replaced_paths.append(entry["path"])
-                        journal["inflight"] = None
-                        _atomic_json(journal_path, journal)
-                    journal["phase"] = "wiki-written"
-                    _atomic_json(journal_path, journal)
-                    if raw_move_entry:
-                        source = self._resolve_relative(raw_move_entry["source"])
-                        destination = self._resolve_relative(
-                            raw_move_entry["destination"]
-                        )
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        raw_move_entry["inflight"] = True
-                        _atomic_json(journal_path, journal)
-                        os.replace(source, destination)
-                        raw_move_entry["moved"] = True
-                        raw_move_entry["inflight"] = False
-                        records[raw_move_entry["content_hash"]].path = (
-                            raw_move_entry["destination"]
-                        )
-                        _atomic_json(journal_path, journal)
-                    for content_hash, status in source_statuses.items():
-                        if content_hash not in records:
-                            raise ValidationError(
-                                "Cannot update an unknown source",
-                                details={"source_hash": content_hash},
-                            )
-                        records[content_hash].status = status
-                    self._write_registry_unlocked(records)
-                    freshness = self._read_state_unlocked("freshness")
-                    freshness["version"] = 2
-                    freshness_pages = freshness.setdefault("pages", {})
-                    for path, update in freshness_updates.items():
-                        prior_freshness = freshness_pages.get(path, {})
-                        freshness_pages[path] = {
-                            **(
-                                prior_freshness
-                                if isinstance(prior_freshness, dict)
-                                else {}
-                            ),
-                            **update,
-                        }
-                    self._write_state_unlocked("freshness", freshness)
-                    journal["phase"] = "state-written"
-                    _atomic_json(journal_path, journal)
-                    indexed_documents = index_rebuild(records)
-                    journal["phase"] = "index-written"
-                    _atomic_json(journal_path, journal)
-                    result = {
-                        "transaction_id": transaction_id,
-                        "proposal_id": proposal_id,
-                        "request_hash": request_hash,
-                        "paths": sorted(pages),
-                        "applied_at": utc_now(),
-                        "idempotent": False,
-                        "indexed_documents": indexed_documents,
-                        "raw_move": (
-                            {
-                                "content_hash": raw_move_entry["content_hash"],
-                                "from": raw_move_entry["source"],
-                                "to": raw_move_entry["destination"],
-                            }
-                            if raw_move_entry
-                            else None
-                        ),
-                    }
-                    applied.setdefault("proposals", {})[proposal_id] = result
-                    self._write_state_unlocked("applied", applied)
-                    journal["state"] = "committed"
-                    _atomic_json(journal_path, journal)
-                except Exception:
-                    self._recover_apply_unlocked()
-                    raise
-                self._cleanup_transaction_unlocked(journal)
-                return result
-
-    def _transaction_move_destination(
-        self, source: Path, branch: str, content_hash: str
-    ) -> Path:
-        destination = self.root / "raw" / branch / source.name
-        if destination == source or not destination.exists():
-            return destination
-        candidate = destination.with_name(
-            f"{destination.stem}-{content_hash[:10]}{destination.suffix}"
-        )
-        counter = 2
-        while candidate.exists():
-            candidate = destination.with_name(
-                f"{destination.stem}-{content_hash[:10]}-{counter}{destination.suffix}"
-            )
-            counter += 1
-        return candidate
+                return self._apply.commit(plan)
 
     def read_state(self, name: str) -> dict[str, Any]:
         self._validate_state_name(name)
@@ -1114,91 +902,53 @@ class FileVault:
         merged: dict[str, str],
         quarantined: list[str],
     ) -> None:
-        database = self.root / ".brain" / "index.db"
-        if not database.is_file():
-            return
-        try:
-            with closing(sqlite3.connect(database, timeout=10)) as connection:
-                with connection:
-                    for old, new in moved.items():
-                        connection.execute(
-                            "DELETE FROM search_fts WHERE path = ?", (new,)
-                        )
-                        connection.execute(
-                            "UPDATE search_fts SET path = ? WHERE path = ?", (new, old)
-                        )
-                    for old in (*merged, *quarantined):
-                        connection.execute(
-                            "DELETE FROM search_fts WHERE path = ?", (old,)
-                        )
-        except sqlite3.Error:
-            # The index is disposable: drop it and let the next reindex rebuild.
-            for suffix in ("", "-wal", "-shm"):
-                database.with_name(database.name + suffix).unlink(missing_ok=True)
+        """Tell the index where the pages went.
+
+        `merged` and `quarantined` arrive separately because the *vault* has to
+        tell them apart -- one discards a byte-identical duplicate, the other
+        preserves a divergent page outside `wiki/` -- but both leave no file at
+        the old path, which is the only thing the index can act on. Collapsing
+        them here keeps that classification on this side of the port instead of
+        asking the index to learn a legacy-directory vocabulary.
+
+        The adapter is constructed here rather than injected because this runs
+        from `__init__`, and the index is built *from* `index_path`: a vault has
+        to exist before its index can. The vault already owns where that file
+        lives, and now stops claiming to know what is inside it.
+        """
+
+        index: SearchIndexPort = SqliteFtsIndex(self.index_path)
+        index.rename_paths(moved, [*merged, *quarantined])
 
     def _recover_apply_unlocked(self) -> None:
-        journal_path = self.root / ".brain" / "apply-journal.json"
-        if not journal_path.is_file():
-            return
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        if journal.get("state") != "committed":
-            replaced = set(journal.get("replaced", []))
-            if journal.get("inflight"):
-                replaced.add(str(journal["inflight"]))
-            for entry in journal.get("entries", []):
-                path = str(entry.get("path", ""))
-                if path not in replaced:
-                    continue
-                target = self._resolve_relative(path)
-                backup = entry.get("backup")
-                if backup:
-                    shutil.copy2(self._resolve_relative(str(backup)), target)
-                else:
-                    target.unlink(missing_ok=True)
-            raw_move = journal.get("raw_move")
-            if isinstance(raw_move, dict) and (
-                raw_move.get("moved") or raw_move.get("inflight")
-            ):
-                source = self._resolve_relative(str(raw_move.get("source", "")))
-                destination = self._resolve_relative(
-                    str(raw_move.get("destination", ""))
-                )
-                source.parent.mkdir(parents=True, exist_ok=True)
-                if destination.is_file() and not source.exists():
-                    os.replace(destination, source)
-                elif destination.is_file() and source.exists():
-                    destination.unlink()
-            backups = journal.get("backups")
-            if isinstance(backups, list):
-                for entry in backups:
-                    if not isinstance(entry, dict):
-                        continue
-                    target = self._resolve_relative(str(entry.get("target", "")))
-                    target.unlink(missing_ok=True)
-                    backup = entry.get("backup")
-                    if backup:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(self._resolve_relative(str(backup)), target)
-            else:
-                for backup_key, target_name in (
-                    ("registry_backup", "registry.json"),
-                    ("applied_backup", "applied.json"),
-                ):
-                    backup = journal.get(backup_key)
-                    if backup:
-                        shutil.copy2(
-                            self._resolve_relative(str(backup)),
-                            self.root / ".brain" / target_name,
-                        )
-        self._cleanup_transaction_unlocked(journal)
+        """Roll back an interrupted apply, under the write lock.
 
-    def _cleanup_transaction_unlocked(self, journal: dict[str, Any]) -> None:
-        transaction_id = str(journal.get("transaction_id", ""))
-        if re.fullmatch(r"[0-9a-f]{32}", transaction_id):
-            transaction_root = self.root / ".brain" / "transactions" / transaction_id
-            if transaction_root.is_dir():
-                shutil.rmtree(transaction_root)
-        (self.root / ".brain" / "apply-journal.json").unlink(missing_ok=True)
+        The vault's half of recovery is the lock, the same way
+        `commit_wiki_batch` is the lock for the forward path. Called once on
+        open, so the first command after a crash finds the vault as it was.
+        """
+
+        self._apply.recover()
+
+    def _configured_branches(self) -> Collection[str]:
+        return self.config().branches
+
+    def _write_json(self, path: Path, content: dict[str, Any]) -> None:
+        """The durable-write primitive the transaction journals through.
+
+        Handed to `ApplyTransaction` rather than imported by it: how this vault
+        makes a write durable (temp file in the target's directory, fsync,
+        rename) is the vault's policy, and an engine that imported it would
+        have to import this module, which imports the engine. Resolving the
+        module global at call time also leaves exactly one place to intercept
+        every write an apply performs, which is what
+        `tests/test_apply_journal_recovery.py` patches.
+        """
+
+        _atomic_json(path, content)
+
+    def _write_text(self, path: Path, content: str) -> None:
+        _atomic_text(path, content)
 
     @contextmanager
     def _registry_lock(self, *, shared: bool) -> Iterator[None]:

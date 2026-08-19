@@ -23,6 +23,14 @@ import unittest
 from pathlib import Path
 from typing import ClassVar
 
+# Side effect only: registers the synthetic `graphify` alias in
+# `sys.modules`. Reaching a vendored module by its real dotted path
+# instead imports the same file a second time, under a second name, with
+# its own module-level caches -- so these tests would exercise a copy of
+# the extractor that production never runs. See
+# `codeanalysis/__init__.py`, and the guard in `test_vendoring.py`.
+import brainskit.infrastructure.codeanalysis  # noqa: F401
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEANALYSIS = REPO_ROOT / "src" / "brainskit" / "infrastructure" / "codeanalysis"
 
@@ -170,7 +178,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainskit.infrastructure.codeanalysis.extractors.json_config import (
+        from graphify.extractors.json_config import (
             extract_json,
         )
 
@@ -191,7 +199,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainskit.infrastructure.codeanalysis.extractors.json_config import (
+        from graphify.extractors.json_config import (
             extract_json,
         )
 
@@ -210,7 +218,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stderr
 
-        from brainskit.infrastructure.codeanalysis.extract import extract
+        from graphify.extract import extract
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -233,7 +241,7 @@ class DeliberateSkipTest(unittest.TestCase):
         import tempfile
         from contextlib import redirect_stderr
 
-        from brainskit.infrastructure.codeanalysis.extract import extract
+        from graphify.extract import extract
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -263,7 +271,7 @@ class SkipCachingTest(unittest.TestCase):
     """
 
     def build_twice(self, root: Path) -> tuple[dict, dict]:
-        from brainskit.infrastructure.codeanalysis.extract import extract
+        from graphify.extract import extract
 
         paths = [root / "data.json"]
         first = extract(paths, cache_root=root / "cache", root=root, parallel=False)
@@ -274,7 +282,7 @@ class SkipCachingTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainskit.infrastructure.codeanalysis.cache import load_cached
+        from graphify.cache import load_cached
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -294,7 +302,7 @@ class SkipCachingTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainskit.infrastructure.codeanalysis.extractors.json_config import (
+        from graphify.extractors.json_config import (
             extract_json,
         )
 
@@ -319,8 +327,8 @@ class SkipCachingTest(unittest.TestCase):
         import json
         import tempfile
 
-        from brainskit.infrastructure.codeanalysis.cache import load_cached
-        from brainskit.infrastructure.codeanalysis.extract import (
+        from graphify.cache import load_cached
+        from graphify.extract import (
             _PARALLEL_THRESHOLD,
             extract,
         )

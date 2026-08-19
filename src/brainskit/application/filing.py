@@ -20,7 +20,6 @@ from typing import Any
 from brainskit.application.compilation import ApplyGate
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import _branch_policy, _record_branch
 from brainskit.application.retrieval import Retrieval
 from brainskit.domain.model import (
     ApplyProposal,
@@ -36,6 +35,7 @@ from brainskit.domain.model import (
     normalize_branch,
     utc_now,
 )
+from brainskit.domain.privacy import record_branch, resolve_branch_policy
 
 
 class Filing:
@@ -82,7 +82,7 @@ class Filing:
             record = current_records[content_hash]
             if all_pending and record.status != "pending":
                 continue
-            branch = _record_branch(record)
+            branch = record_branch(record)
             context = self.retrieval.context(record.content_hash)
             destination, filing_reason = self._resolve_filing_destination(
                 record,
@@ -96,7 +96,7 @@ class Filing:
                 validator=self._apply_payload_failures,
             )
             apply_payload.setdefault("proposal_id", f"wiki-{uuid.uuid4().hex}")
-            filing_policy = _branch_policy(
+            filing_policy = resolve_branch_policy(
                 self.vault.config(), destination
             ).filing
             filing_proposal = FilingProposal(
@@ -221,7 +221,7 @@ class Filing:
             record = self._resolve_record(records, proposal.source_hash)
             move = (
                 (proposal.source_hash, proposal.destination_branch)
-                if _record_branch(record) != proposal.destination_branch
+                if record_branch(record) != proposal.destination_branch
                 else None
             )
             apply_result = self.gate.commit(
@@ -263,7 +263,7 @@ class Filing:
         target_branch: str | None,
     ) -> tuple[str, str]:
         config = self.vault.config()
-        current_branch = _record_branch(record)
+        current_branch = record_branch(record)
         if target_branch:
             destination = normalize_branch(target_branch)
             if destination not in config.branches:

@@ -1,10 +1,44 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from brainskit.domain.model import ScanSurvey, SearchHit, SourceRecord, VaultConfig
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyPlan:
+    """The complete description of one apply, so that a port and its adapter
+    can no longer disagree about a parameter's name.
+
+    `commit_wiki_batch` took these as eight positional parameters and had one
+    production caller, which passed all eight positionally. A positional call
+    cannot disagree about a name, so nothing noticed when the port came to
+    declare `freshness_state` while the adapter went on implementing
+    `freshness_updates` -- two live spellings of one argument, each of them
+    wrong depending on which file you were reading, and neither reachable by a
+    test that only ever *calls* the thing. The same silence hid a weaker type
+    on the port (`dict[str, Any]` for what `FreshnessLedger.mark_applied`
+    actually returns). One argument object means one spelling.
+
+    It lives beside the port rather than in `domain/model.py` because
+    `index_rebuild` is a callback into the index adapter: behaviour, not data.
+    Every value the domain holds is data that refers to nothing that runs, and
+    `DomainHasNoThirdPartyImportsTest` would not have caught this one --
+    `Callable` is stdlib -- so the placement has to be argued rather than
+    left to the guard.
+    """
+
+    pages: dict[str, str]
+    expected_versions: dict[str, str | None]
+    source_statuses: dict[str, str]
+    proposal_id: str
+    request_hash: str
+    freshness_updates: dict[str, dict[str, Any]]
+    raw_move: tuple[str, str] | None
+    index_rebuild: Callable[[dict[str, SourceRecord]], int]
 
 
 class VaultPort(Protocol):
@@ -56,17 +90,7 @@ class VaultPort(Protocol):
 
     def wiki_version(self, relative_path: str) -> str | None: ...
 
-    def commit_wiki_batch(
-        self,
-        pages: dict[str, str],
-        expected_versions: dict[str, str | None],
-        source_statuses: dict[str, str],
-        proposal_id: str,
-        request_hash: str,
-        freshness_state: dict[str, Any],
-        raw_move: tuple[str, str] | None,
-        index_rebuild: Callable[[dict[str, SourceRecord]], int],
-    ) -> dict[str, Any]: ...
+    def commit_wiki_batch(self, plan: ApplyPlan) -> dict[str, Any]: ...
 
     def read_state(self, name: str) -> dict[str, Any]: ...
 
@@ -99,6 +123,13 @@ class SearchIndexPort(Protocol):
     def upsert_raw(self, vault: VaultPort, record: SourceRecord) -> None: ...
 
     def upsert_wiki(self, vault: VaultPort, paths: Sequence[str]) -> None: ...
+
+    #: Rename indexed documents in place. Declared on the port because the
+    #: vault performs this migration and used to reach into `search_fts` --
+    #: another adapter's private schema -- to do it.
+    def rename_paths(
+        self, moved: Mapping[str, str], removed: Sequence[str]
+    ) -> None: ...
 
     def search(self, query: str, limit: int = 10) -> list[SearchHit]: ...
 
@@ -144,9 +175,49 @@ class CodeExtractorPort(Protocol):
     #: missing grammars *before* extracting, and both need this answer. Callers
     #: reach it defensively (`getattr`) so an extractor that predates it still
     #: satisfies the protocol at runtime.
-    def survey(
-        self, root: Path, paths: list[Path] | None = None
-    ) -> ScanSurvey: ...
+    def survey(self, root: Path, paths: list[Path] | None = None) -> ScanSurvey: ...
+
+
+class EnvironmentPort(Protocol):
+    """The interpreter `bk` is installed into, as far as a report needs it.
+
+    How brainskit was installed -- `uv tool`, pipx, a virtualenv, the system
+    python -- is `infrastructure`'s to classify, and `bk doctor` has to say so
+    and to name the command that adds a missing grammar *to this one*. So it
+    crosses as a parameter, the way `SyncBoundaryPort` does below, rather than
+    as an import a layer that must not reach for infrastructure would need.
+
+    Read-only throughout: the describer is a frozen value object, and nothing
+    on this side of the boundary has any business writing to it.
+    """
+
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def executable(self) -> str: ...
+
+    #: False when nothing in this environment can produce a working install
+    #: command, in which case `install_hint` explains that instead of emitting
+    #: one that will fail.
+    @property
+    def installable(self) -> bool: ...
+
+    @property
+    def label(self) -> str: ...
+
+    def install_hint(self, packages: Sequence[str]) -> str: ...
+
+
+class SyncBoundaryPort(Protocol):
+    """What crosses to an integration adapter: a consumer name and one path
+    predicate. Never inside the graph payload -- the graph dict stays pure
+    JSON data end to end."""
+
+    @property
+    def consumer(self) -> str: ...
+
+    def allows_path(self, relative: PurePosixPath) -> bool: ...
 
 
 class IntegrationPort(Protocol):
@@ -165,4 +236,9 @@ class IntegrationPort(Protocol):
 
     def down(self, name: str) -> dict[str, Any]: ...
 
-    def sync(self, name: str, graph: dict[str, Any]) -> dict[str, Any]: ...
+    def sync(
+        self,
+        name: str,
+        graph: dict[str, Any],
+        boundary: SyncBoundaryPort,
+    ) -> dict[str, Any]: ...

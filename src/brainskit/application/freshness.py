@@ -6,7 +6,31 @@ They share a module because they share a shape: both are a stored fingerprint
 compared against the live inputs, and both are read by `lint` and `status`
 through the same state file.
 
-Pure functions only; the state dict is passed in.
+`FreshnessLedger` owns `.brain/freshness.json`. Everything that reads or writes
+it goes through the ledger, because the two rules a reader depends on are
+properties of the file as a whole and cannot be enforced by any one writer:
+
+**An entry's vocabulary.** `status` (`fresh` | `review` | `stale`, and
+`unknown` for a page with no entry), `updated_at` and `content_hash` and
+`source_hashes` from the apply that wrote the page, `review_reason` and
+`review_requested_at` from whatever asked a human to look, `age_days` from the
+ageing pass, `last_resurfaced_at` from `bk resurface`.
+
+**`content_hash` means the apply gate wrote this page, and here is what it
+wrote.** Only `mark_applied` produces one. Every other transition annotates an
+entry that may or may not already have one, and an entry lacking it is an
+annotation rather than proof of provenance -- so `applied_hash` answers `None`
+for it and `wiki.outside_apply` still reports the page. Populating the field
+outside apply would make expected equal observed for bytes apply never saw,
+which blesses the tamper instead of reporting it.
+
+**Never downgrade.** `review` is a weaker claim on attention than `stale`, and
+`refresh_staleness` skips `review` entries -- so writing `review` over `stale`
+does not lower a badge, it removes the page from the ageing loop for good.
+`mark_reviewed` carries that rule once, for every caller.
+
+The pure helpers below take the state dict and are shared by both sides; the
+ledger composes them. ADR 0002 records the reasoning.
 """
 
 from __future__ import annotations
@@ -14,12 +38,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from brainskit.application.codegraph import _malformation
-from brainskit.domain.model import SourceRecord
+from brainskit.application.ports import VaultPort
+from brainskit.domain.model import PageOperation, SourceRecord, utc_now
+
+#: The state file the ledger owns, named once so no caller spells it.
+STATE = "freshness"
 
 GRAPH_PROJECTION = "graph/graph.json"
 
@@ -187,7 +215,7 @@ def _projection_source_hash(
     calling artefact actually renders, so a field only one of them shows cannot
     age the other.
 
-    What stays out: the `status` and `age_days` that `_refresh_staleness`
+    What stays out: the `status` and `age_days` that `refresh_staleness`
     rewrites on every `bk lint`. `age_days` reaches no artefact at all, and
     while a page's freshness badge does appear in `views/map/*.md`, that badge
     moves with the clock rather than with anything a user did — folding it in
@@ -232,3 +260,309 @@ def _age_in_days(timestamp: str | None, now: datetime) -> int | None:
 
 def _orphaned_freshness(state: dict[str, Any], present: set[str]) -> list[str]:
     return sorted(path for path in state.get("pages", {}) if path not in present)
+
+
+class FreshnessSnapshot:
+    """One read of the ledger, and every question asked of that read.
+
+    Request-scoped by the same convention `PrivacyBoundary` carries: a snapshot
+    is taken, questioned, and dropped -- never held across a write. Holding one
+    is what lets `lint` ask about a thousand pages while opening the state file
+    once, which is the reason this is a value rather than more methods on the
+    ledger.
+
+    Every accessor tolerates a malformed entry, because the file is on disk and
+    a hand edit is exactly the condition `lint` exists to survive. A non-dict
+    entry answers the same as a missing one.
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, state: dict[str, Any]):
+        self._state = state
+
+    @property
+    def state(self) -> dict[str, Any]:
+        """The raw state, for the one caller that reports the file itself."""
+
+        return self._state
+
+    def pages(self) -> dict[str, Any]:
+        pages = self._state.get("pages", {})
+        return pages if isinstance(pages, dict) else {}
+
+    def projections(self) -> dict[str, Any]:
+        recorded = self._state.get("projections", {})
+        return recorded if isinstance(recorded, dict) else {}
+
+    def entry(self, path: str) -> dict[str, Any] | None:
+        entry = self.pages().get(path)
+        return entry if isinstance(entry, dict) else None
+
+    def applied_hash(self, path: str) -> str | None:
+        """The hash `bk apply` recorded for this page, or None if it never did.
+
+        The tracked/annotation question, asked in one place so no reader has to
+        re-derive it. `content_hash` is written by `mark_applied` and by nothing
+        else, so its presence is what distinguishes a page the gate produced
+        from a page some other writer merely annotated.
+
+        `None` therefore covers three cases that are the same case to a reader:
+        no entry at all, an entry that is not even a dict, and an entry that
+        exists but carries no hash. All three mean the ledger cannot say what
+        this page looked like when it was written, so it cannot vouch for what
+        is on disk now. Reading the third as "tracked" is what let a
+        hand-written page under `wiki/` disappear from `wiki.outside_apply` the
+        moment any capture happened to relate to it -- the page was laundered by
+        an annotation, past the very check that backstops the write gate failing
+        open.
+        """
+
+        entry = self.entry(path)
+        if entry is None:
+            return None
+        content_hash = entry.get("content_hash")
+        return content_hash if isinstance(content_hash, str) and content_hash else None
+
+    def status(self, path: str) -> str:
+        entry = self.entry(path)
+        status = entry.get("status") if entry else None
+        return str(status) if isinstance(status, str) else "unknown"
+
+    def updated_at(self, path: str) -> str | None:
+        entry = self.entry(path)
+        return entry.get("updated_at") if entry else None
+
+    def stale_pages(self) -> list[tuple[str, Any]]:
+        """Every page currently aged out, with the age lint reports."""
+
+        return [
+            (path, entry.get("age_days", "?"))
+            for path, entry in self.pages().items()
+            if isinstance(entry, dict) and entry.get("status") == "stale"
+        ]
+
+    def summary(self, *, present: set[str] | None = None) -> dict[str, int]:
+        return _freshness_summary(self._state, present=present)
+
+    def orphans(self, present: set[str]) -> list[str]:
+        return _orphaned_freshness(self._state, present)
+
+
+class FreshnessLedger:
+    """The one owner of `.brain/freshness.json`.
+
+    Five callers used to read and write this file directly, each restating as
+    much of the entry vocabulary as it happened to need. Two of them wrote the
+    same `review` transition and only one carried the never-downgrade rule; two
+    created bare entries that a third then read as proof the apply gate had
+    written the page. Both defects are the same shape -- a rule that lives in a
+    writer rather than in the thing being written -- so both are fixed by giving
+    the file an owner and naming the transitions after the intent that reaches
+    them.
+
+    Built once, at the composition root, and handed to its collaborators. It
+    holds no state of its own: every method takes a fresh read, so the ledger is
+    safe to keep for a process's lifetime while a `FreshnessSnapshot` is not.
+    """
+
+    def __init__(self, vault: VaultPort):
+        self.vault = vault
+
+    def snapshot(self) -> FreshnessSnapshot:
+        return FreshnessSnapshot(self.vault.read_state(STATE))
+
+    # ------------------------------------------------------------ transitions
+
+    def mark_applied(
+        self,
+        operations: Sequence[PageOperation],
+        pages: Mapping[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        """The complete entry, and the only writer that records provenance.
+
+        Returned rather than committed, and that is not an inconsistency with
+        the other transitions. These entries belong to the apply transaction:
+        `commit_wiki_batch` takes the registry lock before the freshness lock
+        and both are blocking `flock`s, so a second writer reaching for
+        freshness from inside that transaction would invert the order and
+        deadlock -- the same ordering `record_projection` documents from the
+        other side. The gate hands what this builds straight to the transaction,
+        which merges it over any prior entry, so an annotation already on the
+        page survives the apply that supersedes it.
+
+        `review_reason` is cleared explicitly: an apply answers the request a
+        reviewer was asked to look at, and leaving the old reason behind would
+        keep pointing a human at work that is done.
+        """
+
+        now = utc_now()
+        return {
+            operation.relative_path: {
+                "status": "fresh",
+                "updated_at": now,
+                "content_hash": hashlib.sha256(
+                    pages[operation.relative_path].encode("utf-8")
+                ).hexdigest(),
+                "source_hashes": list(operation.source_hashes),
+                "review_reason": None,
+            }
+            for operation in operations
+        }
+
+    def mark_reviewed(self, reasons: Mapping[str, str]) -> list[str]:
+        """Ask a human to look at these pages, without ever lowering a badge.
+
+        Reached from two places that had no idea they were the same transition:
+        a capture whose content relates to a page (`bk capture`), and a page
+        whose cited code has moved on (`bk lint`). Both want the same durable
+        state -- a lint warning is read once by whoever ran lint, `review` is
+        carried by the vault until someone acts on it -- so code drift joins the
+        existing queue rather than inventing a second one.
+
+        Never downgrades. A page already `stale` has a stronger claim on
+        attention, and `refresh_staleness` skips `review`, so overwriting would
+        have taken it out of the ageing loop until the next `bk apply`. That
+        left `review` reachable only from `fresh`, which is the coherent
+        reading: a current page flagged for a human should not also age.
+
+        Takes a reason per path because the two callers differ there and only
+        there -- a capture names one source for every page it touched, code
+        drift names the file that moved for each. One call, one lock.
+
+        Returns the paths actually moved, so a caller can report what it did.
+        """
+
+        if not reasons:
+            return []
+        moved: list[str] = []
+        requested_at = utc_now()
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            pages = state.setdefault("pages", {})
+            for path, reason in reasons.items():
+                entry = pages.get(path)
+                if not isinstance(entry, dict):
+                    entry = {}
+                    pages[path] = entry
+                if entry.get("status") == "stale":
+                    continue
+                entry["status"] = "review"
+                entry["review_reason"] = reason
+                entry["review_requested_at"] = requested_at
+                moved.append(path)
+            return state
+
+        self.vault.mutate_state(STATE, mutate)
+        return moved
+
+    def record_resurfaced(self, page: str) -> bool:
+        """Note that `bk resurface` put this page in front of someone.
+
+        An annotation: it records an event about the page and says nothing about
+        whether the page still matches its sources, so it never touches
+        `status` and never invents a `content_hash`. A page the ledger has never
+        heard of gets an entry only if it really exists under `wiki/` -- a model
+        naming a path that is not there must not conjure one.
+        """
+
+        known = page in self.snapshot().pages() or page in self.vault.wiki_pages()
+        if not known:
+            return False
+        recorded_at = utc_now()
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            pages = state.setdefault("pages", {})
+            entry = pages.get(page)
+            if not isinstance(entry, dict):
+                entry = {}
+                pages[page] = entry
+            entry["last_resurfaced_at"] = recorded_at
+            return state
+
+        self.vault.mutate_state(STATE, mutate)
+        return True
+
+    def refresh_staleness(self) -> FreshnessSnapshot:
+        """Re-age every entry against the clock, and return what was committed.
+
+        `review` entries are skipped: a page a human has been asked to look at
+        is already at the top of the queue, and ageing it would either overwrite
+        that request or race it. With `mark_reviewed` refusing to downgrade,
+        `review` is only ever reached from `fresh`, so nothing that had aged out
+        can hide here.
+        """
+
+        stale_after_days = self.vault.config().novelty.stale_after_days
+        now = datetime.now(UTC)
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            for entry in state.setdefault("pages", {}).values():
+                if not isinstance(entry, dict) or entry.get("status") == "review":
+                    continue
+                updated_at = entry.get("updated_at")
+                if not isinstance(updated_at, str):
+                    continue
+                try:
+                    age_days = (now - datetime.fromisoformat(updated_at)).days
+                except ValueError:
+                    continue
+                entry["status"] = "stale" if age_days >= stale_after_days else "fresh"
+                entry["age_days"] = age_days
+            return state
+
+        return FreshnessSnapshot(self.vault.mutate_state(STATE, mutate))
+
+    def record_projection(self, artifact: str) -> None:
+        """Stamp a derived artefact with the inputs it was just built from.
+
+        The page half of the fingerprint is taken inside the mutator, so it is
+        computed from the state the write actually commits: an apply landing
+        between a read and a write cannot leave a projection claiming to cover
+        pages it never saw.
+
+        The registry is read *before* the mutator on purpose. `commit_wiki_batch`
+        takes the registry lock before the freshness lock, and both are blocking
+        `flock`s, so reading the registry while holding freshness would invert
+        the order and deadlock. Reading it first is also the safe direction: a
+        capture landing in between is simply absent from the recorded
+        fingerprint, and the next lint compares against a registry that has it
+        and reports stale. The error can only be a false `stale`, never a false
+        `fresh`.
+        """
+
+        records = self.vault.registry()
+        raw_fields = PROJECTION_RAW_FIELDS[artifact]
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            projections = state.setdefault("projections", {})
+            projections[artifact] = {
+                "generated_at": utc_now(),
+                "source_hash": _projection_source_hash(
+                    state.get("pages", {}), records, raw_fields
+                ),
+            }
+            return state
+
+        self.vault.mutate_state(STATE, mutate)
+
+    def drop(self, paths: Iterable[str]) -> None:
+        """Forget entries for pages that are gone.
+
+        Freshness is keyed by path while the registry is keyed by content hash,
+        so a wiki page removed outside the gate leaves an entry that can never
+        be revived. `bk reconcile` is where that is healed; `bk lint` reports it
+        as `freshness.orphaned` in the meantime.
+        """
+
+        dropped = list(paths)
+        if not dropped:
+            return
+
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            pages = state.setdefault("pages", {})
+            for path in dropped:
+                pages.pop(path, None)
+            return state
+
+        self.vault.mutate_state(STATE, mutate)

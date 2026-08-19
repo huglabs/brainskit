@@ -9,6 +9,61 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+### Added
+
+- `providers.<name>.reasoning` on the OpenAI-compatible driver, forwarded
+  verbatim to the provider. Absent by default, so a model that reasons keeps
+  doing so until an operator says otherwise. Measured on OpenRouter with
+  `nvidia/nemotron-3-nano-30b-a3b:free` running the real ingest job:
+  `{"enabled": false, "exclude": true}` took a call from 12.7s to 3.8s and its
+  reasoning tokens from 898 to 0, with identical output. An endpoint that
+  refuses to skip reasoning — `openai/gpt-oss-20b:free` answers *"Reasoning is
+  mandatory for this endpoint"* — is retried without the option, because
+  suppression is a cost and latency preference and never a correctness one.
+
+### Fixed
+
+- An empty completion from an OpenAI-compatible provider is refused instead of
+  returned as an answer. A reasoning model that spends its whole budget
+  thinking returns a well-formed response whose `content` is empty;
+  `OpenAICompatibleDriver` passed that back, so the repair loop chased it as
+  malformed JSON — three attempts, three empty strings, and a final
+  `model_response_invalid` naming `json.invalid` rather than the cause, after
+  6m46s of wall clock. The refusal now carries `finish_reason` and names the
+  `reasoning` option. `AnthropicDriver._text` already had this guard; the
+  asymmetry is what shipped.
+
+- A standalone `graphify` distribution installed alongside Brainskit no longer
+  silently replaces the vendored extractors. The alias shim's idempotency guard
+  accepted any `sys.modules["graphify"]`, so "the name is taken" stood in for
+  "we already took it" — and upstream Graphify is a real, installable package,
+  so the name can be held by a foreign one. It failed both ways: where that
+  package lacked `graphify.ids`, importing `codeanalysis` died as
+  `ModuleNotFoundError: No module named 'graphify.ids'`, naming neither the
+  conflict nor its cause; where it had one, the import succeeded and supplied a
+  *different* `normalize_id` — the recipe node ids are built from — with nothing
+  raised. The guard now recognises the alias by its search path and refuses a
+  foreign package with `not_configured`, naming what holds the name and how to
+  free it. Overriding it instead would fork the extractor rather than repair it:
+  a process binds a top-level name to exactly one package, and the foreign
+  package's submodules may already be imported.
+
+- A spawned extraction worker now resolves the same `graphify` its parent did.
+  `_enable_parallel_workers` writes a generated `graphify` package for the child
+  to find on `sys.path` — a `spawn`ed worker inherits the path but not
+  `sys.modules`, so the in-process alias and the refusal above cannot reach it —
+  and *appended* it, documented as deliberate so that "a genuine Graphify
+  installation earlier on the path keeps winning". That is the same fork one
+  process boundary out: parent on the vendored tree, child on the installed
+  distribution, and the pool pickles its work by qualified name, so the child's
+  copy is what extracts. It surfaced as `AttributeError: Can't get attribute
+  '_extract_single_file' on module 'graphify.extract'` while unpickling, that
+  helper being this tree's and not upstream's; an upstream carrying a same-named
+  helper would have run silently instead. The entry is now prepended, and moved
+  rather than skipped when already present. Safe on both counts: the directory
+  holds exactly one package, so it can shadow nothing else, and `_shim_root`
+  already refuses a directory that is not 0700 and owned by the current user.
+
 ## [0.7.0] — 2026-08-14
 
 An end-to-end overhaul of the web viewer (`bk web`). Nothing in this release

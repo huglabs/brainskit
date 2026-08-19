@@ -1,0 +1,110 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "runbook",
+      "source_file": "runbook.md",
+      "source_location": "L1",
+      "target": "runbook_release_runbook",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "runbook_before_the_release",
+      "source_file": "runbook.md",
+      "source_location": "L9",
+      "target": "runbook_checks_that_must_be_green",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "runbook_release_runbook",
+      "source_file": "runbook.md",
+      "source_location": "L18",
+      "target": "runbook_after_the_release",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "runbook_release_runbook",
+      "source_file": "runbook.md",
+      "source_location": "L5",
+      "target": "runbook_before_the_release",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "runbook_release_runbook",
+      "source_file": "runbook.md",
+      "source_location": "L14",
+      "target": "runbook_cutting_the_release",
+      "weight": 1.0
+    }
+  ],
+  "language": "markdown",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "document",
+      "id": "runbook",
+      "label": "runbook.md",
+      "source_file": "runbook.md",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "document",
+      "id": "runbook_after_the_release",
+      "label": "After the release",
+      "source_file": "runbook.md",
+      "source_location": "L18"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "document",
+      "id": "runbook_before_the_release",
+      "label": "Before the release",
+      "source_file": "runbook.md",
+      "source_location": "L5"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "document",
+      "id": "runbook_checks_that_must_be_green",
+      "label": "Checks that must be green",
+      "source_file": "runbook.md",
+      "source_location": "L9"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "document",
+      "id": "runbook_cutting_the_release",
+      "label": "Cutting the release",
+      "source_file": "runbook.md",
+      "source_location": "L14"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "document",
+      "id": "runbook_release_runbook",
+      "label": "Release runbook",
+      "source_file": "runbook.md",
+      "source_location": "L1"
+    }
+  ],
+  "paradigm": "no-grammar",
+  "sources": {
+    "runbook.md": "d41f12c76246c33a125d53bf7a51c00d507f58595f3596553ccc32998441ce22"
+  }
+}

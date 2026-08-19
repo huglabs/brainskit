@@ -40,18 +40,18 @@ from __future__ import annotations
 from typing import Any
 
 from brainskit.application.ports import VaultPort
-from brainskit.application.privacy import (
-    _consumer_allows,
-    _privacy_for_record,
-    _validate_consumer,
-    strictest_privacy,
-)
+from brainskit.application.privacy import for_consumer
 from brainskit.domain.model import (
     EnrichmentEdge,
     NotConfiguredError,
     NotFoundError,
     PrivacyMode,
     ValidationError,
+)
+from brainskit.domain.privacy import (
+    branch_privacy,
+    record_branch,
+    strictest_privacy,
 )
 
 STATE = "enrichment"
@@ -155,13 +155,12 @@ class Enrichment:
     def edges(self, *, consumer: str = "human") -> list[dict[str, Any]]:
         """Stored edges this consumer may see, strictest-source-first."""
 
-        _validate_consumer(consumer)
-        records = self.vault.registry()
+        boundary = for_consumer(consumer, self.vault)
         config = self.vault.config()
         visible = []
         for edge in self.vault.read_state(STATE).get("edges", {}).values():
-            privacy = self.privacy_of(edge, records, config)
-            if _consumer_allows(consumer, privacy):
+            privacy = self.privacy_of(edge, boundary.records, config)
+            if boundary.allows(privacy):
                 visible.append({**edge, "privacy": privacy.value})
         return sorted(visible, key=lambda edge: str(edge.get("id", "")))
 
@@ -182,12 +181,12 @@ class Enrichment:
             return PrivacyMode.NEVER_INGEST
         return strictest_privacy(
             (
-                _privacy_for_record(config, records[content_hash])
+                branch_privacy(config, record_branch(records[content_hash]))
                 for content_hash in hashes
             ),
             # `hashes` is non-empty here -- the guard above returns first. The
             # answer is stated rather than defaulted so this call site cannot
-            # drift into the failure `_evidence_privacy` had.
+            # drift into the failure `evidence_privacy` had.
             on_empty=PrivacyMode.NEVER_INGEST,
         )
 

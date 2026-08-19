@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, urlparse
 from brainskit.application.jobs import MAX_HISTORY_EXCHANGES
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import BrainskitError, ValidationError
+from brainskit.domain.privacy import Consumer
+from brainskit.interfaces.errors import error_envelope, present, refusal_envelope
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -53,8 +55,10 @@ def build_server(
     # assembling the server by hand, which is what this function exists to stop.
     if port != 0 and not 1 <= port <= 65535:
         raise ValidationError("Web viewer port must be between 1 and 65535")
-    if consumer not in {"human", "local", "cloud"}:
-        raise ValidationError("Web viewer consumer is invalid")
+    # `Consumer.parse` is the one place an unknown consumer becomes an error
+    # (ADR 0001); a fourth copy of the three names here could only ever go out
+    # of date with it, and its message names the three where this one did not.
+    Consumer.parse(consumer)
     if host not in LOOPBACK_HOSTS and not token:
         raise ValidationError(
             "Remote web viewer binding requires --token-env with a populated variable"
@@ -255,16 +259,10 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
         # not be able to confirm a viewer is even running here, let alone read
         # a vault whose consumer is `human` and therefore withholds nothing.
         if not self._host_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "host_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("host_denied", HTTPStatus.FORBIDDEN)
             return
         if not self._origin_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "origin_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("origin_denied", HTTPStatus.FORBIDDEN)
             return
         if parsed.path in {"/", "/index.html"}:
             self._send_html(WEB_VIEWER_HTML)
@@ -282,10 +280,7 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorized():
-            self._send_json(
-                {"ok": False, "error": {"code": "unauthorized"}},
-                status=HTTPStatus.UNAUTHORIZED,
-            )
+            self._send_refusal("unauthorized", HTTPStatus.UNAUTHORIZED)
             return
         query = parse_qs(parsed.query)
         try:
@@ -337,64 +332,37 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
                     limit=int(_one(query, "limit", "500")),
                 )
             elif parsed.path == "/api/integrations":
-                value = self.server.service.integration_status()
-            else:
-                self._send_json(
-                    {"ok": False, "error": {"code": "not_found"}},
-                    status=HTTPStatus.NOT_FOUND,
+                value = self.server.service.integration_status(
+                    consumer=self.server.consumer
                 )
+            else:
+                self._send_refusal("not_found", HTTPStatus.NOT_FOUND)
                 return
         except (ValueError, BrainskitError) as exc:
-            code = getattr(exc, "code", "invalid_request")
-            details = getattr(exc, "details", {})
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": code,
-                        "message": str(exc),
-                        "details": details,
-                    },
-                },
-                status=HTTPStatus.BAD_REQUEST,
-            )
+            self._send_error(exc)
             return
         self._send_json({"ok": True, "result": value})
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if not self._host_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "host_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("host_denied", HTTPStatus.FORBIDDEN)
             return
         if not self._origin_allowed():
-            self._send_json(
-                {"ok": False, "error": {"code": "origin_denied"}},
-                status=HTTPStatus.FORBIDDEN,
-            )
+            self._send_refusal("origin_denied", HTTPStatus.FORBIDDEN)
             return
         if not self._authorized():
-            self._send_json(
-                {"ok": False, "error": {"code": "unauthorized"}},
-                status=HTTPStatus.UNAUTHORIZED,
-            )
+            self._send_refusal("unauthorized", HTTPStatus.UNAUTHORIZED)
             return
         # The write surface belongs to a person at a keyboard. A viewer bound
         # to a machine consumer (`local`/`cloud`) stays read-only, so a script
         # pointed at a viewer cannot mutate the vault through it.
         if self.server.consumer != "human":
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "writes_refused",
-                        "message": "The web viewer only writes at --consumer human",
-                        "details": {"consumer": self.server.consumer},
-                    },
-                },
-                status=HTTPStatus.FORBIDDEN,
+            self._send_refusal(
+                "writes_refused",
+                HTTPStatus.FORBIDDEN,
+                message="The web viewer only writes at --consumer human",
+                details={"consumer": self.server.consumer},
             )
             return
         try:
@@ -410,25 +378,10 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
                     _need(body, "id"), str(body.get("reason") or "")
                 )
             else:
-                self._send_json(
-                    {"ok": False, "error": {"code": "not_found"}},
-                    status=HTTPStatus.NOT_FOUND,
-                )
+                self._send_refusal("not_found", HTTPStatus.NOT_FOUND)
                 return
         except (ValueError, BrainskitError) as exc:
-            code = getattr(exc, "code", "invalid_request")
-            details = getattr(exc, "details", {})
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": code,
-                        "message": str(exc),
-                        "details": details,
-                    },
-                },
-                status=HTTPStatus.BAD_REQUEST,
-            )
+            self._send_error(exc)
             return
         self._send_json({"ok": True, "result": value})
 
@@ -551,6 +504,38 @@ class BrainskitWebHandler(BaseHTTPRequestHandler):
 
         origin = self.headers.get("Origin")
         return origin is None or origin in self.server.allowed_origins
+
+    def _send_error(self, exc: BaseException) -> None:
+        """Answer an error with the status its code means.
+
+        Both handlers used to inline the same fifteen lines and both ended them
+        with `HTTPStatus.BAD_REQUEST`, so a missing page arrived as a bad
+        request and a privacy refusal did too. The status now comes from the
+        one table in `interfaces/errors.py`; a bare `ValueError` (an unparsable
+        query parameter, which this deliberately still catches) keeps the 400
+        it always had.
+        """
+
+        self._send_json(error_envelope(exc), status=present(exc).http_status)
+
+    def _send_refusal(
+        self,
+        code: str,
+        status: HTTPStatus,
+        *,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Answer a guard that refused before any error was raised.
+
+        A denied Host, a foreign Origin, a missing token, an unrouted path:
+        there is no exception to describe, only the name of the rule that said
+        no -- and the status is that rule's, not a code's.
+        """
+
+        self._send_json(
+            refusal_envelope(code, message=message, details=details), status=status
+        )
 
     def _send_json(
         self, value: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
@@ -693,11 +678,12 @@ const NODES_LIMIT=1100;
 const KIND_RGB={raw:[0.33,0.84,0.75],concept:[0.39,0.65,1.0],entity:[0.96,0.75,0.42],synthesis:[0.49,0.91,0.53],system:[0.71,0.61,1.0],source:[0.33,0.84,0.75],page:[0.39,0.65,1.0],default:[0.71,0.61,1.0]};
 const EXT_RGB={py:[0.39,0.65,1.0],ts:[0.33,0.84,0.75],js:[0.96,0.75,0.42],go:[0.42,0.87,0.8],rs:[0.96,0.62,0.45],java:[0.96,0.55,0.48],md:[0.8,0.76,0.62],sql:[0.7,0.6,0.95],sh:[0.66,0.76,0.87],json:[0.58,0.58,0.66],html:[0.96,0.75,0.42],css:[0.6,0.6,0.96]};
 const state={graph:null,nodes:[],edges:[],pos:null,colTarget:null,bondColTarget:null,scaleFactors:null,idx:{},adj:null,edgeVerts:[],degree:{},hovered:null,selected:null,dragging:null,userMoved:false,source:'knowledge',cache:{},graph_cache:{},sim:null,labelCache:{},collectionFilters:{},coverCache:{},resourceCache:{},chatThread:[],askPending:false,reveal:null,revealDelay:null};
-const G={renderer:null,scene:null,camera:null,atoms:null,bonds:null,bondMode:null,stars:null,label:null,rings:[],halos:[],raycaster:null,textureCache:{},scr:null,cam:{theta:0.6,phi:1.05,dist:330,distTarget:330,tx:0,ty:0,tz:0},fly:null,spin:{t:0,p:0},spinT:0,lastClick:null,lastInteract:0,colorsAnimating:false};
+const G={renderer:null,scene:null,camera:null,atoms:null,bonds:null,bondMode:null,stars:null,label:null,rings:[],halos:[],raycaster:null,textureCache:{},scr:null,cam:{theta:0.6,phi:1.05,dist:330,distTarget:330,tx:0,ty:0,tz:0},fly:null,spin:{t:0,p:0},spinT:0,lastClick:null,lastInteract:0,colorsAnimating:false,fogR:null};
 let tGlobal=0;
 const RING_PULSE_AMPLITUDE=0.04;
 const ORBIT_DAMPING=0.92,ZOOM_EASE=0.18,COLOR_EASE=0.3,IDLE_DRIFT=0.0004,IDLE_DELAY_MS=6000,DBLCLICK_MS=300;
 const ATOM_SCALE_K=0.35,ATOM_SCALE_MAX=2.4,BOND_SPLIT_MAX_EDGES=6000;
+const FOG_NEAR_K=1.5,FOG_FAR_K=2.5,FOG_REFIT_MS=200;
 const ALPHA_DECAY=0.995,ALPHA_MIN=0.003,WAKE_ALPHA=0.3,KE_SLEEP=0.0001,FLING_GAIN=0.5,FLING_MAX=6,DRAG_VEL_STALE_MS=90;
 const REVEAL_SPAN_MIN=1200,REVEAL_SPAN_MAX=2500,REVEAL_ATOM_MS=300,REVEAL_BOND_MS=250;
 const RIM_INTENSITY=0.35,RIM_POWER=2.5,HALO_COUNT=8,HALO_SCALE=2.2,HALO_OPACITY=0.35;
@@ -790,10 +776,19 @@ function init3D(){let canvas=document.getElementById('graph');G.renderer=new THR
 function resize3D(){if(!G.renderer)return;let rect=G.renderer.domElement.getBoundingClientRect();if(rect.width===0||rect.height===0)return;G.renderer.setSize(rect.width,rect.height,false);G.camera.aspect=rect.width/rect.height;G.camera.updateProjectionMatrix()}
 function setCamera(){let c=G.cam,sp=Math.sin(c.phi);G.camera.position.set(c.tx+c.dist*sp*Math.cos(c.theta),c.ty+c.dist*Math.cos(c.phi),c.tz+c.dist*sp*Math.sin(c.theta));G.camera.lookAt(c.tx,c.ty,c.tz)}
 function flyTo(px,py,pz,dist,from){G.spin.t=0;G.spin.p=0;if(from)G.cam.dist=from;G.cam.distTarget=dist;G.fly={sx:G.cam.tx,sy:G.cam.ty,sz:G.cam.tz,ex:px,ey:py,ez:pz,sd:G.cam.dist,ed:dist,t:0}}
-function flyToOrigin(R,from){let camDistTarget=Math.max(150,R*2.7);if(G.scene&&G.scene.fog){G.scene.fog.near=Math.max(20,camDistTarget-R*1.5);G.scene.fog.far=camDistTarget+R*2.5}flyTo(0,0,0,camDistTarget,from)}
+function flyToOrigin(R,from){flyTo(0,0,0,Math.max(150,R*2.7),from)}
 function nodePos(i){return{x:state.pos[i*3],y:state.pos[i*3+1],z:state.pos[i*3+2]}}
 function graphRadius(){let r=0;for(let i=0;i<state.nodes.length;i++){r=Math.max(r,Math.hypot(state.pos[i*3],state.pos[i*3+1],state.pos[i*3+2]))}return r}
-function buildGraph(data,source){showGraphEmpty(false);state.selected=null;state.hovered=null;state.dragging=null;state.userMoved=false;G.lastClick=null;state.source=source;state.graph=data;state.degree={};for(let e of data.edges){state.degree[e.source]=(state.degree[e.source]||0)+1;state.degree[e.target]=(state.degree[e.target]||0)+1}let nodes=[...data.nodes].sort((a,b)=>(state.degree[b.id]||0)-(state.degree[a.id]||0));let clientHidden=Math.max(0,nodes.length-NODES_LIMIT);nodes=nodes.slice(0,NODES_LIMIT);let ids=new Set(nodes.map(n=>n.id));let edges=data.edges.filter(e=>ids.has(e.source)&&ids.has(e.target));state.nodes=nodes;state.edges=edges;state.idx={};nodes.forEach((nd,i)=>state.idx[nd.id]=i);state.adj=nodes.map(()=>[]);let edgeVerts=[];for(let e of edges){let a=state.idx[e.source],b=state.idx[e.target];if(a===undefined||b===undefined)continue;state.adj[a].push(b);state.adj[b].push(a);edgeVerts.push([a,b])}state.edgeVerts=edgeVerts;
+/* The fog is a depth cue, not a curtain. Pinned to the distance one camera move
+   happened to end at, it swallows the whole graph as soon as you scroll past its
+   far plane -- zooming out went black. Refitting it to where the camera actually
+   is keeps the same near-bright/far-dim gradient at every zoom, so a node is only
+   ever dimmed relative to its neighbours, never fogged out of existence. The
+   radius is sampled rather than measured per frame: it drifts slowly while the
+   simulation settles, and the fog does not need to track it exactly. */
+function fogRadius(){let now=performance.now();if(G.fogR&&now-G.fogR.t<FOG_REFIT_MS)return G.fogR.r;let r=Math.max(graphRadius(),40);G.fogR={t:now,r};return r}
+function fitFog(dist){if(!G.scene||!G.scene.fog)return;let R=fogRadius();G.scene.fog.near=Math.max(1,dist-R*FOG_NEAR_K);G.scene.fog.far=dist+R*FOG_FAR_K}
+function buildGraph(data,source){showGraphEmpty(false);state.selected=null;state.hovered=null;state.dragging=null;state.userMoved=false;G.lastClick=null;G.fogR=null;state.source=source;state.graph=data;state.degree={};for(let e of data.edges){state.degree[e.source]=(state.degree[e.source]||0)+1;state.degree[e.target]=(state.degree[e.target]||0)+1}let nodes=[...data.nodes].sort((a,b)=>(state.degree[b.id]||0)-(state.degree[a.id]||0));let clientHidden=Math.max(0,nodes.length-NODES_LIMIT);nodes=nodes.slice(0,NODES_LIMIT);let ids=new Set(nodes.map(n=>n.id));let edges=data.edges.filter(e=>ids.has(e.source)&&ids.has(e.target));state.nodes=nodes;state.edges=edges;state.idx={};nodes.forEach((nd,i)=>state.idx[nd.id]=i);state.adj=nodes.map(()=>[]);let edgeVerts=[];for(let e of edges){let a=state.idx[e.source],b=state.idx[e.target];if(a===undefined||b===undefined)continue;state.adj[a].push(b);state.adj[b].push(a);edgeVerts.push([a,b])}state.edgeVerts=edgeVerts;
 let n=nodes.length,pos=new Float32Array(n*3);let kinds=[...new Set(nodes.map(nd=>nd.kind||'default'))];let band={};kinds.forEach((k,i)=>band[k]=i+1);for(let i=0;i<n;i++){let nd=nodes[i],b=band[nd.kind||'default'],a=(hash(nd.id)%100000)/100000*Math.PI*2,p=(hash(nd.id+'p')%100000)/100000*2-1,r=46+b*38+(hash(nd.id+'r')%60),rr=r*Math.sqrt(1-p*p);pos[i*3]=Math.cos(a)*rr;pos[i*3+1]=r*p;pos[i*3+2]=Math.sin(a)*rr}state.pos=pos;
 /* load reveal: BFS order from the biggest hub (nodes are degree-sorted, so index order IS hub order) makes the assembly read as connections spreading outward. Re-armed on every build; skipped outright under reduced motion. */
 state.revealDelay=computeRevealDelays();
@@ -905,7 +900,7 @@ if(!REDUCED_MOTION&&downMode===null&&now-G.lastInteract>IDLE_DELAY_MS)G.cam.thet
 if(state.sim&&!state.sim.sleeping)stepSim(state.sim);
 if(G.colorsAnimating&&G.atoms){let settled=true,na=G.atoms.instanceColor;if(na){settled=easeColorArray(na.array,state.colTarget)&&settled;na.needsUpdate=true}let ba=bondColorArray();if(ba){settled=easeColorArray(ba,state.bondColTarget)&&settled;bondColorsChanged()}if(settled)G.colorsAnimating=false}
 if(state.reveal&&!state.reveal.done)stepReveal(now);
-if(G.rings.length||G.label){tGlobal+=0.05;let dscale=G.cam.dist/150,p=REDUCED_MOTION?1:1+RING_PULSE_AMPLITUDE*Math.sin(tGlobal*2.2);for(let r of G.rings){let s=r.base*dscale*p;r.sprite.scale.set(s,s,1)}if(G.label){let u=G.label.userData;G.label.scale.set(u.ar*8*dscale,8*dscale,1);G.label.position.y=u.baseY+22*dscale}}setCamera();G.renderer.render(G.scene,G.camera)}
+if(G.rings.length||G.label){tGlobal+=0.05;let dscale=G.cam.dist/150,p=REDUCED_MOTION?1:1+RING_PULSE_AMPLITUDE*Math.sin(tGlobal*2.2);for(let r of G.rings){let s=r.base*dscale*p;r.sprite.scale.set(s,s,1)}if(G.label){let u=G.label.userData;G.label.scale.set(u.ar*8*dscale,8*dscale,1);G.label.position.y=u.baseY+22*dscale}}fitFog(G.cam.dist);setCamera();G.renderer.render(G.scene,G.camera)}
 /* ---------------- graph sources ---------------- */
 function showGraphLoading(show){document.getElementById('graphLoading').classList.toggle('hidden',!show)}
 function showGraphEmpty(show,opts){let el=document.getElementById('graphEmpty');el.classList.toggle('hidden',!show);if(!show)return;escText(document.getElementById('graphEmptyTitle'),opts.title);escText(document.getElementById('graphEmptyBody'),opts.body);let btn=document.getElementById('graphEmptyAction');btn.classList.toggle('hidden',!opts.action);if(opts.action){escText(btn,opts.action.label);btn.onclick=opts.action.onClick}let cli=document.getElementById('graphEmptyCli');cli.classList.toggle('hidden',!opts.cli);if(opts.cli){cli.replaceChildren(document.createTextNode('or from a terminal: '));let code=document.createElement('code');escText(code,opts.cli);cli.append(code)}}

@@ -16,19 +16,14 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from brainskit.application.filing import Filing
-from brainskit.application.freshness import _freshness_summary
+from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health, enforcement_ok
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import (
-    _consumer_allows,
-    _evidence_privacy,
-    _privacy_for_record,
-    _record_branch,
-    _validate_consumer,
-)
+from brainskit.application.privacy import for_consumer
 from brainskit.application.projections import Projections
 from brainskit.domain.model import NotFoundError, PolicyError, ValidationError
+from brainskit.domain.privacy import record_branch
 
 
 def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
@@ -43,6 +38,11 @@ def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
     the viewer only has to name the layer that is off. A hook path names a local
     filesystem layout, and there is no reason to spend that on a caller with no
     use for it.
+
+    `agent` is kept, on the other side of that line: it is present only when the
+    vault is installed for more than one, and without it two identically named
+    rows would render as one layer reported twice. It names an agent, not a
+    machine.
     """
 
     return {
@@ -51,7 +51,7 @@ def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
         "layers": [
             {
                 key: layer[key]
-                for key in ("layer", "mechanism", "active", "advisory")
+                for key in ("layer", "mechanism", "active", "advisory", "agent")
                 if key in layer
             }
             for layer in enforcement.get("layers", [])
@@ -69,25 +69,20 @@ class Reader:
         health: Health,
         filing: Filing,
         projections: Projections,
+        ledger: FreshnessLedger,
     ):
         self.vault = vault
         self.index = index
         self.health = health
         self.filing = filing
         self.projections = projections
-
+        self.ledger = ledger
 
     def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
-        _validate_consumer(consumer)
+        boundary = for_consumer(consumer, self.vault)
         if consumer == "human":
             return self.health.status()
-        records = self.vault.registry()
-        config = self.vault.config()
-        visible_records = {
-            content_hash: record
-            for content_hash, record in records.items()
-            if _consumer_allows(consumer, _privacy_for_record(config, record))
-        }
+        visible_records, redacted_sources = boundary.split_records()
         graph = self.projections.graph_data(consumer=consumer)
         visible_pages = {
             str(node["path"])
@@ -106,16 +101,8 @@ class Reader:
         ]
         raw_counts: dict[str, int] = defaultdict(int)
         for record in visible_records.values():
-            raw_counts[_record_branch(record)] += 1
-        freshness = self.vault.read_state("freshness")
-        filtered_freshness = {
-            **freshness,
-            "pages": {
-                path: value
-                for path, value in freshness.get("pages", {}).items()
-                if path in visible_pages
-            },
-        }
+            raw_counts[record_branch(record)] += 1
+        freshness = self.ledger.snapshot()
         index_state = self.index.stats()
         enforcement = _reportable_enforcement(self.health.enforcement())
         return {
@@ -130,7 +117,7 @@ class Reader:
                 **index_state,
                 "documents": len(visible_records) + len(visible_pages),
             },
-            "freshness": _freshness_summary(filtered_freshness),
+            "freshness": freshness.summary(present=visible_pages),
             "enforcement": enforcement,
             # The same two inputs `Health.status` weighs, and for the same
             # reason: this feeds `/api/status`, which the viewer renders as
@@ -155,27 +142,26 @@ class Reader:
                 finding["severity"] == "error" for finding in visible_findings
             ),
             "consumer": consumer,
-            "redacted_sources": len(records) - len(visible_records),
+            "redacted_sources": redacted_sources,
             "redacted_pages": len(self.vault.wiki_pages()) - len(visible_pages),
         }
 
     def browse_sources(
         self, *, consumer: str = "human", limit: int = 500
     ) -> dict[str, Any]:
-        _validate_consumer(consumer)
+        boundary = for_consumer(consumer, self.vault)
         if not 1 <= limit <= 1_000:
             raise ValidationError("Source browse limit must be between 1 and 1000")
-        config = self.vault.config()
         records = sorted(
-            self.vault.registry().values(),
+            boundary.records.values(),
             key=lambda record: record.captured_at,
             reverse=True,
         )
         visible = []
         redacted = 0
         for record in records:
-            privacy = _privacy_for_record(config, record)
-            if not _consumer_allows(consumer, privacy):
+            privacy = boundary.record_privacy(record)
+            if not boundary.allows(privacy):
                 redacted += 1
                 continue
             visible.append(
@@ -184,7 +170,7 @@ class Reader:
                     "content_hash": record.content_hash,
                     "path": record.path,
                     "title": record.original_name,
-                    "branch": _record_branch(record),
+                    "branch": record_branch(record),
                     "privacy": privacy.value,
                     "status": record.status,
                     "captured_at": record.captured_at,
@@ -204,35 +190,23 @@ class Reader:
     def browse_pages(
         self, *, consumer: str = "human", limit: int = 500
     ) -> dict[str, Any]:
-        _validate_consumer(consumer)
+        boundary = for_consumer(consumer, self.vault)
         if not 1 <= limit <= 1_000:
             raise ValidationError("Page browse limit must be between 1 and 1000")
-        records = self.vault.registry()
-        config = self.vault.config()
-        freshness = self.vault.read_state("freshness").get("pages", {})
+        freshness = self.ledger.snapshot()
         graph = self.projections.graph_data(consumer=consumer)
         pages = []
         for node in graph["nodes"]:
             if not str(node["id"]).startswith("page:"):
                 continue
             path = str(node["path"])
-            content = self.vault.read_text(path)
-            privacy = _evidence_privacy(node, content, records, config)
-            page_freshness = freshness.get(path, {})
+            privacy = boundary.evidence_privacy(node)
             pages.append(
                 {
                     **node,
                     "privacy": privacy.value,
-                    "freshness": (
-                        page_freshness.get("status", "unknown")
-                        if isinstance(page_freshness, dict)
-                        else "unknown"
-                    ),
-                    "updated_at": (
-                        page_freshness.get("updated_at")
-                        if isinstance(page_freshness, dict)
-                        else None
-                    ),
+                    "freshness": freshness.status(path),
+                    "updated_at": freshness.updated_at(path),
                 }
             )
         pages.sort(key=lambda page: (str(page["kind"]), str(page["label"])))
@@ -243,9 +217,10 @@ class Reader:
             "pages": pages[:limit],
         }
 
-    def timeline(
-        self, *, consumer: str = "human", limit: int = 500
-    ) -> dict[str, Any]:
+    def timeline(self, *, consumer: str = "human", limit: int = 500) -> dict[str, Any]:
+        # Validation by construction: an unknown consumer fails here, at this
+        # method's own boundary, rather than transitively inside a callee.
+        for_consumer(consumer, self.vault)
         sources = self.browse_sources(consumer=consumer, limit=limit)
         pages = self.browse_pages(consumer=consumer, limit=limit)
         events = [
@@ -279,19 +254,17 @@ class Reader:
     def read_resource(
         self, identifier: str, *, consumer: str = "human"
     ) -> dict[str, Any]:
-        _validate_consumer(consumer)
-        records = self.vault.registry()
-        config = self.vault.config()
+        boundary = for_consumer(consumer, self.vault)
         if identifier.startswith("raw:"):
             content_hash = identifier.removeprefix("raw:")
-            record = records.get(content_hash)
+            record = boundary.records.get(content_hash)
             if not record:
                 raise NotFoundError(
                     "Raw graph resource was not found",
                     details={"identifier": identifier},
                 )
-            privacy = _privacy_for_record(config, record)
-            if not _consumer_allows(consumer, privacy):
+            privacy = boundary.record_privacy(record)
+            if not boundary.allows(privacy):
                 raise PolicyError(
                     "Resource is outside the consumer privacy boundary",
                     details={"privacy": privacy.value, "consumer": consumer},
@@ -310,8 +283,8 @@ class Reader:
                 "Wiki graph resource was not found", details={"identifier": identifier}
             )
         content = self.vault.read_text(path)
-        privacy = _evidence_privacy({"path": path}, content, records, config)
-        if not _consumer_allows(consumer, privacy):
+        privacy = boundary.evidence_privacy({"path": path}, content)
+        if not boundary.allows(privacy):
             raise PolicyError(
                 "Resource is outside the consumer privacy boundary",
                 details={"privacy": privacy.value, "consumer": consumer},
@@ -329,18 +302,14 @@ class Reader:
     def proposals_for_consumer(
         self, status: str | None = None, *, consumer: str = "human"
     ) -> dict[str, Any]:
-        _validate_consumer(consumer)
+        boundary = for_consumer(consumer, self.vault)
         result = self.filing.proposals(status)
         if consumer == "human":
             return {**result, "consumer": consumer, "redacted": 0}
-        records = self.vault.registry()
-        config = self.vault.config()
         visible = []
         for proposal in result["proposals"]:
-            record = records.get(str(proposal.get("source_hash", "")))
-            if record and _consumer_allows(
-                consumer, _privacy_for_record(config, record)
-            ):
+            record = boundary.records.get(str(proposal.get("source_hash", "")))
+            if record and boundary.allows_record(record):
                 visible.append(proposal)
         return {
             "count": len(visible),

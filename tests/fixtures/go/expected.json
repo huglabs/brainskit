@@ -1,0 +1,165 @@
+{
+  "cross_file": false,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "cache",
+      "source_file": "cache.go",
+      "source_location": "L14",
+      "target": "cache_newstore",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "cache",
+      "source_file": "cache.go",
+      "source_location": "L33",
+      "target": "cache_warm",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "cache",
+      "source_file": "cache.go",
+      "source_location": "L9",
+      "target": "source_store",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "import",
+      "relation": "imports_from",
+      "source": "cache",
+      "source_file": "cache.go",
+      "source_location": "L3",
+      "target": "go_pkg_errors",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "return_type",
+      "relation": "references",
+      "source": "cache_newstore",
+      "source_file": "cache.go",
+      "source_location": "L14",
+      "target": "source_store",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "cache_warm",
+      "source_file": "cache.go",
+      "source_location": "L34",
+      "target": "cache_newstore",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "cache_warm",
+      "source_file": "cache.go",
+      "source_location": "L36",
+      "target": "source_store_get",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "context": "call",
+      "relation": "calls",
+      "source": "cache_warm",
+      "source_file": "cache.go",
+      "source_location": "L35",
+      "target": "source_store_put",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "source_store",
+      "source_file": "cache.go",
+      "source_location": "L24",
+      "target": "source_store_get",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "source_store",
+      "source_file": "cache.go",
+      "source_location": "L19",
+      "target": "source_store_put",
+      "weight": 1.0
+    }
+  ],
+  "language": "go",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "cache",
+      "label": "cache.go",
+      "source_file": "cache.go",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "cache_newstore",
+      "label": "NewStore()",
+      "source_file": "cache.go",
+      "source_location": "L14"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "cache_warm",
+      "label": "Warm()",
+      "source_file": "cache.go",
+      "source_location": "L33"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_store",
+      "label": "Store",
+      "source_file": "cache.go",
+      "source_location": "L9"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_store_get",
+      "label": ".Get()",
+      "source_file": "cache.go",
+      "source_location": "L24"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "source_store_put",
+      "label": ".Put()",
+      "source_file": "cache.go",
+      "source_location": "L19"
+    }
+  ],
+  "paradigm": "standalone-tree-sitter",
+  "sources": {
+    "cache.go": "0c55813173334312e33f65cfb88574f61bc2ee7ab3a4bb50ef56ed599244ac4c"
+  }
+}

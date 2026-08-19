@@ -166,19 +166,39 @@ def _enable_parallel_workers() -> bool:
     pointing at the vendored tree, which is exactly what the in-process alias
     already does.
 
-    **Appended, never prepended.** A genuine Graphify installation earlier on
-    the path keeps winning; this only fills a gap that would otherwise be a
-    crash. Failure to write the shim is not fatal -- `_run` degrades to
-    sequential extraction, which is slower and correct, and `CodeGraph`
-    reports any file that went unexplained regardless.
+    **Prepended, and that reverses an earlier decision.** This used to append,
+    so "a genuine Graphify installation earlier on the path keeps winning".
+    Letting it win is precisely the fork: the parent binds `graphify` to the
+    vendored tree -- `codeanalysis/__init__.py` now refuses to start if
+    anything else holds that name -- while the child would bind it to the
+    installed distribution, so a pool would extract with an implementation the
+    parent never runs. Observed as `AttributeError: Can't get attribute
+    '_extract_single_file' on module 'graphify.extract'`, raised while
+    unpickling the work item, because that private helper is this tree's and
+    not upstream's. The version that *does* have a same-named helper is the
+    quiet one.
+
+    A worker has to resolve the same `graphify` its parent did, so precedence
+    is the requirement rather than mere presence. Prepending is safe on both
+    counts that matter: this directory holds exactly one package -- the
+    generated `graphify` -- so it can shadow nothing else, and `_shim_root`
+    already refuses a directory that is not 0700 and ours, which is what stops
+    a planted shim from being trusted on sight.
+
+    Failure to write the shim is not fatal -- `_run` degrades to sequential
+    extraction, which is slower and correct, and `CodeGraph` reports any file
+    that went unexplained regardless.
     """
 
     directory = _shim_root()
     if directory is None:
         return False
     entry = str(directory)
-    if entry not in sys.path:
-        sys.path.append(entry)
+    # Move it rather than skip it: an entry already on the path may be sitting
+    # behind an installed `graphify`, which is the state this exists to fix.
+    if entry in sys.path:
+        sys.path.remove(entry)
+    sys.path.insert(0, entry)
     return True
 
 

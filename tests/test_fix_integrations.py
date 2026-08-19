@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from brainskit.application.privacy import PrivacyBoundary, for_consumer
 from brainskit.domain.model import BrainskitError, ValidationError
 from brainskit.infrastructure import integrations as integrations_module
 from brainskit.infrastructure.integrations import (
@@ -332,6 +333,10 @@ class VaultFixture(unittest.TestCase):
             {"message": str(error), "details": error.details}, ensure_ascii=False
         )
 
+    def boundary(self, consumer: str = "local") -> PrivacyBoundary:
+        """A real boundary over this vault, as the sync port now requires."""
+        return for_consumer(consumer, self.vault)
+
 
 class VendorErrorContractTest(VaultFixture):
     """Defect 1: vendor driver exceptions must never escape the error contract."""
@@ -372,7 +377,7 @@ class VendorErrorContractTest(VaultFixture):
         with patch.dict(os.environ, {"BRAINSKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
             with patch.dict(sys.modules, modules):
                 with self.assertRaises(BrainskitError) as caught:
-                    self.integrations.sync("neo4j", graph())
+                    self.integrations.sync("neo4j", graph(), self.boundary())
         return caught.exception
 
     def neo4j_modules(self) -> tuple[dict[str, types.ModuleType], FakeNeo4jDriver]:
@@ -394,7 +399,7 @@ class VendorErrorContractTest(VaultFixture):
         with patch.dict(os.environ, environment):
             with patch.dict(sys.modules, {"psycopg": module}):
                 with self.assertRaises(BrainskitError) as caught:
-                    self.integrations.sync("postgres", graph())
+                    self.integrations.sync("postgres", graph(), self.boundary())
         return caught.exception
 
     def test_neo4j_connection_failure_becomes_a_brainskit_error(self) -> None:
@@ -440,7 +445,7 @@ class VendorErrorContractTest(VaultFixture):
         with patch.dict(os.environ, {"BRAINSKIT_TEST_NEO4J_PASSWORD": NEO4J_PASSWORD}):
             with patch.dict(sys.modules, {"neo4j": None}):
                 with self.assertRaises(ValidationError) as caught:
-                    self.integrations.sync("neo4j", graph())
+                    self.integrations.sync("neo4j", graph(), self.boundary())
         self.assertEqual(str(caught.exception), "Neo4j sync requires the official driver")
         self.assertEqual(caught.exception.details, {"hint": "Install brainskit[neo4j]"})
 
@@ -492,7 +497,7 @@ class VendorErrorContractTest(VaultFixture):
         with patch.dict(os.environ, {"BRAINSKIT_TEST_PG_PASSWORD": POSTGRES_PASSWORD}):
             with patch.dict(sys.modules, {"psycopg": None}):
                 with self.assertRaises(ValidationError) as caught:
-                    self.integrations.sync("postgres", graph())
+                    self.integrations.sync("postgres", graph(), self.boundary())
         self.assertEqual(str(caught.exception), "PostgreSQL sync requires psycopg")
         self.assertEqual(caught.exception.details, {"hint": "Install brainskit[postgres]"})
 
@@ -613,7 +618,11 @@ class PostgresVaultScopeTest(unittest.TestCase):
         }
         with patch.dict(os.environ, environment):
             with patch.dict(sys.modules, {"psycopg": module}):
-                return integrations.sync("postgres", shared_graph())
+                return integrations.sync(
+                    "postgres",
+                    shared_graph(),
+                    for_consumer("local", integrations.vault),
+                )
 
     def test_the_refresh_deletes_only_the_syncing_vaults_rows(self) -> None:
         module = fake_psycopg_module()
@@ -965,7 +974,7 @@ class ObsidianExportBoundaryTest(VaultFixture):
             json.dumps(graph(canary="neverIngestCanary"), ensure_ascii=False) + "\n",
         )
         self.configure(target, consumer="local")
-        result = self.integrations.sync("obsidian", graph())
+        result = self.integrations.sync("obsidian", graph(), self.boundary())
         exported = (target / "brainskit" / "graph" / "graph.json").read_text(
             encoding="utf-8"
         )
@@ -980,34 +989,34 @@ class ObsidianExportBoundaryTest(VaultFixture):
             json.dumps(graph(canary="vaultOwnedCanary"), ensure_ascii=False) + "\n",
         )
         self.configure(target, consumer="cloud")
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary("cloud"))
         vault_graph = (self.root / "graph" / "graph.json").read_text(encoding="utf-8")
         self.assertIn("vaultOwnedCanary", vault_graph)
 
     def test_human_owned_files_survive_a_resync(self) -> None:
         target = self.destination()
         self.configure(target, consumer="human")
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary("human"))
         outside = target / "human-note.md"
         inside = target / "brainskit" / "minha-anotacao.md"
         nested = target / "brainskit" / "wiki" / "human-inside.md"
         nested.parent.mkdir(parents=True, exist_ok=True)
         for path in (outside, inside, nested):
             path.write_text("humano", encoding="utf-8")
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary("human"))
         for path in (outside, inside, nested):
             self.assertTrue(path.is_file(), path)
 
     def test_stale_managed_files_are_still_pruned(self) -> None:
         target = self.destination()
         self.configure(target, consumer="human")
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary("human"))
         stale = target / "brainskit" / "wiki" / "gone.md"
         stale.write_text("stale", encoding="utf-8")
         self.integrations._record(
             "obsidian", {"managed_files": ["wiki/gone.md", "graph/graph.json"]}
         )
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary("human"))
         self.assertFalse(stale.exists())
         self.assertTrue((target / "brainskit" / "graph" / "graph.json").is_file())
 
@@ -1017,10 +1026,10 @@ class ObsidianExportBoundaryTest(VaultFixture):
         raw.parent.mkdir(parents=True, exist_ok=True)
         raw.write_text("raw bytes", encoding="utf-8")
         self.configure(target, consumer="human")
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary("human"))
         self.assertFalse((target / "brainskit" / "raw").exists())
         self.configure(target, include_raw=True)
-        result = self.integrations.sync("obsidian", graph())
+        result = self.integrations.sync("obsidian", graph(), self.boundary("human"))
         self.assertTrue((target / "brainskit" / "raw" / "_inbox" / "note.md").is_file())
         self.assertIn("graph/graph.json", result["managed_files"])
 
@@ -1031,7 +1040,7 @@ class ObsidianExportBoundaryTest(VaultFixture):
             managed=False,
             options={"path": str(self.root)},
         )
-        result = self.integrations.sync("obsidian", graph())
+        result = self.integrations.sync("obsidian", graph(), self.boundary())
         self.assertEqual(result["mode"], "in-place")
         self.assertEqual(result["managed_files"], 0)
         self.assertEqual(
@@ -1153,7 +1162,7 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
         self.configure("../mirror-beside-the-vault")
         beside = (self.root.parent / "mirror-beside-the-vault").resolve()
         self.addCleanup(shutil.rmtree, beside, True)
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary())
         self.assert_untouched(enclosing)
         self.assertTrue((beside / "brainskit" / "graph" / "graph.json").is_file())
 
@@ -1168,7 +1177,7 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
         self.stand_elsewhere()
         self.configure("inside")
         with self.assertRaises(ValidationError) as refused:
-            self.integrations.sync("obsidian", graph())
+            self.integrations.sync("obsidian", graph(), self.boundary())
         self.assertIn("nested inside the source vault", str(refused.exception))
         self.assertFalse((self.root / "inside").exists())
 
@@ -1186,7 +1195,7 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
         self.configure("MyObsidian")
         self.integrations._record("obsidian", {"path": str(legacy)})
         with self.assertRaises(BrainskitError) as refused:
-            self.integrations.sync("obsidian", graph())
+            self.integrations.sync("obsidian", graph(), self.boundary())
         details = refused.exception.details
         self.assertEqual(refused.exception.code, "not_configured")
         self.assertEqual(details["synced_at"], str(legacy))
@@ -1206,9 +1215,9 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
         self.configure("../mirror-beside-the-vault")
         beside = (self.root.parent / "mirror-beside-the-vault").resolve()
         self.addCleanup(shutil.rmtree, beside, True)
-        first = self.integrations.sync("obsidian", graph())
+        first = self.integrations.sync("obsidian", graph(), self.boundary())
         self.stand_elsewhere()
-        second = self.integrations.sync("obsidian", graph())
+        second = self.integrations.sync("obsidian", graph(), self.boundary())
         self.assertEqual(second["path"], first["path"])
         self.assertEqual(second["state"], "ready")
 
@@ -1218,9 +1227,9 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
         self.configure("../mirror-beside-the-vault")
         beside = (self.root.parent / "mirror-beside-the-vault").resolve()
         self.addCleanup(shutil.rmtree, beside, True)
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary())
         self.configure("../mirror-beside-the-vault", subdirectory="notes")
-        result = self.integrations.sync("obsidian", graph())
+        result = self.integrations.sync("obsidian", graph(), self.boundary())
         self.assertEqual(result["path"], str(beside / "notes"))
 
     def test_an_absolute_destination_is_never_a_relocation(self) -> None:
@@ -1228,10 +1237,10 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
 
         first_target = self.elsewhere()
         self.configure(str(first_target))
-        self.integrations.sync("obsidian", graph())
+        self.integrations.sync("obsidian", graph(), self.boundary())
         second_target = self.elsewhere()
         self.configure(str(second_target))
-        result = self.integrations.sync("obsidian", graph())
+        result = self.integrations.sync("obsidian", graph(), self.boundary())
         self.assertEqual(result["path"], str((second_target / "brainskit").resolve()))
 
     def test_a_first_sync_has_nothing_to_orphan(self) -> None:
@@ -1239,7 +1248,7 @@ class ObsidianDestinationIsAVaultPropertyTest(VaultFixture):
         self.configure("../mirror-beside-the-vault")
         beside = (self.root.parent / "mirror-beside-the-vault").resolve()
         self.addCleanup(shutil.rmtree, beside, True)
-        result = self.integrations.sync("obsidian", graph())
+        result = self.integrations.sync("obsidian", graph(), self.boundary())
         self.assertEqual(result["path"], str(beside / "brainskit"))
         self.assert_untouched(enclosing)
 

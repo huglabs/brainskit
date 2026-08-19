@@ -17,22 +17,21 @@ from collections import defaultdict
 from pathlib import PurePosixPath
 from typing import Any
 
-from brainskit.application.freshness import GRAPH_PROJECTION, VIEWS_PROJECTION
+from brainskit.application.freshness import (
+    GRAPH_PROJECTION,
+    VIEWS_PROJECTION,
+    FreshnessLedger,
+)
 from brainskit.application.health import Health
 from brainskit.application.pages import GENERATED_MARKER
 from brainskit.application.ports import GraphPort, IntegrationPort, VaultPort
-from brainskit.application.privacy import (
-    _consumer_allows,
-    _evidence_privacy,
-    _privacy_for_record,
-    _validate_consumer,
-    _view_branch,
-)
+from brainskit.application.privacy import for_consumer
 from brainskit.domain.model import (
     NotConfiguredError,
     SourceRecord,
     ValidationError,
 )
+from brainskit.domain.privacy import Consumer, view_branch
 
 # File exports leave the vault, so they default to the local boundary and never
 # carry never-ingest evidence unless the caller widens it on purpose.
@@ -47,6 +46,42 @@ EXPORT_SUFFIXES = {
     "llms-txt": "txt",
 }
 
+#: Option values that describe the machine's own layout -- where files live,
+#: how to reach a database, which container holds it. The operator needs them
+#: to administer the integration; a machine consumer asking "is it up?" does
+#: not, and each one is disclosure in its own right.
+_LAYOUT_OPTION_KEYS = frozenset(
+    {"path", "subdirectory", "uri", "dsn", "container_name"}
+)
+#: Runtime counterparts, recorded by up/down/sync: filesystem paths, container
+#: names, and the per-file listing an Obsidian sync leaves behind.
+_LAYOUT_RUNTIME_KEYS = frozenset(
+    {"path", "log", "uri", "dsn", "container", "managed_files"}
+)
+
+
+def _without_layout(values: dict[str, Any], layout: frozenset[str]) -> dict[str, Any]:
+    # `*_env` is the house convention for "the name of the environment
+    # variable holding a secret" (password_env, dsn_env, token_env); the name
+    # alone maps the machine, so the suffix is stripped as a class rather than
+    # key by key.
+    return {
+        key: value
+        for key, value in values.items()
+        if key not in layout and not key.endswith("_env")
+    }
+
+
+def _sans_machine_layout(row: dict[str, Any]) -> dict[str, Any]:
+    scrubbed = dict(row)
+    options = row.get("options")
+    if isinstance(options, dict):
+        scrubbed["options"] = _without_layout(options, _LAYOUT_OPTION_KEYS)
+    runtime = row.get("runtime")
+    if isinstance(runtime, dict):
+        scrubbed["runtime"] = _without_layout(runtime, _LAYOUT_RUNTIME_KEYS)
+    return scrubbed
+
 
 class Projections:
     """Generated views and graph, plus every path evidence takes out."""
@@ -55,31 +90,26 @@ class Projections:
         self,
         vault: VaultPort,
         health: Health,
+        ledger: FreshnessLedger,
         graph_port: GraphPort | None = None,
         integrations: IntegrationPort | None = None,
     ):
         self.vault = vault
         self.health = health
+        self.ledger = ledger
         self.graph_port = graph_port
         self.integration_port = integrations
 
 
     def views(self, *, consumer: str = "human") -> dict[str, Any]:
-        _validate_consumer(consumer)
+        boundary = for_consumer(consumer, self.vault)
         status = self.health.status()
-        config = self.vault.config()
-        all_records = self.vault.registry()
-        records = {
-            content_hash: record
-            for content_hash, record in all_records.items()
-            if _consumer_allows(consumer, _privacy_for_record(config, record))
-        }
-        freshness = self.vault.read_state("freshness").get("pages", {})
+        records, _ = boundary.split_records()
+        freshness = self.ledger.snapshot()
         pages = {}
         for path in self.vault.wiki_pages():
             content = self.vault.read_text(path)
-            privacy = _evidence_privacy({"path": path}, content, all_records, config)
-            if _consumer_allows(consumer, privacy):
+            if boundary.allows_evidence({"path": path}, content):
                 pages[path] = content
         home = [
             GENERATED_MARKER,
@@ -97,7 +127,7 @@ class Projections:
         written = ["views/home.md"]
         by_branch: dict[str, list[SourceRecord]] = defaultdict(list)
         for record in sorted(records.values(), key=lambda item: item.path):
-            by_branch[_view_branch(record)].append(record)
+            by_branch[view_branch(record)].append(record)
         # Every known branch is rewritten, including the ones the consumer cannot
         # see, so a narrower run always overwrites a wider run's rows.
         for branch in status["by_branch"]:
@@ -122,10 +152,7 @@ class Projections:
                     f"[[{PurePosixPath(path).stem}]]" for path in linked_paths
                 ]
                 freshness_badges = sorted(
-                    {
-                        str(freshness.get(path, {}).get("status", "unknown"))
-                        for path in linked_paths
-                    }
+                    {freshness.status(path) for path in linked_paths}
                 )
                 rows.append(
                     "| "
@@ -137,7 +164,7 @@ class Projections:
             self.vault.write_generated(view_path, "\n".join(rows) + "\n")
             written.append(view_path)
         self.vault.write_generated("views/home.md", "\n".join(home) + "\n")
-        self.health._record_projection(VIEWS_PROJECTION)
+        self.ledger.record_projection(VIEWS_PROJECTION)
         return {"written": written}
 
     def graph(
@@ -167,7 +194,7 @@ class Projections:
                 "graph/graph.html", self.graph_port.export(graph, "html")
             )
             written.append("graph/graph.html")
-        self.health._record_projection(GRAPH_PROJECTION)
+        self.ledger.record_projection(GRAPH_PROJECTION)
         return {
             "consumer": consumer,
             "nodes": len(graph["nodes"]),
@@ -201,25 +228,20 @@ class Projections:
 
         if not self.graph_port:
             raise NotConfiguredError("Graph adapter is not configured")
-        _validate_consumer(consumer)
+        boundary = for_consumer(consumer, self.vault)
         graph = self.graph_port.build(self.vault)
-        records = self.vault.registry()
-        config = self.vault.config()
         allowed: set[str] = set()
         for node in graph["nodes"]:
             node_id = str(node["id"])
             if node_id.startswith("raw:"):
                 content_hash = node_id.removeprefix("raw:")
-                record = records.get(content_hash)
-                if record and _consumer_allows(
-                    consumer, _privacy_for_record(config, record)
-                ):
+                record = boundary.records.get(content_hash)
+                if record and boundary.allows_record(record):
                     allowed.add(node_id)
                 continue
             path = str(node.get("path", ""))
             content = self.vault.read_text(path)
-            privacy = _evidence_privacy(node, content, records, config)
-            if _consumer_allows(consumer, privacy):
+            if boundary.allows(boundary.evidence_privacy(node, content)):
                 allowed.add(node_id)
         kept_nodes = [node for node in graph["nodes"] if node["id"] in allowed]
         kept_edges = [
@@ -287,7 +309,7 @@ class Projections:
     ) -> dict[str, Any]:
         if not self.graph_port:
             raise NotConfiguredError("Graph adapter is not configured")
-        _validate_consumer(consumer)
+        Consumer.parse(consumer)
         if target in INTEGRATION_TARGETS:
             # An integration's contents follow its own policy, and enrichment
             # is not part of one. Refuse rather than quietly ignore the flag:
@@ -342,8 +364,29 @@ class Projections:
             options=options or {},
         )
 
-    def integration_status(self, name: str | None = None) -> dict[str, Any]:
-        return self._require_integrations().status(name)
+    def integration_status(
+        self, name: str | None = None, *, consumer: str = "human"
+    ) -> dict[str, Any]:
+        """Integration policy and runtime state, scoped to a consumer.
+
+        `human` receives the operator's report exactly as the adapter builds
+        it. A machine consumer gets the same rows with the machine-layout
+        disclosure stripped -- option values that are filesystem paths, DSNs
+        or env-var names, and runtime file listings -- because "is the
+        integration up?" never needed any of them to be answerable.
+        """
+
+        parsed = Consumer.parse(consumer)
+        payload = self._require_integrations().status(name)
+        if parsed is Consumer.HUMAN:
+            return payload
+        return {
+            **payload,
+            "integrations": [
+                _sans_machine_layout(row) for row in payload["integrations"]
+            ],
+            "consumer": parsed.value,
+        }
 
     def integration_up(self, name: str) -> dict[str, Any]:
         if name == "obsidian":
@@ -354,12 +397,15 @@ class Projections:
         return self._require_integrations().down(name)
 
     def integration_sync(self, name: str) -> dict[str, Any]:
-        graph = self._integration_graph(name)
+        consumer = self._integration_consumer(name)
+        graph = self.graph_data(consumer=consumer)
         if name == "obsidian":
             # Views are copied into the Obsidian vault, so they are generated
             # under the same boundary as the graph that ships with them.
-            self.views(consumer=str(graph["consumer"]))
-        return self._require_integrations().sync(name, graph)
+            self.views(consumer=consumer)
+        return self._require_integrations().sync(
+            name, graph, boundary=for_consumer(consumer, self.vault)
+        )
 
     def _require_integrations(self) -> IntegrationPort:
         if not self.integration_port:
@@ -391,8 +437,5 @@ class Projections:
                     "hint": "Set consumer to local or cloud before syncing",
                 },
             )
-        _validate_consumer(consumer)
+        Consumer.parse(consumer)
         return consumer
-
-    def _integration_graph(self, name: str) -> dict[str, Any]:
-        return self.graph_data(consumer=self._integration_consumer(name))

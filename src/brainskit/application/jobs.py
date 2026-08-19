@@ -17,21 +17,22 @@ import re
 from typing import Any
 
 from brainskit.application.filing import Filing
+from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import VaultPort
-from brainskit.application.privacy import (
-    _branch_policy,
-    _context_branches,
-    _privacy_for_record,
-    _record_branch,
-)
+from brainskit.application.privacy import for_consumer
 from brainskit.application.retrieval import Retrieval
 from brainskit.domain.model import (
     PolicyError,
     PrivacyMode,
     VaultConfig,
     utc_now,
+)
+from brainskit.domain.privacy import (
+    context_branches,
+    record_branch,
+    resolve_branch_policy,
 )
 
 #: Conversation bounds for `Jobs.ask`. History is model context only -- it
@@ -97,7 +98,7 @@ def _resolved_query_route(
         return None, None
     try:
         policies = [
-            _branch_policy(config, branch) for branch in (branches or ["_inbox"])
+            resolve_branch_policy(config, branch) for branch in (branches or ["_inbox"])
         ]
     except PolicyError:
         return None, None
@@ -127,12 +128,14 @@ class Jobs:
         judgment_runner: JudgmentRunner,
         health: Health,
         filing: Filing,
+        ledger: FreshnessLedger,
     ):
         self.vault = vault
         self.retrieval = retrieval
         self.judgment_runner = judgment_runner
         self.health = health
         self.filing = filing
+        self.ledger = ledger
 
 
     def ask(
@@ -151,7 +154,7 @@ class Jobs:
         # burying the terms this question is actually about. History is model
         # context for *interpreting* the question, and rides only the prompt.
         context = self.retrieval.context(question, include_apply_contract=False)
-        branches = _context_branches(context)
+        branches = context_branches(context)
         response = self.judgment_runner.run(
             job="query",
             branches=branches,
@@ -188,13 +191,10 @@ class Jobs:
             key=lambda item: item.captured_at,
             reverse=True,
         )[:50]
-        config = self.vault.config()
-        allowed_recent = [
-            record
-            for record in recent
-            if _privacy_for_record(config, record) != PrivacyMode.NEVER_INGEST
-        ]
-        digest_branches = sorted({_record_branch(record) for record in allowed_recent})
+        # `local` is the boundary that excludes exactly never-ingest evidence.
+        boundary = for_consumer("local", self.vault)
+        allowed_recent = [record for record in recent if boundary.allows_record(record)]
+        digest_branches = sorted({record_branch(record) for record in allowed_recent})
         if not digest_branches:
             digest_branches = ["_inbox"]
         digest_payload = self.judgment_runner.run(
@@ -210,7 +210,7 @@ class Jobs:
                     self.filing.proposals(), ensure_ascii=False
                 ),
                 "freshness": json.dumps(
-                    self.vault.read_state("freshness"), ensure_ascii=False
+                    self.ledger.snapshot().state, ensure_ascii=False
                 ),
             },
         )
@@ -225,26 +225,18 @@ class Jobs:
         }
 
     def resurface(self) -> dict[str, Any]:
-        freshness = self.vault.read_state("freshness")
         # `resurface` only ever reads (see `ask`, above, for why this stays off).
         context = self.retrieval.context(
             "durable insight worth revisiting", limit=20, include_apply_contract=False
         )
         result = self.judgment_runner.run(
             job="resurface",
-            branches=_context_branches(context),
+            branches=context_branches(context),
             variables={"context": json.dumps(context, ensure_ascii=False)},
         )
         path = f"output/resurface/{utc_now()[:10]}.md"
         self.vault.write_generated(path, str(result["markdown"]).rstrip() + "\n")
-        page = str(result["page"])
-
-        def mutate(state: dict[str, Any]) -> dict[str, Any]:
-            pages = state.setdefault("pages", {})
-            entry = pages.setdefault(page, {})
-            entry["last_resurfaced_at"] = utc_now()
-            return state
-
-        if page in freshness.get("pages", {}) or page in self.vault.wiki_pages():
-            self.vault.mutate_state("freshness", mutate)
+        # An annotation, not a freshness verdict -- see `record_resurfaced`,
+        # which also refuses to invent an entry for a page that is not there.
+        self.ledger.record_resurfaced(str(result["page"]))
         return {**result, "path": path}

@@ -14,10 +14,14 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from brainskit.application import installer
+from brainskit.application.gate import INSTRUCTION_END, INSTRUCTION_START
+from brainskit.application.install import agent_install
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import NotFoundError, ValidationError
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.integrations import NativeIntegrations
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces import cli, console, onboarding, prompt
 from brainskit.interfaces.mcp import (
@@ -25,6 +29,7 @@ from brainskit.interfaces.mcp import (
     MCP_PROTOCOL_VERSION,
     BrainskitMcpHttpHandler,
     BrainskitMcpHttpServer,
+    _call_tool,
     _safe_reason,
     _tool_definitions,
     run_stdio,
@@ -601,7 +606,15 @@ class McpHttpContractTest(unittest.TestCase):
         self.assertEqual(broken_body["error"]["code"], -32600)
 
     def test_tool_level_validation_stays_a_jsonrpc_error_at_200(self) -> None:
-        """Only transport failures become HTTP errors; tool errors do not."""
+        """Only transport failures become HTTP errors; tool errors do not.
+
+        The HTTP status is the claim this test exists for and it is unchanged.
+        The JSON-RPC code moved from `-32600` to `-32000` when ADR 0006 gave
+        the two transports one table: `-32600` means "the JSON sent is not a
+        valid Request object", and this request object is valid -- it is the
+        tool named inside it that does not exist. stdio has always answered
+        `-32000` here; the divergence was the bug.
+        """
 
         status, body, _ = self._post(
             {
@@ -613,7 +626,10 @@ class McpHttpContractTest(unittest.TestCase):
             version=MCP_PROTOCOL_VERSION,
         )
         self.assertEqual(status, HTTPStatus.OK)
-        self.assertEqual(body["error"]["code"], -32600)
+        self.assertEqual(body["error"]["code"], -32000)
+        # And the machine-readable code now survives the HTTP transport, which
+        # dropped it entirely while it built its own `data` member.
+        self.assertEqual(body["error"]["data"]["code"], "validation_error")
         unknown, unknown_body, _ = self._post(
             {"jsonrpc": "2.0", "id": 9, "method": "no/such/method"},
             version=MCP_PROTOCOL_VERSION,
@@ -704,6 +720,32 @@ class McpConsumerSchemaTest(unittest.TestCase):
             self.assertIn("consumer", tool["inputSchema"]["required"])
 
 
+class McpIntegrationStatusConsumerTest(unittest.TestCase):
+    """integration_status over MCP names the machine boundary explicitly.
+
+    The tool schema declares no consumer, so the call inherits the transport's
+    own scope: `local`, the same boundary resources/list and resources/read
+    already hardcode. Before the fix the call was bare, which handed a machine
+    caller the unfiltered human payload.
+    """
+
+    def test_the_tool_passes_the_local_consumer(self) -> None:
+        service = RecordingService()
+        _call_tool(service, "integration_status", {})  # type: ignore[arg-type]
+        name, args, kwargs = service.calls[-1]
+        self.assertEqual(name, "integration_status")
+        self.assertEqual(args, (None,))
+        self.assertEqual(kwargs.get("consumer"), "local")
+
+    def test_a_named_integration_keeps_the_local_consumer(self) -> None:
+        service = RecordingService()
+        _call_tool(service, "integration_status", {"name": "web"})  # type: ignore[arg-type]
+        name, args, kwargs = service.calls[-1]
+        self.assertEqual(name, "integration_status")
+        self.assertEqual(args, ("web",))
+        self.assertEqual(kwargs.get("consumer"), "local")
+
+
 class AgentInstallTest(unittest.TestCase):
     """`hooks install` seeds the skill and the graph instructions."""
 
@@ -724,7 +766,8 @@ class AgentInstallTest(unittest.TestCase):
         return cli._install_hooks(self.service, agent, force=force)
 
     def instructions(self, agent: str = "claude") -> str:
-        return (self.root / cli.INSTRUCTION_FILES[agent]).read_text(encoding="utf-8")
+        target = self.root / agent_install(agent).instructions
+        return target.read_text(encoding="utf-8")
 
     def skill_path(self) -> Path:
         return self.root / ".claude" / "skills" / "brainskit" / "SKILL.md"
@@ -753,8 +796,8 @@ class AgentInstallTest(unittest.TestCase):
         for _ in range(3):
             self.install()
         content = self.instructions()
-        self.assertEqual(content.count(cli.INSTRUCTION_START), 1)
-        self.assertEqual(content.count(cli.INSTRUCTION_END), 1)
+        self.assertEqual(content.count(INSTRUCTION_START), 1)
+        self.assertEqual(content.count(INSTRUCTION_END), 1)
 
     def test_reinstalling_is_byte_identical(self) -> None:
         self.install()
@@ -773,10 +816,8 @@ class AgentInstallTest(unittest.TestCase):
         )
         self.install()
         content = self.instructions()
-        self.assertLess(content.index("# Topo"), content.index(cli.INSTRUCTION_START))
-        self.assertGreater(
-            content.index("## Rodape"), content.index(cli.INSTRUCTION_END)
-        )
+        self.assertLess(content.index("# Topo"), content.index(INSTRUCTION_START))
+        self.assertGreater(content.index("## Rodape"), content.index(INSTRUCTION_END))
 
     def test_an_existing_skill_is_not_replaced_without_force(self) -> None:
         self.skill_path().parent.mkdir(parents=True, exist_ok=True)
@@ -800,11 +841,11 @@ class AgentInstallTest(unittest.TestCase):
     def test_templates_are_packaged_with_the_distribution(self) -> None:
         for name in ("claude-skill", "instructions"):
             with self.subTest(template=name):
-                self.assertTrue(cli._agent_template(name, self.root))
+                self.assertTrue(installer._agent_template(name, self.root))
 
     def test_an_unknown_template_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
-            cli._agent_template("does-not-exist", self.root)
+            installer._agent_template("does-not-exist", self.root)
 
 
 class WebViewerBoundaryTest(unittest.TestCase):
@@ -894,6 +935,103 @@ class WebViewerBoundaryTest(unittest.TestCase):
             build_server(
                 self.service, host="0.0.0.0", port=0, consumer="local"  # noqa: S104
             )
+
+
+class WebIntegrationsConsumerTest(unittest.TestCase):
+    """/api/integrations answers under the viewer's bound consumer.
+
+    Before the fix the handler called `integration_status()` bare, so a viewer
+    bound at a machine consumer received the human payload over HTTP —
+    filesystem paths and secret-bearing env-var names included. ADR 0001 names
+    this as one of the two behavioral gaps the seam closes: "machine consumers
+    no longer receive filesystem paths, container names, DSN env names".
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.obsidian_target = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        vault = FileVault.initialize(root, policy())
+        self.service = BrainskitService(
+            vault,
+            SqliteFtsIndex(vault.index_path),
+            graph=MarkdownGraph(),
+            integrations=NativeIntegrations(vault),
+        )
+        self.service.integration_configure(
+            "obsidian",
+            enabled=True,
+            managed=False,
+            options={"path": self.obsidian_target.name, "subdirectory": "brainskit"},
+        )
+        self.service.integration_configure(
+            "postgres",
+            enabled=True,
+            managed=False,
+            options={"dsn_env": "BRAINSKIT_TEST_PG_DSN", "consumer": "local"},
+        )
+
+    def tearDown(self) -> None:
+        self.obsidian_target.cleanup()
+        self.temporary.cleanup()
+
+    def _fetch(self, consumer: str) -> tuple[int, str]:
+        server = build_server(self.service, host="127.0.0.1", port=0, consumer=consumer)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(f"http://127.0.0.1:{server.server_port}/api/integrations")
+            try:
+                with urlopen(request, timeout=3) as response:
+                    return response.status, response.read().decode("utf-8")
+            except HTTPError as error:
+                return error.code, error.read().decode("utf-8")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_the_handler_forwards_the_bound_consumer(self) -> None:
+        recording = RecordingService()
+        server = build_server(
+            recording,  # type: ignore[arg-type]
+            host="127.0.0.1",
+            port=0,
+            consumer="local",
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/integrations", timeout=3
+            ) as response:
+                self.assertEqual(response.status, HTTPStatus.OK)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertEqual(
+            recording.calls[-1],
+            ("integration_status", (), {"consumer": "local"}),
+        )
+
+    def test_a_machine_viewer_receives_no_machine_layout_disclosure(self) -> None:
+        leak_path = self.obsidian_target.name
+        status, human_body = self._fetch("human")
+        self.assertEqual(status, HTTPStatus.OK)
+        # Control: the human payload really carries the layout the machine
+        # assertions below are about, so absence there is filtering at work,
+        # not a vacuously green test.
+        self.assertIn(leak_path, human_body)
+        self.assertIn("BRAINSKIT_TEST_PG_DSN", human_body)
+
+        status, machine_body = self._fetch("local")
+        self.assertEqual(status, HTTPStatus.OK)
+        payload = json.loads(machine_body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"].get("consumer"), "local")
+        self.assertNotIn(leak_path, machine_body)
+        self.assertNotIn("BRAINSKIT_TEST_PG_DSN", machine_body)
 
 
 class RendererUnitTests(unittest.TestCase):

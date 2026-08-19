@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import re
 import shlex
 import subprocess
 import sys
@@ -11,26 +10,18 @@ import time
 import traceback
 from collections import Counter
 from collections.abc import Callable, Sequence
-from importlib.resources import files
 from pathlib import Path
 from typing import IO, Any, NamedTuple
 
 from brainskit import __version__
-from brainskit.application.gate import (
-    DEFAULT_DENY_PREFIXES,
-    HOOK_SENTINEL,
-    INSTRUCTION_END,
-    INSTRUCTION_START,
-)
-from brainskit.application.health import redirected_git_hooks_path
+from brainskit.application.install import INSTRUCTIONS
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     BrainskitError,
-    NotConfiguredError,
     NotFoundError,
-    PolicyError,
     ValidationError,
 )
+from brainskit.domain.privacy import Consumer
 from brainskit.infrastructure import pyenv
 from brainskit.infrastructure.extractor import (
     GraphifyExtractor,
@@ -43,13 +34,21 @@ from brainskit.infrastructure.integrations import NativeIntegrations, vault_id
 from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainskit.infrastructure.vault import FileVault
 from brainskit.infrastructure.vaults import RegisteredVault, VaultRegistry
-from brainskit.interfaces import console, onboarding, prompt
+from brainskit.interfaces import console, errors, onboarding, prompt
+from brainskit.interfaces.errors import error_envelope, install_hint_for
 
 
 class InternalError(BrainskitError):
     """An unmodelled adapter failure that reached the CLI boundary."""
 
     code = "internal_error"
+
+
+#: The `--consumer` values, derived from the enum that already owns them rather
+#: than spelled into ten `add_argument` calls. `argparse` wants a plain list;
+#: `Consumer` decides what is in it, and `Consumer.parse` is still the only
+#: thing that turns one of these strings into a boundary.
+CONSUMER_CHOICES = [consumer.value for consumer in Consumer]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,13 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     search = commands.add_parser("search", help="Search with FTS5 BM25")
     search.add_argument("query", help="Full-text query")
     search.add_argument("--limit", type=int, default=10, help="Maximum hits to return (default: 10)")
-    search.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
+    search.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary to read under; required with --json")
 
     context = commands.add_parser("context", help="Build a bounded evidence bundle")
     context.add_argument("query", help="Topic to gather evidence for")
     context.add_argument("--limit", type=int, default=8, help="Maximum evidence items to bundle (default: 8)")
     context.add_argument("--max-chars", type=int, default=24_000, help="Truncate the bundle to roughly this many characters")
-    context.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
+    context.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary to read under; required with --json")
 
     apply_command = commands.add_parser(
         "apply", help="Validate and atomically stage wiki writes"
@@ -179,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enrich_apply.add_argument("proposal", help="Proposal JSON path, or - for stdin")
     enrich_list = enrich_sub.add_parser("list", help="Stored edges, privacy-filtered")
-    enrich_list.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary to read under; required with --json")
+    enrich_list.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary to read under; required with --json")
     enrich_forget = enrich_sub.add_parser("forget", help="Drop one stored edge")
     enrich_forget.add_argument("id", metavar="ID", help="Full or prefix edge id")
 
@@ -191,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     # with nothing on it saying which boundary it was built under.
     graph.add_argument(
         "--consumer",
-        choices=["human", "local", "cloud"],
+        choices=CONSUMER_CHOICES,
         help="Privacy boundary the written graph is built inside (default: local)",
     )
 
@@ -296,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         reader.add_argument(
             "--consumer",
-            choices=["human", "local", "cloud"],
+            choices=CONSUMER_CHOICES,
             default="local",
             help="The code graph carries repository paths and never leaves the machine",
         )
@@ -318,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Export format: json, graphml, cypher, kuzu, llms-txt, or an integration")
     export.add_argument(
         "--consumer",
-        choices=["human", "local", "cloud"],
+        choices=CONSUMER_CHOICES,
         default="local",
         help=(
             "Privacy boundary written into the export; defaults to local, "
@@ -453,7 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     integration_configure.add_argument("--bolt-port", type=int, help="Bolt port (Neo4j)")
     integration_configure.add_argument("--token-env", help="Environment variable holding the bearer token")
     integration_configure.add_argument(
-        "--consumer", choices=["human", "local", "cloud"],
+        "--consumer", choices=CONSUMER_CHOICES,
         help="Privacy boundary this integration receives")
     integration_status = integration_sub.add_parser("status")
     integration_status.add_argument(
@@ -521,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vaults_sync.add_argument(
         "--consumer",
-        choices=["human", "local", "cloud"],
+        choices=CONSUMER_CHOICES,
         help=(
             "Refused on purpose. Each vault's privacy boundary comes from its "
             "own integration policy; see bk integration configure --consumer"
@@ -531,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     web = commands.add_parser("web", help="Run the complete local web viewer")
     web.add_argument("--host", help="Interface to bind; non-loopback requires --token-env")
     web.add_argument("--port", type=int, help="Port to bind")
-    web.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary the viewer reads under; writes need human")
+    web.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary the viewer reads under; writes need human")
     web.add_argument("--token-env", help="Environment variable holding the bearer token")
     web.add_argument(
         "--allowed-origin",
@@ -556,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--host", help="Interface to bind; non-loopback requires --token-env"
     )
     web_serve.add_argument("--port", type=int, help="Port to bind")
-    web_serve.add_argument("--consumer", choices=["human", "local", "cloud"], help="Privacy boundary the viewer reads under; writes need human")
+    web_serve.add_argument("--consumer", choices=CONSUMER_CHOICES, help="Privacy boundary the viewer reads under; writes need human")
     web_serve.add_argument(
         "--token-env", help="Environment variable holding the bearer token"
     )
@@ -1221,16 +1220,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             # not failures: declining an integration is the policy working.
             return 1
         return 0
-    except PolicyError as exc:
-        _emit_error(exc, json_mode=args.json)
-        return 3
     except BrainskitError as exc:
+        # One branch, not two. `policy_denied` is the only code that carries a
+        # different status, and the table in `interfaces/errors.py` is where it
+        # says so -- next to what the same code means over HTTP and JSON-RPC,
+        # rather than in an `except` ladder no other surface can read.
         _emit_error(exc, json_mode=args.json)
-        return 2
+        return errors.present(exc).exit_status
     except (OSError, json.JSONDecodeError) as exc:
         wrapped = BrainskitError(str(exc))
         _emit_error(wrapped, json_mode=args.json)
-        return 2
+        return errors.present(wrapped).exit_status
     except prompt.Cancelled as exc:
         # Dismissing a prompt is the operator declining, not the tool failing:
         # same exit status as the interrupt it stands in for, and no error
@@ -1417,7 +1417,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return service.views()
     if args.command == "graph":
         return service.graph(
-            consumer=args.consumer or "local", html=args.html
+            consumer=_consumer_for_args(args, default=Consumer.LOCAL), html=args.html
         )
     if args.command == "code":
         if args.code_command == "build":
@@ -1432,27 +1432,41 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return service.code_status()
         if args.code_command == "affected":
             return service.code_affected(
-                args.symbol, depth=args.depth, consumer=args.consumer
+                args.symbol,
+                depth=args.depth,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             )
         if args.code_command == "path":
-            return service.code_path(args.source, args.target, consumer=args.consumer)
+            return service.code_path(
+                args.source,
+                args.target,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
+            )
         if args.code_command == "hubs":
-            return service.code_hubs(top=args.top, consumer=args.consumer)
+            return service.code_hubs(
+                top=args.top,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
+            )
         if args.code_command == "communities":
             return service.code_communities(
-                resolution=args.resolution, consumer=args.consumer
+                resolution=args.resolution,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             )
         if args.code_command == "cycles":
             return service.code_cycles(
-                max_length=args.max_length, top=args.top, consumer=args.consumer
+                max_length=args.max_length,
+                top=args.top,
+                consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             )
         if args.code_command == "diff":
             against = _read_json(args.graph) if args.graph else None
-            return service.code_diff(against, consumer=args.consumer)
+            return service.code_diff(
+                against, consumer=_consumer_for_args(args, default=Consumer.LOCAL)
+            )
     if args.command == "export":
         return service.export(
             args.target,
-            consumer=args.consumer or "local",
+            consumer=_consumer_for_args(args, default=Consumer.LOCAL),
             enrichment=args.enrichment,
         )
     if args.command == "ingest":
@@ -1628,15 +1642,32 @@ def _guided_init(target: Path) -> onboarding.Outcome:
     return onboarding.run(target)
 
 
-def _consumer_for_args(args: argparse.Namespace) -> str:
+def _consumer_for_args(
+    args: argparse.Namespace, *, default: Consumer = Consumer.HUMAN
+) -> str:
+    """The one place the CLI decides which boundary an unnamed read runs under.
+
+    Two defaults, one rule, because the two are not the same decision. An
+    interactive read defaults to `human` -- the operator is the reader, and the
+    result goes no further than the terminal -- but a `--json` caller is not a
+    person and has to say who is, which is the refusal below. A read whose
+    output is a file or a graph defaults to `local` instead and carries no
+    refusal: the artifact outlives the command, and `human` withholds nothing.
+
+    Both used to be decided at the call site, `local` as a bare
+    `args.consumer or "local"` twice over -- once next to an `argparse`
+    `default="local"` that already said it, so the fallback was dead code
+    stating a rule the parser had stated first.
+    """
+
     if args.consumer:
         return str(args.consumer)
-    if args.json:
+    if default is Consumer.HUMAN and args.json:
         raise ValidationError(
             "Machine-readable output requires --consumer",
-            details={"choices": ["human", "local", "cloud"]},
+            details={"choices": CONSUMER_CHOICES},
         )
-    return "human"
+    return default.value
 
 
 def _watch(
@@ -1658,694 +1689,6 @@ def _watch(
             return result
         _emit(result, "watch", json_mode=json_mode)
         time.sleep(interval)
-
-
-INSTRUCTION_FILES = {
-    "claude": "CLAUDE.md",
-    "codex": "AGENTS.md",
-    "gemini": "GEMINI.md",
-    "opencode": "AGENTS.md",
-}
-#: The name this tool installs its artefacts under.
-#
-# Every artefact spells it identically -- `<brand>-gate.sh`, `# <brand>:
-# generated`, `<!-- <brand>:start -->`, `.claude/skills/<brand>/` -- which is
-# what lets one list of former names below cover all four classes at once.
-BRAND = "brainskit"
-
-#: Names this tool shipped under before. A rename has to *migrate* an install,
-#: not duplicate it.
-#
-# Every lookup in this module keys on the current name, so without this list a
-# pre-rename install survives the upgrade intact: its gate stays registered
-# beside the new one and keeps firing on every write against whatever vault it
-# was baked with, its scripts stay on disk beside the current ones, and the
-# instruction file ends up carrying two managed blocks that disagree about which
-# vault this workspace has. That is the state every pre-rename install lands in,
-# and this repository was the reference installation demonstrating it on itself.
-#
-# Hard-coded and finite deliberately. Deriving the set would mean guessing which
-# `*-gate.sh` in an operator's settings.json was once ours, and a wrong guess
-# deletes somebody else's hook -- the one failure worse than leaving debris.
-#
-# RENAMING AGAIN IS ONE ENTRY HERE. Append the name being retired and every
-# artefact class migrates, because they all spell the brand the same way.
-LEGACY_BRANDS: tuple[str, ...] = ("brainkit",)
-
-
-def _legacy_spellings(current: str) -> tuple[str, ...]:
-    """`current` as each former brand spelled it, for artefacts to migrate."""
-
-    return tuple(
-        current.replace(BRAND, legacy) for legacy in LEGACY_BRANDS if BRAND in current
-    )
-
-
-def _managed_block_re(start: str, end: str) -> re.Pattern[str]:
-    return re.compile(rf"{re.escape(start)}.*?{re.escape(end)}\n?", re.DOTALL)
-
-
-_MANAGED_BLOCK_RE = _managed_block_re(INSTRUCTION_START, INSTRUCTION_END)
-
-#: Each former brand's managed block: the start marker to look for, and the
-#: pattern that spans it. Built from the current markers so a brand added above
-#: needs nothing here.
-_LEGACY_MANAGED_BLOCKS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (
-        INSTRUCTION_START.replace(BRAND, legacy),
-        _managed_block_re(
-            INSTRUCTION_START.replace(BRAND, legacy),
-            INSTRUCTION_END.replace(BRAND, legacy),
-        ),
-    )
-    for legacy in LEGACY_BRANDS
-)
-
-#: Stands in for the new block while former blocks are being removed around it.
-#
-# Inserting the real block first and deleting afterwards would be correct only
-# while no former brand name is a substring of the current one; a future rename
-# where it is would have the deletion pass eat the block just written. A token
-# carrying NUL cannot occur in a file this module writes, so it is safe to plant
-# and is always swapped back out below.
-_BLOCK_ANCHOR = "\x00brainskit:managed-block\x00"
-
-
-class ClaudeHook(NamedTuple):
-    """A Claude Code hook brainskit ships, installs and registers."""
-
-    template: str
-    event: str
-    matcher: str | None
-    timeout: int
-
-
-CLAUDE_HOOKS: tuple[ClaudeHook, ...] = (
-    ClaudeHook("brainskit-gate", "PreToolUse", "Write|Edit|MultiEdit", 10),
-    # SessionStart carries no matcher so every session source is covered; the
-    # settings schema treats an absent matcher as "all", which is how the other
-    # session-scoped hooks in a real settings file are written.
-    ClaudeHook("brainskit-status", "SessionStart", None, 15),
-)
-
-GATE_REMEDIATION: dict[str, str] = {
-    "wiki/": "Wiki pages are written only by the apply gate. Use: bk apply",
-    "raw/": "Sources are immutable and hash-identified. Use: bk capture",
-}
-
-
-def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
-    """The adapter file, written as policy the gate reads rather than prose.
-
-    `rules` stays for the human who opens the vault. `gate` is what code reads,
-    which is the whole point: metadata with a consumer stays accurate, and
-    metadata without one rots into something that merely looks like enforcement.
-
-    `workspace` records where the agent's configuration was installed, because
-    that is not always the vault and nothing else on disk remembers it. Without
-    it `bk status` would look for hooks beside the vault, find none, and report
-    every layer off while they are in fact guarding the project correctly.
-    """
-    return {
-        "agent": agent,
-        "version": 2,
-        "workspace": str(workspace),
-        "gate": {
-            "deny_prefixes": list(DEFAULT_DENY_PREFIXES),
-            "remediation": dict(GATE_REMEDIATION),
-        },
-        "rules": [
-            "Read evidence with bk context --json --consumer local",
-            "Write wiki pages only with bk apply",
-            "Never edit raw content",
-        ],
-    }
-
-
-def _agent_template(name: str, vault: Path) -> str:
-    resource = files("brainskit").joinpath("templates", "agents", f"{name}.md")
-    if not resource.is_file():
-        raise NotConfiguredError(
-            "Agent template is missing from the installation",
-            details={"template": name},
-        )
-    return resource.read_text(encoding="utf-8").replace("{{vault}}", str(vault))
-
-
-def _hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
-    """Render a shipped hook script with the vault and workspace baked in.
-
-    Both paths are shell-quoted, not interpolated raw: real paths carry spaces
-    and non-ASCII, and a hook that cannot parse its own argument would fail
-    open on every write it was installed to govern.
-
-    The workspace is separate because the git repository, the instruction file
-    and the hooks live with the project, not with the vault. A script that
-    looked for them beside the vault would report a live enforcement layer as
-    OFF for every vault nested inside the project it guards.
-    """
-    resource = files("brainskit").joinpath("templates", "agents", f"{name}.sh")
-    if not resource.is_file():
-        raise NotConfiguredError(
-            "Agent hook script is missing from the installation",
-            details={"script": name},
-        )
-    return (
-        resource.read_text(encoding="utf-8")
-        .replace("{{vault}}", shlex.quote(str(vault)))
-        .replace("{{workspace}}", shlex.quote(str(workspace or vault)))
-    )
-
-
-def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
-    """Install the Claude Code skill that teaches the vault contract.
-
-    A former brand's skill directory is reported alongside — an already-current
-    install is exactly where that debris hides, so the report is attached to
-    every outcome rather than only to the one that writes.
-    """
-    skill = root / ".claude" / "skills" / BRAND / "SKILL.md"
-    content = _agent_template("claude-skill", vault)
-    legacy = _legacy_skill_dirs(root)
-    if skill.is_file() and not force:
-        if skill.read_text(encoding="utf-8") == content:
-            return {"path": str(skill), "state": "current", **_legacy(legacy)}
-        raise ValidationError(
-            "A brainskit skill already exists; re-run with --force to replace it",
-            details={"path": str(skill)},
-        )
-    updated = skill.is_file()
-    skill.parent.mkdir(parents=True, exist_ok=True)
-    skill.write_text(content, encoding="utf-8")
-    return {
-        "path": str(skill),
-        "state": "updated" if updated else "created",
-        **_legacy(legacy),
-    }
-
-
-def _legacy(found: list[str]) -> dict[str, Any]:
-    """`legacy` only when there is something to report, so callers can `in` it."""
-
-    return {"legacy": found} if found else {}
-
-
-def _install_instructions(root: Path, vault: Path, agent: str) -> dict[str, Any]:
-    """Append the graph contract, replacing any block a previous run wrote.
-
-    The block is fenced by HTML comments so re-running never duplicates it and
-    never disturbs instructions the operator wrote around it.
-
-    A block left by a former brand is retired here rather than appended beside.
-    Two managed blocks is a worse state than one stale block: they contradict
-    each other about which vault this workspace has, both are addressed to the
-    same agent, and nothing downstream can tell which one the operator meant.
-    The first one retired inherits the new block's position, so the contract
-    stays where it was last read instead of moving to the end of the file.
-    """
-    target = root / INSTRUCTION_FILES[agent]
-    block = (
-        f"{INSTRUCTION_START}\n"
-        f"{_agent_template('instructions', vault).strip()}\n"
-        f"{INSTRUCTION_END}\n"
-    )
-    existing = target.read_text(encoding="utf-8") if target.is_file() else ""
-    content = existing
-    migrated: list[str] = []
-    # Only when there is no current block: an install that already has one keeps
-    # it where it is, and the former block is then simply debris to drop.
-    adopt = INSTRUCTION_START not in content
-    for start, pattern in _LEGACY_MANAGED_BLOCKS:
-        if start not in content:
-            continue
-        migrated.append(start)
-        if adopt:
-            content = pattern.sub(lambda _: _BLOCK_ANCHOR, content, count=1)
-            adopt = False
-        content = pattern.sub("", content)
-
-    if _BLOCK_ANCHOR in content:
-        content = content.replace(_BLOCK_ANCHOR, block, 1)
-        state = "migrated"
-    elif INSTRUCTION_START in content:
-        # Replace in place so instructions written after the block keep their
-        # position; a lambda avoids re.sub interpreting escapes in the block.
-        content = _MANAGED_BLOCK_RE.sub(lambda _: block, content, count=1)
-        state = "current" if existing == content else "updated"
-    else:
-        stripped = content.strip()
-        content = f"{stripped}\n\n{block}" if stripped else block
-        state = "appended" if stripped else "created"
-    if content != existing:
-        target.write_text(content, encoding="utf-8")
-    result: dict[str, Any] = {"path": str(target), "state": state}
-    if migrated:
-        result["migrated"] = migrated
-    return result
-
-
-COMMIT_LINT_OFF = (
-    "Commit-time linting is OFF: nothing runs bk lint --changed, so a page "
-    "written outside the apply gate is only reported when somebody runs bk lint."
-)
-
-
-def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
-    """Install the lint hook when the workspace is a git repository.
-
-    A missing repository is reported rather than raised: the skill and the
-    instructions are useful on their own and have nothing to do with git. It is
-    reported *loudly* — a bare `{"state": "skipped"}` reads as a detail, and the
-    detail it hides is that a whole enforcement layer does not exist.
-
-    The repository that matters is the workspace's, not the vault's: a vault
-    nested in a project is committed through that project, so its pre-commit
-    hook is the one a wiki write actually passes through.
-
-    A repository whose `core.hooksPath` points elsewhere gets nothing written
-    at all. Writing `.git/hooks/pre-commit` there would produce a file git
-    never reads, and `--force` cannot change that -- force decides whether to
-    clobber an existing hook, not which directory git executes.
-    """
-    git_dir = root / ".git"
-    if not git_dir.is_dir():
-        return {
-            "state": "skipped",
-            "reason": f"{root} is not a git repository",
-            "hint": (
-                "Run git init there, or point --root at the repository that "
-                "tracks the vault, then install again"
-            ),
-            "enforcement": "off",
-            "consequence": COMMIT_LINT_OFF,
-        }
-    redirected_hooks = redirected_git_hooks_path(root)
-    if redirected_hooks is not None:
-        return {
-            "state": "skipped",
-            "reason": (
-                f"git runs hooks from {redirected_hooks}, not .git/hooks, "
-                "because core.hooksPath is set"
-            ),
-            "hint": (
-                "Add `bk --vault "
-                f"{shlex.quote(str(vault))} lint --changed` to "
-                f"{redirected_hooks / 'pre-commit'} and commit it"
-            ),
-            "enforcement": "off",
-            "consequence": COMMIT_LINT_OFF,
-        }
-    hook = git_dir / "hooks" / "pre-commit"
-    content = f"#!/bin/sh\nexec bk --vault {json.dumps(str(vault))} lint --changed\n"
-    if hook.exists() and not force:
-        if hook.read_text(encoding="utf-8") == content:
-            return {"path": str(hook), "state": "current"}
-        return {
-            "path": str(hook),
-            "state": "skipped",
-            "reason": "a pre-commit hook already exists",
-            "hint": "Merge brainskit lint into it, or re-run with --force",
-            "enforcement": "off",
-            "consequence": COMMIT_LINT_OFF,
-        }
-    updated = hook.exists()
-    hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text(content, encoding="utf-8")
-    hook.chmod(0o755)
-    return {"path": str(hook), "state": "updated" if updated else "created"}
-
-
-def _write_hook_script(
-    root: Path, vault: Path, hook: ClaudeHook, *, force: bool
-) -> dict[str, Any]:
-    """Write one hook script, refusing to clobber a file brainskit did not write.
-
-    The sentinel comment is what makes a rewrite safe: a script carrying it is
-    ours to replace, and a script without it belongs to the operator.
-    """
-    target = root / ".claude" / "hooks" / f"{hook.template}.sh"
-    content = _hook_script(hook.template, vault, root)
-    existed = target.is_file()
-    if existed:
-        existing = target.read_text(encoding="utf-8")
-        if HOOK_SENTINEL not in existing and not force:
-            return {
-                "path": str(target),
-                "state": "skipped",
-                "reason": "an unmanaged script already occupies this path",
-                "hint": "Move it aside, or re-run with --force",
-            }
-        if existing == content:
-            # The mode, not the bytes, is what silently disables a hook.
-            target.chmod(0o755)
-            return {"path": str(target), "state": "current"}
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    target.chmod(0o755)
-    return {"path": str(target), "state": "updated" if existed else "created"}
-
-
-def _hook_command_registered(group: Sequence[Any], command: str) -> bool:
-    """Whether any entry in a settings hook array already runs this command."""
-    for entry in group:
-        if not isinstance(entry, dict):
-            continue
-        commands = entry.get("hooks")
-        if not isinstance(commands, list):
-            continue
-        for item in commands:
-            if isinstance(item, dict) and item.get("command") == command:
-                return True
-    return False
-
-
-def _hook_script_names(template: str) -> frozenset[str]:
-    """Every filename this hook has ever been installed as, current and former.
-
-    A former brand's filename belongs here because it identifies the same hook
-    on the same event: keying only on the current name is what let a pre-rename
-    gate stay registered beside the new one through a `--force` reinstall.
-    """
-
-    return frozenset(
-        f"{name}.sh" for name in (template, *_legacy_spellings(template))
-    )
-
-
-def _is_stale_hook_command(command: Any, template: str, current: str) -> bool:
-    """Whether `command` is a brainskit `template` hook at some path other than `current`.
-
-    Every install writes to `<root>/.claude/hooks/<template>.sh`, so the command
-    this workspace should be running for a given template never has more than
-    one live value at a time. A registered command matching that name — under
-    this brand or one it used to have — but not equal to the one being installed
-    now is not "unrelated tooling on the same event", the case this file
-    otherwise takes care never to touch. It is a previous install this one
-    supersedes: a settings.json carried over from a different `--root`, copied
-    wholesale from another project's `.claude/`, or simply older than a rename.
-    Left alone, it keeps firing every session against a vault or workspace this
-    one no longer is.
-    """
-    if not isinstance(command, str) or command == current:
-        return False
-    return Path(command).name in _hook_script_names(template)
-
-
-def _retire_legacy_hook_scripts(
-    root: Path, installed: Sequence[ClaudeHook]
-) -> list[dict[str, Any]]:
-    """Remove the hook scripts a former brand left, when they are still ours.
-
-    Unregistering alone leaves `<former>-gate.sh` sitting beside the current one:
-    inert, but indistinguishable at a glance from the hook that actually runs,
-    which is how a workspace gets debugged against the wrong file.
-
-    Ownership is decided exactly the way `_write_hook_script` decides it — by the
-    generated sentinel, spelled as that brand spelled it. A script still carrying
-    it is untouched output of an earlier install and safe to delete. One without
-    it has been edited, and deleting an edited file is a different act from
-    dropping a settings entry, so it is reported and left where it is.
-
-    `--force` is not consulted. Force decides whether to clobber an install that
-    is currently the right one; finishing a rename this tool itself performed is
-    not that question, and gating it would leave the default upgrade path — the
-    documented `bk hooks install` with no flags — silently running two gates.
-
-    Only hooks this run actually installed are retired. A hook whose current
-    script was skipped keeps its old registration, and deleting the file that
-    registration points at would turn debris into a broken command.
-    """
-
-    retired: list[dict[str, Any]] = []
-    hooks_dir = root / ".claude" / "hooks"
-    for legacy in LEGACY_BRANDS:
-        sentinel = HOOK_SENTINEL.replace(BRAND, legacy)
-        for hook in installed:
-            path = hooks_dir / f"{hook.template.replace(BRAND, legacy)}.sh"
-            if not path.is_file():
-                continue
-            try:
-                owned = sentinel in path.read_text(encoding="utf-8")
-                if owned:
-                    path.unlink()
-            except OSError as exc:
-                retired.append(
-                    {"path": str(path), "state": "kept", "reason": str(exc)}
-                )
-                continue
-            retired.append(
-                {"path": str(path), "state": "removed"}
-                if owned
-                else {
-                    "path": str(path),
-                    "state": "kept",
-                    "reason": (
-                        "edited since it was generated, so it is yours; "
-                        "it is no longer registered and can be deleted"
-                    ),
-                }
-            )
-    return retired
-
-
-def _legacy_skill_dirs(root: Path) -> list[str]:
-    """Skill directories a former brand installed and an agent still loads.
-
-    Reported, never removed. A hook script proves its provenance with the
-    generated sentinel; a skill is plain markdown carrying no such mark, so
-    nothing here distinguishes an earlier install's output from something the
-    operator wrote. Deleting on a guess is worse than the debris — and unlike a
-    stale hook, a stale skill is only read, never executed.
-    """
-
-    skills = root / ".claude" / "skills"
-    return [str(skills / legacy) for legacy in LEGACY_BRANDS if (skills / legacy).is_dir()]
-
-
-def _prune_stale_hook_entries(
-    group: list[Any], template: str, current: str
-) -> tuple[list[Any], list[str]]:
-    """Drop any `template` hook command other than `current`; report what left.
-
-    An entry that loses every command this way is dropped whole rather than
-    kept as `{"hooks": []}` — an empty hooks list is not a shape Claude Code
-    itself ever writes, and leaving one behind would be a second kind of debris
-    in a file this module otherwise treats as the operator's.
-    """
-    removed: list[str] = []
-    pruned: list[Any] = []
-    for entry in group:
-        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
-            pruned.append(entry)
-            continue
-        kept = []
-        for item in entry["hooks"]:
-            command = item.get("command") if isinstance(item, dict) else None
-            if isinstance(command, str) and _is_stale_hook_command(
-                command, template, current
-            ):
-                removed.append(command)
-                continue
-            kept.append(item)
-        if kept:
-            pruned.append({**entry, "hooks": kept})
-    return pruned, removed
-
-
-def _register_claude_hooks(
-    root: Path, entries: Sequence[tuple[ClaudeHook, str]]
-) -> dict[str, Any]:
-    """Register hook commands in `.claude/settings.json` without clobbering it.
-
-    The file belongs to the operator and routinely carries unrelated tooling on
-    the same events, so this reads, mutates and writes: unknown top-level keys
-    survive, existing arrays are appended to rather than replaced, and a file
-    that does not parse is left exactly as it is instead of being rebuilt. The
-    idempotency key is the hook's command path, so a second install at the same
-    path appends nothing and the file stays byte-identical — but a *different*
-    path registered under the same template name is recognised as stale and
-    pruned first, so reinstalling against a new `--root` or vault replaces the
-    old entry instead of running alongside it.
-    """
-    target = root / ".claude" / "settings.json"
-    settings: dict[str, Any] = {}
-    existed = target.is_file()
-    if existed:
-        try:
-            parsed = json.loads(target.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            return {
-                "path": str(target),
-                "state": "skipped",
-                "reason": f"settings.json is not valid JSON: {exc}",
-                "hint": "Repair the file, then run bk hooks install again",
-            }
-        if not isinstance(parsed, dict):
-            return {
-                "path": str(target),
-                "state": "skipped",
-                "reason": "settings.json is not a JSON object",
-                "hint": "Repair the file, then run bk hooks install again",
-            }
-        settings = parsed
-
-    hooks = settings.get("hooks", {})
-    if not isinstance(hooks, dict):
-        return {
-            "path": str(target),
-            "state": "skipped",
-            "reason": "the hooks key in settings.json is not an object",
-            "hint": "Repair the file, then run bk hooks install again",
-        }
-    for hook, _ in entries:
-        if not isinstance(hooks.get(hook.event, []), list):
-            return {
-                "path": str(target),
-                "state": "skipped",
-                "reason": f"hooks.{hook.event} in settings.json is not an array",
-                "hint": "Repair the file, then run bk hooks install again",
-            }
-
-    registered: list[dict[str, Any]] = []
-    pruned_stale: list[dict[str, Any]] = []
-    changed = False
-    for hook, command in entries:
-        group = list(hooks.get(hook.event, []))
-        group, removed = _prune_stale_hook_entries(group, hook.template, command)
-        if removed:
-            hooks[hook.event] = group
-            changed = True
-            pruned_stale.extend(
-                {"event": hook.event, "command": stale} for stale in removed
-            )
-        if _hook_command_registered(group, command):
-            registered.append(
-                {"event": hook.event, "command": command, "state": "current"}
-            )
-            continue
-        entry: dict[str, Any] = {}
-        if hook.matcher:
-            entry["matcher"] = hook.matcher
-        entry["hooks"] = [
-            {"type": "command", "command": command, "timeout": hook.timeout}
-        ]
-        group.append(entry)
-        hooks[hook.event] = group
-        registered.append(
-            {"event": hook.event, "command": command, "state": "appended"}
-        )
-        changed = True
-
-    if not changed:
-        return {"path": str(target), "state": "current", "registered": registered}
-    settings["hooks"] = hooks
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    result: dict[str, Any] = {
-        "path": str(target),
-        "state": "updated" if existed else "created",
-        "registered": registered,
-    }
-    if pruned_stale:
-        result["pruned"] = pruned_stale
-    return result
-
-
-def _install_claude_hook(
-    root: Path, vault: Path, *, force: bool = False
-) -> dict[str, Any]:
-    """Install the Claude Code hooks and register them in settings.json.
-
-    The instructions and the skill *ask* the model to route writes through the
-    apply gate. This is the part that does not depend on the model agreeing: a
-    PreToolUse hook that refuses the write while it is being attempted, and a
-    SessionStart hook that says what the vault looks like before the first one.
-    """
-    scripts: dict[str, Any] = {}
-    registrable: list[tuple[ClaudeHook, str]] = []
-    for hook in CLAUDE_HOOKS:
-        outcome = _write_hook_script(root, vault, hook, force=force)
-        scripts[hook.template] = outcome
-        if outcome["state"] != "skipped":
-            registrable.append((hook, str(outcome["path"])))
-    # Registration first, so a former brand's command is gone from settings.json
-    # before its script leaves the disk. The reverse order has a window — and, if
-    # the unlink fails, a lasting state — where a registered hook points at a
-    # file that is not there.
-    settings = _register_claude_hooks(root, registrable)
-    retired = _retire_legacy_hook_scripts(root, [hook for hook, _ in registrable])
-    result: dict[str, Any] = {"scripts": scripts, "settings": settings}
-    if retired:
-        result["legacy"] = retired
-    return result
-
-
-def _enforcement_layer(
-    name: str, mechanism: str, outcome: dict[str, Any], *, active: bool
-) -> dict[str, Any]:
-    layer: dict[str, Any] = {"layer": name, "mechanism": mechanism, "active": active}
-    if not active:
-        for key in ("reason", "hint", "consequence"):
-            if outcome.get(key):
-                layer[key] = outcome[key]
-    return layer
-
-
-def _enforcement_summary(result: dict[str, Any]) -> dict[str, Any]:
-    """Name every enforcement layer and say plainly whether it is on.
-
-    An installer that reports only what it managed to write hides the layers it
-    could not, which is exactly how an invariant ends up guarded by nothing at
-    all while the install output still reads like success.
-    """
-    layers: list[dict[str, Any]] = []
-    hook = result.get("claude_hook")
-    if isinstance(hook, dict):
-        settings = hook["settings"]
-        registered = {
-            str(item["command"]) for item in settings.get("registered", [])
-        }
-        for name, template, mechanism in (
-            (
-                "write_gate",
-                "brainskit-gate",
-                "Claude Code PreToolUse hook on Write|Edit|MultiEdit",
-            ),
-            (
-                "session_status",
-                "brainskit-status",
-                "Claude Code SessionStart hook reporting vault state",
-            ),
-        ):
-            script = hook["scripts"][template]
-            active = script["state"] != "skipped" and script["path"] in registered
-            outcome = script if script["state"] == "skipped" else settings
-            layers.append(
-                _enforcement_layer(name, mechanism, outcome, active=active)
-            )
-    pre_commit = result["pre_commit"]
-    layers.append(
-        _enforcement_layer(
-            "commit_lint",
-            ".git/hooks/pre-commit running bk lint --changed",
-            pre_commit,
-            active=pre_commit["state"] != "skipped",
-        )
-    )
-    layers.append(
-        {
-            "layer": "instructions",
-            "mechanism": f"{INSTRUCTION_FILES[result['agent']]} managed block",
-            "active": True,
-            "advisory": True,
-        }
-    )
-    return {
-        "layers": layers,
-        "inactive": [layer["layer"] for layer in layers if not layer["active"]],
-    }
 
 
 def _warn_about_inactive_enforcement(
@@ -2375,11 +1718,12 @@ def _warn_about_inactive_enforcement(
 def _note_pruned_stale_hooks(claude_hook: dict[str, Any] | None) -> None:
     """Say, on stderr, which stale hook commands this install just replaced.
 
-    `_register_claude_hooks` prunes silently because `settings.json` is the
-    operator's file and this module otherwise never announces an edit to it —
-    but a removed entry is exactly the kind of change `_warn_about_inactive_
-    enforcement` exists to never leave quiet: the operator may have expected
-    that command to still be the one guarding a different vault or workspace.
+    `installer._register_claude_hooks` prunes silently because `settings.json`
+    is the operator's file and the installer otherwise never announces an edit
+    to it — but a removed entry is exactly the kind of change
+    `_warn_about_inactive_enforcement` exists to never leave quiet: the operator
+    may have expected that command to still be the one guarding a different
+    vault or workspace.
     """
     if not isinstance(claude_hook, dict):
         return
@@ -2404,7 +1748,7 @@ def _note_legacy_migration(result: dict[str, Any]) -> None:
     """
 
     lines: list[str] = []
-    instructions = result.get("instructions") or {}
+    instructions = result.get(INSTRUCTIONS) or {}
     for marker in instructions.get("migrated", []):
         lines.append(f"  - retired {marker} in {instructions['path']}")
     hook = result.get("claude_hook")
@@ -2429,53 +1773,6 @@ def _note_legacy_migration(result: dict[str, Any]) -> None:
     print("", file=sys.stderr)
 
 
-def _resolve_workspace(vault: Path, root: str | None) -> Path:
-    """Where the agent's configuration belongs, which is not always the vault.
-
-    An agent reads `.claude/` and `CLAUDE.md` from the project it was opened
-    on. A vault nested inside that project is a different directory, and
-    installing into it produces the worst possible outcome: every file lands,
-    the installer reports success, and not one hook is ever loaded. So the
-    caller may name the workspace, and the default stays the vault because
-    that is what a standalone vault wants.
-    """
-    if root is None:
-        return vault
-    candidate = Path(root).expanduser()
-    if not candidate.is_dir():
-        raise ValidationError(
-            "The --root workspace must be an existing directory",
-            details={"root": str(candidate)},
-        )
-    return candidate.resolve()
-
-
-def _workspace_advisory(vault: Path, workspace: Path) -> dict[str, Any] | None:
-    """Warn when the vault was used as a workspace it does not look like.
-
-    Silence here is what the separation exists to prevent, so this fires on
-    the shape of the mistake rather than on certainty about it: a vault with
-    no agent configuration of its own, sitting inside a directory that has
-    some. Advisory only -- a standalone vault is a legitimate workspace, and
-    an operator who passed --root has already answered the question.
-    """
-    if workspace != vault:
-        return None
-    if (vault / ".claude").is_dir() or (vault / ".git").is_dir():
-        return None
-    for parent in vault.parents:
-        if (parent / ".claude").is_dir() or (parent / ".git").is_dir():
-            return {
-                "state": "advisory",
-                "reason": (
-                    "The vault is not a project root, so an agent opened on "
-                    f"{parent} will never load what was just installed here."
-                ),
-                "hint": f"Reinstall with --root {parent}",
-            }
-    return None
-
-
 def _install_hooks(
     service: BrainskitService,
     agent: str,
@@ -2484,198 +1781,42 @@ def _install_hooks(
     force: bool = False,
     skip_code_build: bool = False,
 ) -> dict[str, Any]:
-    vault = service.vault.root
-    workspace = _resolve_workspace(vault, root)
-    # Decided before anything is written: the installer creates `.claude/` in
-    # the workspace, and reading that back afterwards would be this check
-    # observing its own side effect and concluding all is well.
-    advisory = _workspace_advisory(vault, workspace)
-    adapter_path = f".brain/agent-{agent}.json"
-    service.vault.write_generated(
-        adapter_path, json.dumps(_agent_policy(agent, workspace), indent=2) + "\n"
-    )
-    result: dict[str, Any] = {
-        "agent": agent,
-        "adapter": adapter_path,
-        "workspace": str(workspace),
-        "instructions": _install_instructions(workspace, vault, agent),
-        "pre_commit": _install_pre_commit(workspace, vault, force=force),
-    }
-    if agent == "claude":
-        result["skill"] = _install_skill(workspace, vault, force=force)
-        result["claude_hook"] = _install_claude_hook(workspace, vault, force=force)
-    if advisory is not None:
-        result["workspace_advisory"] = advisory
-    result["enforcement"] = _enforcement_summary(result)
+    """Run the install, then say out loud what it did and did not manage.
+
+    The writing is `installer.install_agent`'s. Everything below it is the half
+    that could not go with it: the first `bk code build` needs the running
+    interpreter to turn a missing extra into an install command, and the four
+    banners are stderr, which is this layer's alone. An install that returned a
+    clean-looking dict while a layer sat inactive, a superseded hook stayed
+    registered, a former brand's gate was still on disk or the code graph was
+    never built is the failure each of them exists to prevent.
+    """
+
+    result = service.install_agent(agent, root=root, force=force)
     result["code_graph"] = _bootstrap_code_graph(service, skip=skip_code_build)
-    _warn_about_inactive_enforcement(result["enforcement"], advisory)
+    _warn_about_inactive_enforcement(
+        result["enforcement"], result.get("workspace_advisory")
+    )
     _note_pruned_stale_hooks(result.get("claude_hook"))
     _note_legacy_migration(result)
     _note_code_graph_bootstrap(result["code_graph"])
     return result
 
 
-#: The probe payload is the shape Claude Code sends a PreToolUse hook.
-_GATE_PROBE_NAME = "brainskit-doctor-probe.md"
-
-
-def _run_gate_hook(script: Path, target: Path) -> tuple[int | None, str]:
-    """Ask the installed hook about one path, exactly as the agent would.
-
-    Runs the script itself rather than `sh script`, because the executable bit
-    is part of what makes a hook fire and `sh` would paper over its absence.
-    Never raises: a hook that cannot run is a finding, not a crash.
-    """
-    payload = json.dumps(
-        {"tool_name": "Write", "tool_input": {"file_path": str(target)}}
-    )
-    try:
-        # The path is the hook brainskit installed and `Health` reports, not
-        # caller input, and it is a one-element argument vector with no shell.
-        # Executing it is the entire point: reading the file instead is the
-        # bug this probe exists to catch.
-        done = subprocess.run(  # noqa: S603
-            [str(script)],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, str(exc)
-    return done.returncode, done.stderr.strip()
-
-
-def _probe_write_gate(service: BrainskitService, layers: list[dict[str, Any]]) -> dict[str, Any]:
-    """Run the write gate instead of confirming that its file exists.
-
-    Every enforcement answer above this one is "the artefact is installed and
-    registered". That is not the same claim as "a write to `wiki/` is refused",
-    and the two have already come apart in the field: the hook script fails
-    open by design -- no `python3`, no `bk` on PATH, an unreachable vault, a
-    lost executable bit -- and each of those makes it exit 0 on a write it was
-    installed to deny, while `bk status` still reports the layer active.
-
-    So: one path the gate must deny, one it must allow. Both are decisions
-    only; `gate check-write` writes nothing, and neither probe file is ever
-    created. Denying everything is reported too -- a gate that blocks ordinary
-    edits is broken in the direction that stops work rather than the direction
-    that loses provenance, but it is still broken.
-    """
-
-    entry = next((layer for layer in layers if layer["layer"] == "write_gate"), None)
-    script = Path(entry["script"]) if entry and entry.get("script") else None
-    if script is None or not script.is_file():
-        return {
-            "state": "absent",
-            "detail": "no write-gate hook is installed; nothing to exercise",
-        }
-
-    vault_root = service.vault.root
-    gated = vault_root / "wiki" / _GATE_PROBE_NAME
-    ordinary = vault_root.parent / _GATE_PROBE_NAME
-
-    denied_status, denied_note = _run_gate_hook(script, gated)
-    allowed_status, allowed_note = _run_gate_hook(script, ordinary)
-    denies_gated = denied_status == 2
-    allows_ordinary = allowed_status == 0
-
-    if denied_status is None or allowed_status is None:
-        state, detail = "unknown", f"the hook could not be run: {denied_note or allowed_note}"
-    elif denies_gated and allows_ordinary:
-        state, detail = "enforcing", f"a write to wiki/ is refused (exit {denied_status})"
-    elif not denies_gated:
-        state = "not_enforcing"
-        detail = (
-            f"a direct write to wiki/{_GATE_PROBE_NAME} was allowed "
-            f"(hook exited {denied_status}); the gate is installed but not guarding"
-        )
-    else:
-        state = "over_blocking"
-        detail = (
-            f"an ordinary write outside the vault was refused "
-            f"(hook exited {allowed_status})"
-        )
-
-    report: dict[str, Any] = {
-        "state": state,
-        "detail": detail,
-        "script": str(script),
-        "denies_a_gated_write": denies_gated,
-        "allows_an_ordinary_write": allows_ordinary,
-    }
-    # The script explains its own fail-open on stderr, and that sentence names
-    # the missing piece far better than anything inferred from an exit code.
-    note = denied_note or allowed_note
-    if note and state != "enforcing":
-        report["hook_said"] = note
-    return report
-
-
 def _doctor(service: BrainskitService) -> dict[str, Any]:
-    """Whether this installation can do what it advertises.
+    """Ask the application for the report, supplying what only this layer sees.
 
-    `bk status` answers "is the vault healthy". This answers the question that
-    went unasked until three separate failures traced back to it: is the machine
-    underneath it wired up. Each section is here because its absence was silent —
-
-    - **environment**: every "install the optional X" message named `pip`, which
-      a `uv tool` install does not have, so the advice could not be followed.
-    - **grammars**: 13 of 29 shipped and the rest unreachable, discoverable only
-      by building a graph and noticing a language missing from it.
-    - **code root**: the directory a build would scan, *and why that one*. A
-      vault resolved this to a parent holding every repository on the machine,
-      and nothing said so until the graph reached 683 MB.
-    - **enforcement**: reused from `Health`, because "is the write gate live" is
-      part of any health question -- and then *exercised* rather than believed,
-      because every layer above reports that a file is installed, which is a
-      different claim from "a write to `wiki/` is actually refused".
-
-    Assembled in the interface layer rather than in `Health`: every fact here is
-    about the interpreter and the installation, which `application` may not
-    import (`tests/test_layering.py`) and should not have to know.
+    Which environment `bk` was installed into, and which tree-sitter grammars
+    that environment can reach, are `infrastructure`'s to answer and
+    `application` may not import it (`tests/test_layering.py`). So they are
+    gathered here and handed over. The probe, the shape of the report and the
+    verdict are not facts about the interpreter and stay on the other side.
+    See `doctor_report`.
     """
 
-    vault = service.vault
-    environment = pyenv.describe_environment()
-    root, reason = vault.code_root_reason()
-    grammars = grammar_inventory()
-    missing = [name for name, installed in grammars.items() if not installed]
-    enforcement = service.health.enforcement()
-    probe = _probe_write_gate(service, enforcement["layers"])
-    enforcement["write_gate_probe"] = probe
-    return {
-        "vault": str(vault.root),
-        "environment": {
-            "kind": environment.kind,
-            "label": environment.label,
-            "executable": environment.executable,
-            "installable": environment.installable,
-        },
-        "code": {
-            "root": str(root),
-            "why_this_root": reason,
-            "scan_limit": vault.config().code_scan_limit,
-            "grammars_installed": sum(grammars.values()),
-            "grammars_known": len(grammars),
-            "grammars_missing": missing,
-            **(
-                {"install": environment.install_hint(missing)}
-                if missing and environment.installable
-                else {}
-            ),
-        },
-        "enforcement": enforcement,
-        # An allowlist, not a denylist: only two states are compatible with a
-        # healthy installation -- the gate refused what it must ("enforcing"),
-        # or there is no gate to judge ("absent", which an operator may have
-        # chosen). Everything else, including a hook that could not be run at
-        # all, means nobody has confirmed that a write to wiki/ is refused, and
-        # an installed gate that does not guard is worse than none: every other
-        # layer keeps reporting success while writes go around it.
-        "healthy": not missing and probe["state"] in {"enforcing", "absent"},
-    }
+    return service.doctor(
+        environment=pyenv.describe_environment(), grammars=grammar_inventory()
+    )
 
 
 def _offer_missing_grammars(
@@ -2796,7 +1937,7 @@ def _bootstrap_code_graph(service: BrainskitService, *, skip: bool) -> dict[str,
         return {
             "state": "skipped",
             "reason": str(exc),
-            "hint": _install_hint_for(exc.details or {}).get("hint"),
+            "hint": install_hint_for(exc.details or {}).get("hint"),
         }
     except Exception as exc:
         # Mirrors _sync_one_vault: an extractor's own failure belongs to this
@@ -3054,11 +2195,18 @@ def _enforcement_rows(layers: Sequence[dict[str, Any]]) -> list[list[str]]:
     the vault does not have. It says so in the layer name rather than in colour
     alone: most of this output is read through a pipe, a file or a test capture,
     and colour is stripped in all three.
+
+    A vault installed for two agents reports each agent's layers, and `Health`
+    stamps `agent` on them only then. The name carries it for the same reason it
+    carries `(advisory)`: two `commit_lint` rows with nothing between them read
+    as one layer reported twice.
     """
 
     rows: list[list[str]] = []
     for layer in layers:
         name = str(layer["layer"])
+        if layer.get("agent"):
+            name = f"{name} [{layer['agent']}]"
         detail = str(layer.get("detail", ""))
         if layer.get("advisory"):
             symbol = console.CHECK if layer["active"] else console.CROSS
@@ -3759,44 +2907,14 @@ def _internal_error(exc: BaseException) -> InternalError:
     )
 
 
-def _install_hint_for(details: dict[str, Any]) -> dict[str, Any]:
-    """Turn a `needs` list into the command that works on *this* machine.
-
-    The application layer names what is missing (`{"needs": ["brainskit[code]"]}`)
-    and stops there, because which command installs it is a fact about the
-    running interpreter — not something a layer that must not import
-    infrastructure can know, and not something to hardcode. Every hint that did
-    hardcode it said `pip install …`, which is unrunnable under `uv tool`: that
-    environment ships no `pip`, so the operator either saw a failure or silently
-    installed the package into an unrelated interpreter and hit the identical
-    message on the retry.
-
-    Enriching here, at the one place errors are rendered, means every raiser
-    gets a correct hint without any of them knowing how `bk` was installed.
-    """
-
-    needs = details.get("needs")
-    if not isinstance(needs, list) or not needs or "hint" in details:
-        return details
-    return {**details, "hint": pyenv.install_hint([str(item) for item in needs])}
-
-
 def _emit_error(error: BrainskitError, *, json_mode: bool) -> None:
-    payload = {
-        "ok": False,
-        "error": {
-            "code": error.code,
-            "message": str(error),
-            "details": _install_hint_for(error.details or {}),
-        },
-    }
+    payload = error_envelope(error)
     stream = sys.stdout if json_mode else sys.stderr
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False), file=stream)
     else:
         print(console.style(f"bk: {error}", console.ERR, stream=stream), file=stream)
-        details = _install_hint_for(error.details or {})
-        for line in _human_detail_lines(details, stream=stream):
+        for line in _human_detail_lines(payload["error"]["details"], stream=stream):
             print(line, file=stream)
 
 

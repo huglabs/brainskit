@@ -1,0 +1,257 @@
+{
+  "cross_file": true,
+  "edges": [
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "inventory",
+      "source_file": "inventory.rb",
+      "source_location": "L16",
+      "target": "inventory_catalogue",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "inventory",
+      "source_file": "inventory.rb",
+      "source_location": "L3",
+      "target": "inventory_product",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "inventory_catalogue",
+      "source_file": "inventory.rb",
+      "source_location": "L17",
+      "target": "inventory_catalogue_default",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "relation": "calls",
+      "source": "inventory_catalogue_default",
+      "source_file": "inventory.rb",
+      "source_location": "L18",
+      "target": "inventory_product",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "inventory_product",
+      "source_file": "inventory.rb",
+      "source_location": "L11",
+      "target": "inventory_product_discounted",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "inventory_product",
+      "source_file": "inventory.rb",
+      "source_location": "L6",
+      "target": "inventory_product_initialize",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "relation": "calls",
+      "source": "inventory_product_discounted",
+      "source_file": "inventory.rb",
+      "source_location": "L12",
+      "target": "inventory_product",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "orders",
+      "source_file": "orders.rb",
+      "source_location": "L17",
+      "target": "orders_build_default_order",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "contains",
+      "source": "orders",
+      "source_file": "orders.rb",
+      "source_location": "L3",
+      "target": "orders_order",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "relation": "calls",
+      "source": "orders_build_default_order",
+      "source_file": "orders.rb",
+      "source_location": "L18",
+      "target": "inventory_catalogue_default",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "relation": "calls",
+      "source": "orders_build_default_order",
+      "source_file": "orders.rb",
+      "source_location": "L18",
+      "target": "orders_order",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "orders_order",
+      "source_file": "orders.rb",
+      "source_location": "L12",
+      "target": "orders_order_discounted_total",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "orders_order",
+      "source_file": "orders.rb",
+      "source_location": "L4",
+      "target": "orders_order_initialize",
+      "weight": 1.0
+    },
+    {
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "relation": "method",
+      "source": "orders_order",
+      "source_file": "orders.rb",
+      "source_location": "L8",
+      "target": "orders_order_total",
+      "weight": 1.0
+    }
+  ],
+  "language": "ruby",
+  "nodes": [
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory",
+      "label": "inventory.rb",
+      "source_file": "inventory.rb",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_catalogue",
+      "label": "Catalogue",
+      "source_file": "inventory.rb",
+      "source_location": "L16"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_catalogue_default",
+      "label": ".default()",
+      "source_file": "inventory.rb",
+      "source_location": "L17"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_product",
+      "label": "Product",
+      "source_file": "inventory.rb",
+      "source_location": "L3"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_product_discounted",
+      "label": ".discounted()",
+      "source_file": "inventory.rb",
+      "source_location": "L11"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "inventory_product_initialize",
+      "label": ".initialize()",
+      "source_file": "inventory.rb",
+      "source_location": "L6"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "orders",
+      "label": "orders.rb",
+      "source_file": "orders.rb",
+      "source_location": "L1"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "orders_build_default_order",
+      "label": "build_default_order()",
+      "source_file": "orders.rb",
+      "source_location": "L17"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "orders_order",
+      "label": "Order",
+      "source_file": "orders.rb",
+      "source_location": "L3"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "orders_order_discounted_total",
+      "label": ".discounted_total()",
+      "source_file": "orders.rb",
+      "source_location": "L12"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "orders_order_initialize",
+      "label": ".initialize()",
+      "source_file": "orders.rb",
+      "source_location": "L4"
+    },
+    {
+      "_origin": "ast",
+      "file_type": "code",
+      "id": "orders_order_total",
+      "label": ".total()",
+      "source_file": "orders.rb",
+      "source_location": "L8"
+    }
+  ],
+  "paradigm": "config-engine",
+  "sources": {
+    "inventory.rb": "63715a91488704fd7c17358d9e4ea0dad7ef0293de46b928f6f21e79d84983e8",
+    "orders.rb": "618e9111dc58a36f57d2d14d1078360a1feb91cc035362c877b05b7003a4b5af"
+  }
+}

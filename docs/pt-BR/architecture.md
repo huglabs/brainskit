@@ -96,6 +96,32 @@ vinculada a esquema e o determinismo é importante.
 }
 ```
 
+Um modelo de raciocínio roteado para um provedor compatível com OpenAI pode
+gastar todo o orçamento de conclusão pensando e devolver uma resposta vazia.
+`providers.<nome>.reasoning` é encaminhado literalmente para controlar isso;
+é ausente por padrão, então um modelo que raciocina continua fazendo isso até
+que um operador diga o contrário. O formato pertence ao provedor — só a
+OpenRouter aceita `effort`, `max_tokens`, `enabled` e `exclude` — por isso é
+repassado em vez de modelado aqui. Um endpoint que se recusa a pular o
+raciocínio é repetido sem a opção, porque a supressão é uma preferência de custo
+e latência, nunca de correção.
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "reasoning": { "enabled": false, "exclude": true }
+    }
+  }
+}
+```
+
+Uma conclusão vazia é recusada em vez de devolvida. Repassá-la manda o laço de
+reparo atrás de uma violação de esquema que nenhuma retentativa corrige; a
+recusa nomeia `finish_reason` e a opção acima.
+
 Anthropic, OpenAI, OpenRouter e Ollama são drivers intercambiáveis atrás de um
 contrato de trabalho. A neutralidade do provedor é um requisito em vez de uma preferência:
 a evidência `local-only` é roteada para Ollama ou não é roteada em absoluto.

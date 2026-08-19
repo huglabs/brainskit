@@ -57,9 +57,11 @@ import hashlib
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import tomllib
+import types
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -88,7 +90,7 @@ DECLARED_REMOVALS = frozenset({"analyze.py", "build.py", "validate.py"})
 #: a change detector, not a security control — a collision here costs a missed
 #: notice, not an exploit.
 VENDORED_SOURCE = {
-    "__init__.py": "6bf057553cbdbcd9",
+    "__init__.py": "fc1625266b241148",
     "cache.py": "0955b389fb0a57e0",
     "cluster.py": "a3920a33cb72c013",
     "detect.py": "5e936f8be887b27d",
@@ -498,6 +500,132 @@ class VendoredAnalysisIsUnreachableTest(unittest.TestCase):
         self.assertEqual(importers, ["application/codegraph.py"])
 
 
+class VendoredModulesAreReachedOnlyThroughTheAliasTest(unittest.TestCase):
+    """One file on disk must not become two module objects.
+
+    `codeanalysis/__init__.py` registers a synthetic top-level `graphify`
+    package whose `__path__` points at this directory, so the vendored files
+    can keep importing each other by upstream's own absolute names without
+    being edited. Its docstring then states the condition that makes the alias
+    safe, in a sentence that is a rule rather than a description: *nothing
+    outside this file should import a sibling module here by its real dotted
+    path*. Import one both ways and Python imports the same file twice, under
+    two names, producing two module objects with two sets of module-level
+    state.
+
+    That rule had no enforcement, and the test suite was breaking it. Nine
+    imports in `test_code_grammars.py` reached the vendored tree by its
+    brainskit path while production (`infrastructure/extractor.py`) reaches it
+    through `graphify.*`, so the tests were exercising a second copy of the
+    extractor -- an instance no caller ever runs. Measured rather than
+    reasoned about, on this tree:
+
+        graphify.extract is brainskit…codeanalysis.extract   False
+        same `extract` function object                        False
+        same `_DISPATCH`                                      False
+        same `_XAML_CSHARP_CLASS_CACHE`                       False
+        two resolver registries, 9 resolvers each, no shared object
+        7 vendored modules loaded under the brainskit path,
+        39 under graphify
+
+    Both registries happened to hold resolvers of the same nine names, which is
+    what makes this the quiet kind of bug: everything looks right until state
+    written through one path is read through the other. `extract.py` itself
+    mixes the two styles (`from .cache` beside `from graphify.ids`), so the
+    fork is one import statement away at all times and is invisible in any
+    diff.
+
+    Checked as source text, the way `VENDORED_SOURCE` pins bytes rather than
+    behaviour: an import is a property of the file, so reading the file is the
+    direct measurement. Asserting it at runtime would only catch the modules a
+    given test run happened to import.
+    """
+
+    #: The alias shim, and the one file allowed to name what it aliases -- it
+    #: documents the discipline, and its docstring necessarily spells out the
+    #: path it is telling everyone else not to use.
+    SHIM = VENDORED / "__init__.py"
+
+    VENDOR_PACKAGE = "brainskit.infrastructure.codeanalysis"
+
+    #: The package itself is fine and is what `extractor.py` imports for the
+    #: alias's side effect; a dot and a submodule name after it is the fork.
+    #: Built with `re.escape` so this file does not match its own pattern.
+    SUBMODULE = re.compile(re.escape(VENDOR_PACKAGE) + r"\.[A-Za-z_]\w*")
+
+    def python_files(self) -> list[Path]:
+        roots = (PACKAGE, ROOT / "tests", ROOT / "benchmarks", ROOT / "scripts")
+        return sorted(
+            path
+            for root in roots
+            if root.is_dir()
+            for path in root.rglob("*.py")
+            if "__pycache__" not in path.parts
+        )
+
+    def test_no_module_outside_the_shim_names_a_vendored_submodule(self) -> None:
+        offenders = []
+        for path in self.python_files():
+            if path == self.SHIM:
+                continue
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                match = self.SUBMODULE.search(line)
+                if match:
+                    offenders.append(
+                        f"{path.relative_to(ROOT)}:{number}: {match.group(0)}"
+                    )
+        self.assertEqual(
+            offenders,
+            [],
+            "these reach a vendored module by its real dotted path, which "
+            "imports the file a second time under a second name and gives it "
+            "its own module-level caches. Import it through `graphify.<module>` "
+            f"instead -- after `import {self.VENDOR_PACKAGE}` has registered "
+            f"the alias: {offenders}",
+        )
+
+    def test_the_sweep_actually_reads_the_repository(self) -> None:
+        """Control: an empty sweep would pass the assertion above vacuously."""
+
+        found = self.python_files()
+        self.assertGreater(len(found), 50, "the sweep found almost no source")
+        self.assertIn(self.SHIM, found, "the exempted file is not even scanned")
+
+    def test_the_shim_is_the_only_file_that_needs_the_exemption(self) -> None:
+        """Control: the exemption must be earning its keep, not covering drift.
+
+        If the shim ever stopped naming the path it aliases, the exemption
+        would be dead code that silently widens the moment someone adds a file
+        beside it.
+        """
+
+        self.assertTrue(self.SUBMODULE.search(self.SHIM.read_text(encoding="utf-8")))
+
+    def test_first_party_code_does_reach_the_vendored_tree_through_the_alias(
+        self,
+    ) -> None:
+        """Control: the rule must not be satisfiable by importing nothing.
+
+        `VendoredAnalysisIsUnreachableTest` makes the same argument for
+        `cluster`; this is the general form. A repository that had stopped
+        using the vendored extractor altogether would pass the assertion above
+        while saying nothing about import discipline.
+        """
+
+        importers = [
+            str(path.relative_to(ROOT))
+            for path in self.python_files()
+            if not path.is_relative_to(VENDORED)
+            and re.search(
+                r"\bfrom graphify[. ]|\bimport graphify\b",
+                path.read_text(encoding="utf-8"),
+            )
+        ]
+        self.assertTrue(importers, "nothing imports the vendored tree at all")
+
+
 class ReleaseGateIsolationTest(unittest.TestCase):
     """The gate must not modify the machine it is run on.
 
@@ -719,6 +847,273 @@ class SdistListingIsReadOnceTest(unittest.TestCase):
                 if self.EARLY_EXITING_READER.search(line):
                     offenders.append(f"{path.name}:{number}: {line.strip()}")
         self.assertEqual(offenders, [], f"a producer can be cut off mid-write: {offenders}")
+
+
+class ForeignGraphifyIsRefusedTest(unittest.TestCase):
+    """The alias yields to a previous run of itself, never to another package.
+
+    Upstream Graphify is a real, installable distribution, so
+    `sys.modules["graphify"]` can already be bound to a foreign package rather
+    than to a previous execution of the shim. The idempotency guard accepted
+    anything, which made "the name is taken" stand in for "we already took it".
+
+    Both outcomes were wrong, in opposite directions. When the foreign package
+    lacks a module this tree has, the shim's own `from graphify.ids import
+    normalize_id` turned the whole import into `ModuleNotFoundError: No module
+    named 'graphify.ids'` — naming neither the conflict nor its cause. When it
+    has one, the import succeeds and supplies a *different* `normalize_id`,
+    which is the recipe the vendored extractors build node ids with; that one
+    is silent.
+
+    Driven in subprocesses because the subject is `sys.modules` at interpreter
+    start. Mutating it in-process would leak a fake `graphify` into every test
+    that runs afterwards, which is the failure this file exists to prevent.
+    """
+
+    #: `-I` isolates the interpreter, so a `graphify` that happens to be
+    #: installed on the developer's machine cannot decide the result either way.
+    def run_snippet(self, snippet: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-I", "-c", textwrap.dedent(snippet)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+            timeout=120,
+        )
+
+    def test_the_shim_still_installs_when_the_name_is_free(self) -> None:
+        """Control: the guard must not refuse the ordinary case."""
+
+        result = self.run_snippet(
+            """
+            import brainskit.infrastructure.codeanalysis as ca
+            import graphify.extract
+            print("VENDORED", graphify.extract.__file__)
+            print("NORMALIZE", callable(ca.normalize_id))
+            """
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn(str(VENDORED), result.stdout)
+        self.assertIn("NORMALIZE True", result.stdout)
+
+    def test_a_second_execution_of_the_shim_leaves_the_alias_alone(self) -> None:
+        """The behaviour the guard was written for, still intact."""
+
+        result = self.run_snippet(
+            """
+            import sys
+            import brainskit.infrastructure.codeanalysis as ca
+            first = sys.modules["graphify"]
+            ca._install_graphify_alias()
+            print("SAME", sys.modules["graphify"] is first)
+            """
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("SAME True", result.stdout)
+
+    def test_a_foreign_package_holding_the_name_is_refused(self) -> None:
+        result = self.run_snippet(
+            """
+            import sys, types
+            foreign = types.ModuleType("graphify")
+            foreign.__path__ = ["/elsewhere/graphify"]
+            foreign.__file__ = "/elsewhere/graphify/__init__.py"
+            sys.modules["graphify"] = foreign
+            try:
+                import brainskit.infrastructure.codeanalysis  # noqa: F401
+            except Exception as exc:
+                print("CODE", getattr(exc, "code", type(exc).__name__))
+                print("OCCUPIED", exc.details["occupied_by"])
+                print("REMEDY", exc.details["remedy"])
+            else:
+                print("NO REFUSAL")
+            """
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("CODE not_configured", result.stdout)
+        self.assertIn("OCCUPIED /elsewhere/graphify/__init__.py", result.stdout)
+        self.assertIn("uninstall the standalone graphify", result.stdout.lower())
+
+    def test_the_silent_direction_is_the_one_that_is_refused(self) -> None:
+        """A foreign package that *satisfies* the import is still refused.
+
+        This is the case no exception used to mark: `graphify.ids` resolves,
+        so the shim imported someone else's `normalize_id` and every node id
+        built from it diverged from the extractor's own, with nothing raised.
+        """
+
+        result = self.run_snippet(
+            """
+            import sys, types
+            foreign = types.ModuleType("graphify")
+            foreign.__path__ = ["/elsewhere/graphify"]
+            ids = types.ModuleType("graphify.ids")
+            ids.normalize_id = lambda value: "WRONG-RECIPE"
+            sys.modules["graphify"] = foreign
+            sys.modules["graphify.ids"] = ids
+            try:
+                import brainskit.infrastructure.codeanalysis as ca
+            except Exception as exc:
+                print("CODE", getattr(exc, "code", type(exc).__name__))
+            else:
+                print("LEAKED", ca.normalize_id("x"))
+            """
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("CODE not_configured", result.stdout)
+        self.assertNotIn("WRONG-RECIPE", result.stdout)
+
+    def test_a_namespace_package_without_a_file_is_still_named(self) -> None:
+        """`__file__` is absent on namespace packages; `None` helps nobody."""
+
+        from brainskit.infrastructure.codeanalysis import _describe
+
+        module = types.ModuleType("graphify")
+        module.__path__ = ["/elsewhere/graphify"]  # type: ignore[attr-defined]
+        self.assertEqual(_describe(module), "/elsewhere/graphify")
+
+    def test_the_alias_is_recognised_by_its_search_path(self) -> None:
+        """Not by a marker: two Brainskit installs would both set one while
+        pointing at different vendored trees, which is the same fork."""
+
+        from brainskit.infrastructure.codeanalysis import _is_our_alias
+
+        ours = types.ModuleType("graphify")
+        ours.__path__ = [str(VENDORED)]  # type: ignore[attr-defined]
+        theirs = types.ModuleType("graphify")
+        theirs.__path__ = ["/elsewhere/graphify"]  # type: ignore[attr-defined]
+
+        self.assertTrue(_is_our_alias(ours))
+        self.assertFalse(_is_our_alias(theirs))
+        self.assertFalse(_is_our_alias(types.ModuleType("graphify")))
+
+
+class WorkerResolvesTheSameGraphifyAsItsParentTest(unittest.TestCase):
+    """The refusal above cannot reach a spawned worker, so the path must.
+
+    `codeanalysis/__init__.py` binds `graphify` to the vendored tree in
+    `sys.modules`, and refuses to start if a foreign package holds the name.
+    A `spawn`ed worker inherits `sys.path` but *not* `sys.modules`, so none of
+    that reaches it: it re-resolves `graphify` from the path, and the pool
+    pickles its work item by qualified name (`graphify.extract`), so whatever
+    the child resolves is what extracts.
+
+    `_enable_parallel_workers` writes a generated `graphify` package for the
+    child to find and used to *append* it, documented as deliberate — "a
+    genuine Graphify installation earlier on the path keeps winning". That is
+    the fork stated as a feature: parent on the vendored tree, child on the
+    installed distribution. It surfaced as `AttributeError: Can't get attribute
+    '_extract_single_file' on module 'graphify.extract'` while unpickling,
+    because that helper is this tree's and not upstream's — and an upstream
+    that happens to have a same-named helper fails silently instead.
+
+    Precedence is therefore the requirement, not presence.
+    """
+
+    def shim_entry(self) -> str:
+        from brainskit.infrastructure import extractor
+
+        root = extractor._shim_root()
+        if root is None:
+            self.skipTest("no private directory available for the worker shim")
+        return str(root)
+
+    def worker(self, path: list[str]) -> str:
+        """What a fresh interpreter resolves `graphify.extract` to."""
+
+        probe = (
+            f"import sys; sys.path[:] = {path!r}\n"
+            "import graphify.extract as e\n"
+            "print('VENDORED' if 'codeanalysis' in (e.__file__ or '') else 'FOREIGN')\n"
+            "print(hasattr(e, '_extract_single_file'))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result.stdout
+
+    def installed_graphify(self) -> str:
+        """A directory holding a foreign `graphify`, as site-packages would."""
+
+        site = tempfile.TemporaryDirectory()
+        self.addCleanup(site.cleanup)
+        package = Path(site.name) / "graphify"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "extract.py").write_text(
+            "# upstream: no _extract_single_file\n", encoding="utf-8"
+        )
+        return site.name
+
+    def test_the_shim_takes_precedence_on_the_path(self) -> None:
+        from brainskit.infrastructure import extractor
+
+        self.assertTrue(extractor._enable_parallel_workers())
+        self.assertEqual(sys.path[0], self.shim_entry())
+
+    def test_a_worker_resolves_past_an_installed_graphify(self) -> None:
+        """Driven through the real call, never a hand-built path.
+
+        Ordering the entries here would test this method's arithmetic rather
+        than `_enable_parallel_workers`'s: an earlier draft did exactly that
+        and kept passing against the append-only version it was written to
+        catch.
+        """
+
+        from brainskit.infrastructure import extractor
+
+        entry = self.shim_entry()
+        original = list(sys.path)
+        self.addCleanup(extractor._enable_parallel_workers.cache_clear)
+        self.addCleanup(sys.path.__setitem__, slice(None), original)
+
+        # A foreign `graphify` ahead of wherever the shim lands, which is what
+        # an installed distribution in site-packages is.
+        sys.path[:] = [p for p in original if p != entry]
+        sys.path.insert(0, self.installed_graphify())
+        extractor._enable_parallel_workers.cache_clear()
+        self.assertTrue(extractor._enable_parallel_workers())
+
+        output = self.worker(list(sys.path))
+        self.assertIn("VENDORED", output)
+        self.assertIn("True", output)
+
+    def test_the_old_ordering_is_what_reproduced_the_fork(self) -> None:
+        """Control: the probe above must be able to fail.
+
+        Appending is the previous behaviour verbatim, so this pins the bug
+        rather than the fix — if this ever reports VENDORED, the test above
+        proves nothing.
+        """
+
+        entry = self.shim_entry()
+        rest = [p for p in sys.path if p != entry]
+        output = self.worker([*rest, self.installed_graphify(), entry])
+
+        self.assertIn("FOREIGN", output)
+        self.assertIn("False", output)
+
+    def test_an_entry_already_on_the_path_is_moved_rather_than_skipped(self) -> None:
+        """`if entry not in sys.path` left it wherever it was — behind the
+        installed package, which is the state this exists to correct."""
+
+        from brainskit.infrastructure import extractor
+
+        entry = self.shim_entry()
+        original = list(sys.path)
+        self.addCleanup(extractor._enable_parallel_workers.cache_clear)
+        self.addCleanup(sys.path.__setitem__, slice(None), original)
+
+        sys.path[:] = ["/somewhere/site-packages", entry, "/tail"]
+        extractor._enable_parallel_workers.cache_clear()
+        extractor._enable_parallel_workers()
+
+        self.assertEqual(sys.path[0], entry)
+        self.assertEqual(sys.path.count(entry), 1, "the entry was duplicated")
 
 
 if __name__ == "__main__":

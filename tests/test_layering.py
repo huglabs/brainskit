@@ -55,22 +55,15 @@ ALLOWED: dict[str, frozenset[str]] = {
 DOCUMENTED_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset(
     {
         ("application.codegraph", "infrastructure.codeanalysis"),
-        # Two adapters reaching *up* for a concrete application function rather
-        # than a port. Both were invisible while `ALLOWED` let infrastructure
-        # import all of `application`; naming them is what turns a silent
+        # An adapter reaching *up* for a concrete application function rather
+        # than a port. It was invisible while `ALLOWED` let infrastructure
+        # import all of `application`; naming it is what turns a silent
         # allowance into a decision someone has to defend.
         #
         # `parse_frontmatter` is a pure parser over bytes the adapter already
         # holds, with no port to answer to -- the same argument as
         # `normalize_id` above.
         ("infrastructure.graph", "application.pages"),
-        # The privacy rule deciding which files may leave the vault. This one
-        # is real debt: the decision belongs in the application layer and
-        # should be handed to the adapter as a predicate. Attempted and
-        # reverted -- threading a callable through the graph dict that also
-        # feeds the Neo4j and Postgres adapters broke five tests. Left here,
-        # named, rather than left invisible.
-        ("infrastructure.integrations", "application.privacy"),
     }
 )
 
@@ -234,6 +227,110 @@ class ConstantsHaveOneOwnerTest(unittest.TestCase):
             if '("wiki/", "raw/")' in text
         ]
         self.assertEqual(owners, ["gate.py"], msg=f"copied into {owners}")
+
+
+class EnforcementLayersHaveOneOwnerTest(unittest.TestCase):
+    """The install table must be imported too, for exactly the same reason.
+
+    `ConstantsHaveOneOwnerTest` above guards the strings a copy of which had
+    already shipped twice. It did not cover the rest of what writer and reader
+    have to agree on -- what each enforcement layer is called, what mechanism it
+    names, which instruction file an agent reads, which state file records where
+    its configuration went, and what this brand's hook scripts are called -- and
+    that was the third instance: `bk hooks install` knew all four agents while
+    `Health` knew `claude`, in six hardcoded strings. An install for any other
+    agent was reported against a workspace nobody chose, an instruction file
+    nobody wrote and two hooks brainskit does not install for it.
+
+    So the same assertion, over the same boundary, one class of constant wider.
+    """
+
+    #: Spelled with their quotes, so prose naming a file is not read as a copy
+    #: of it. `"instructions"` is here as the layer name *and* as the key the
+    #: installer's result carries for it -- they are the same layer, and using
+    #: the constant for both is what keeps this assertion whole.
+    LITERALS: ClassVar[dict[str, str]] = {
+        "write_gate": "WRITE_GATE",
+        "session_status": "SESSION_STATUS",
+        "commit_lint": "COMMIT_LINT",
+        "instructions": "INSTRUCTIONS",
+        ".git/hooks/pre-commit running bk lint --changed": "COMMIT_LINT_MECHANISM",
+        "Claude Code PreToolUse hook on Write|Edit|MultiEdit": "the gate hook's mechanism",
+        "Claude Code SessionStart hook reporting vault state": "the status hook's mechanism",
+        "CLAUDE.md": "AGENTS['claude'].instructions",
+        "AGENTS.md": "AGENTS['codex'].instructions",
+        "GEMINI.md": "AGENTS['gemini'].instructions",
+    }
+
+    #: Written inside f-strings, so there is no opening quote to match on. The
+    #: mechanism suffix keeps its *closing* quote, because "managed block" is
+    #: also how three docstrings describe the thing in prose and prose is not a
+    #: copy -- only a string literal ending in it is.
+    FRAGMENTS: ClassVar[dict[str, str]] = {
+        "agent-{agent}.json": "adapter_path",
+        ' managed block"': "AgentInstall.instructions_mechanism",
+    }
+
+    def sources(self) -> dict[Path, str]:
+        return {
+            path: path.read_text(encoding="utf-8")
+            for path in SOURCE_ROOT.rglob("*.py")
+            if VENDORED not in path.parts
+        }
+
+    def test_each_layer_string_is_written_once(self) -> None:
+        for literal, name in self.LITERALS.items():
+            with self.subTest(constant=name):
+                owners = [
+                    path.name
+                    for path, text in self.sources().items()
+                    if f'"{literal}"' in text
+                ]
+                self.assertEqual(
+                    owners,
+                    ["install.py"],
+                    msg=f"{name} is spelled out in {owners}; import it instead",
+                )
+
+    def test_each_derived_fragment_is_written_once(self) -> None:
+        for fragment, name in self.FRAGMENTS.items():
+            with self.subTest(constant=name):
+                owners = [
+                    path.name
+                    for path, text in self.sources().items()
+                    if fragment in text
+                ]
+                self.assertEqual(
+                    owners,
+                    ["install.py"],
+                    msg=f"{name} is spelled out in {owners}; import it instead",
+                )
+
+    def test_no_module_spells_a_brand_derived_artefact_name(self) -> None:
+        """`brainskit-gate.sh` is derived from `BRAND`, so writing it is a copy.
+
+        This is the shape the reader was in: two script names typed out beside
+        an installer that builds them from the brand, which is why a rename
+        would have moved one and left the other. Nothing may spell either --
+        including the module that owns them, which builds them from `BRAND`.
+        """
+
+        from brainskit.application.install import AGENTS
+
+        names = {
+            spelling
+            for shape in AGENTS.values()
+            for hook in shape.hooks
+            for spelling in (hook.template, hook.script)
+        }
+        self.assertTrue(names, "fixture guard: the registry declares no hooks")
+        offenders = [
+            f"{path.name}: {spelling}"
+            for path, text in self.sources().items()
+            for spelling in sorted(names)
+            if f'"{spelling}"' in text
+        ]
+        self.assertEqual(offenders, [], msg="derive it from BRAND instead")
 
 
 class DomainHasNoThirdPartyImportsTest(unittest.TestCase):
