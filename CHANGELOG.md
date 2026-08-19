@@ -11,6 +11,13 @@ artifact was built from is the durable record of what shipped.
 
 ### Added
 
+- An installable `dsh-brainskit` bundle under `plugins/dsh-brainskit`. It
+  launches Brainskit over stdio through DSH's official MCP client, contributes
+  privacy-aware memory guidance, and denies mutable wiki, filing and
+  integration operations unless the operator explicitly sets
+  `BRAINSKIT_ALLOW_MUTATIONS=1`. Append-only capture and retrieval stay
+  available in the default posture.
+
 - `bk update` — check PyPI for a newer brainskit and upgrade this installation
   in place. The upgrade command is derived from how `bk` was installed
   (`uv tool upgrade`, `pipx upgrade`, or an in-place pip upgrade), so it works
