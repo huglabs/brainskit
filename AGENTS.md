@@ -1179,3 +1179,16 @@ Two process lessons from the repair round itself:
 - Related, same session: a "negative control" that only added a comment passed
   and proved nothing. **A control that does not fail has not run** — re-do it
   until it fails, or drop the claim.
+
+## The lock contract is portable even when the primitive is not (2026-08-19)
+
+- A module-level `fcntl` import made every Windows command fail before the CLI
+  could render help or diagnostics. Keep platform-specific imports inside the
+  infrastructure adapter so an unsupported primitive cannot make the package
+  itself unimportable.
+- Windows locks byte ranges rather than whole files. Reserve one stable byte in
+  each existing `*.lock` file, use blocking `LockFileEx` shared/exclusive modes
+  to preserve `flock`'s contract, and keep lock ordering in the vault unchanged.
+- Cross-process tests are the receipt for a lock abstraction. Prove both sides:
+  shared readers coexist, while an exclusive holder blocks a reader and a
+  shared holder blocks a writer until release.

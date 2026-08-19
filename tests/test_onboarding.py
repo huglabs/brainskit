@@ -20,16 +20,13 @@ them is a regression test for a bug that made every arrow key read as "cancel".
 
 from __future__ import annotations
 
-import fcntl
 import os
-import pty
 import re
 import select
 import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 import unittest
 from io import StringIO
@@ -40,6 +37,15 @@ from brainskit.domain.model import INTEGRATION_NAMES, PrivacyMode
 from brainskit.interfaces import onboarding, prompt
 from brainskit.interfaces.onboarding import OllamaModel, OllamaProbe
 from brainskit.interfaces.prompt import Choice
+
+try:
+    import fcntl
+    import pty
+    import termios
+except ModuleNotFoundError:
+    fcntl = None  # type: ignore[assignment]
+    pty = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -332,6 +338,9 @@ def _drive(
     unlike a marker, it re-synchronises on every screen, which is what a
     multi-level browser needs.
     """
+
+    if fcntl is None or pty is None or termios is None:
+        raise RuntimeError("pty driver is unavailable on this platform")
 
     master, slave = pty.openpty()
     if size is not None:
