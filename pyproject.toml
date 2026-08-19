@@ -52,8 +52,8 @@ Changelog = "https://github.com/huglabs/brainskit/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 convert = ["markitdown"]
 neo4j = ["neo4j>=5.25,<7"]
-postgres = ["psycopg[binary]>=3.2,<4"]
-integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.2,<4"]
+postgres = ["psycopg[binary]>=3.3.4,<4"]
+integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.3.4,<4"]
 # The code graph. Vendoring Graphify's source did not vendor a parser: the
 # tree-sitter grammars are compiled wheels and stay a real dependency, and they
 # are the reason this is an extra rather than a base requirement — roughly 70 MB
