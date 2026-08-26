@@ -197,8 +197,9 @@ class CodeGraph:
         nodes, dropped = self._nodes(payload)
         edges = self._edges(payload, known=set(nodes))
         notes: dict[str, Any] = {}
+        carry: dict[str, str] = {}
         if paths is not None:
-            nodes, edges, notes = self._merge_scoped(nodes, edges, paths)
+            nodes, edges, notes, carry = self._merge_scoped(nodes, edges, paths)
         if not nodes:
             raise ValidationError(
                 "No code nodes in the imported graph",
@@ -208,7 +209,12 @@ class CodeGraph:
                 },
             )
         result = self._write(
-            nodes, edges, dropped, survey=survey, scoped=paths is not None
+            nodes,
+            edges,
+            dropped,
+            survey=survey,
+            scoped=paths is not None,
+            carry=carry,
         )
         return {**result, **notes}
 
@@ -329,7 +335,12 @@ class CodeGraph:
         nodes: dict[str, dict[str, Any]],
         edges: list[dict[str, Any]],
         paths: list[Path],
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+        dict[str, str],
+    ]:
         """Fold a scoped extraction into the stored graph, not over it.
 
         Everything the stored graph knows about files outside `paths` is kept
@@ -342,11 +353,19 @@ class CodeGraph:
 
         The third return value is what the caller should disclose about the
         merge — presently, whether pruning was possible at all.
+
+        The fourth is the freshness carry: the recorded digest of every
+        out-of-scope file whose nodes survive untouched. `_write` re-hashes
+        node paths from disk, and a hash taken *now* describes bytes this
+        build never extracted — an edit outside the scope would be absorbed
+        into freshness and reported as `fresh` over nodes that describe code
+        that no longer exists. Carrying the old digest keeps that edit visible
+        to `staleness` until a full rebuild actually reads it.
         """
 
         stored = self._maybe_read()
         if stored is None:
-            return nodes, edges, {}
+            return nodes, edges, {}, {}
         self._refuse_malformed(
             stored,
             hint=(
@@ -356,7 +375,7 @@ class CodeGraph:
         )
         scope_roots = self._scope_roots(paths)
         if not scope_roots:
-            return nodes, edges, {}
+            return nodes, edges, {}, {}
 
         def in_scope(path: str) -> bool:
             # A scope root of `""` is the code root itself (`bk code build .`),
@@ -414,7 +433,15 @@ class CodeGraph:
                 str(item.get("type", "")),
             )
         )
-        return merged_nodes, merged_edges, self._prune_notes(stored)
+        recorded = stored.get("files")
+        carry = {
+            str(path): str(digest)
+            for path, digest in (
+                recorded.items() if isinstance(recorded, dict) else []
+            )
+            if digest and not in_scope(str(path))
+        }
+        return merged_nodes, merged_edges, self._prune_notes(stored), carry
 
     def _deletion_test(self, stored: dict[str, Any]) -> Callable[[str], bool]:
         """Whether a stored path may be pruned as deleted — evidence first.
@@ -551,11 +578,21 @@ class CodeGraph:
         *,
         survey: ScanSurvey | None = None,
         scoped: bool = False,
+        carry: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         # Hashed at import, compared at status. This is the artefact's input
         # set, and the only reason the graph can ever be called stale.
+        #
+        # `carry` holds digests a scoped build must NOT re-take: an
+        # out-of-scope file whose nodes were kept from storage was not read by
+        # this build, and hashing its current bytes would bless an edit this
+        # graph does not reflect — `status` would call the result fresh over
+        # nodes describing code that no longer exists. The stored digest is
+        # the honest record: "the file as the graph last saw it".
         files = {
-            path: self.vault.code_hash(path) or ""
+            path: (
+                (carry or {}).get(path) or self.vault.code_hash(path) or ""
+            )
             for path in sorted({node["path"] for node in nodes.values()})
         }
         missing = sorted(path for path, digest in files.items() if not digest)
@@ -581,7 +618,9 @@ class CodeGraph:
         # a complete one are indistinguishable the moment the build output
         # scrolls away -- which is how a two-node graph of a four-file
         # repository came to be reported as `fresh`.
-        coverage = self._coverage(survey, scoped=scoped)
+        coverage = self._coverage(
+            survey, scoped=scoped, covered=len(files)
+        )
         if coverage is not None:
             graph["coverage"] = coverage
         self.vault.write_generated(
@@ -608,7 +647,11 @@ class CodeGraph:
         return result
 
     def _coverage(
-        self, survey: ScanSurvey | None, *, scoped: bool
+        self,
+        survey: ScanSurvey | None,
+        *,
+        scoped: bool,
+        covered: int | None = None,
     ) -> dict[str, Any] | None:
         """What this graph is blind to, as recorded in the artefact.
 
@@ -623,12 +666,24 @@ class CodeGraph:
         deliberate: a grammar installed since the last whole-root build keeps
         being reported until one is run, which is a prompt to rebuild rather
         than a claim of completeness nobody measured.
+
+        The same logic now covers `unexplained_files`: a file with an installed
+        grammar whose bytes produced no nodes and no stated reason. The gap
+        used to reach only the command's return value, so it expired when the
+        build output scrolled away -- exactly the failure it was derived to
+        catch. It lives in the artefact now, as an explicit zero when a
+        whole-root build measured none (a scoped build cannot re-measure the
+        merged graph, so it carries whatever was last recorded), and
+        `staleness` reads it alongside the missing grammars.
         """
 
         if survey is None:
             return self._stored_coverage() if scoped else None
         fresh = survey.to_dict()
         if not scoped:
+            if covered is not None:
+                fresh.update(self._unexplained(survey, covered=covered))
+            fresh.setdefault("unexplained_files", 0)
             return fresh
         previous = self._stored_coverage() or {}
         by_distribution: dict[str, Any] = {
@@ -855,8 +910,13 @@ class CodeGraph:
             if isinstance(coverage, dict)
             else []
         )
+        unexplained = (
+            int(coverage.get("unexplained_files") or 0)
+            if isinstance(coverage, dict)
+            else 0
+        )
         state = "fresh" if fresh else "stale"
-        if fresh and missing:
+        if fresh and (missing or unexplained):
             state = "partial"
         result = {
             "state": state,
@@ -878,6 +938,12 @@ class CodeGraph:
             result["unreachable_files"] = (
                 coverage.get("unreachable_files") if isinstance(coverage, dict) else 0
             )
+        if unexplained:
+            # The gap a whole-root build measured between files it should have
+            # indexed and nodes it actually wrote, persisted so it survives
+            # the build output. `partial` above is the verdict; this is the
+            # size of what was lost.
+            result["unexplained_files"] = unexplained
         return result
 
     # -------------------------------------------------------------- traversal
@@ -1264,18 +1330,50 @@ class CodeGraph:
         )
 
     def _resolve(self, graph: dict[str, Any], symbol: str) -> str:
-        """Find a node by id, then by exact label, then case-insensitively."""
+        """Find a node by id, then by label, tolerating how people name things.
+
+        Function labels are minted as `name()` because that is how the graph
+        renders them, but nobody asking for a path types the parentheses --
+        `bk code path App helper` answered "No such symbol" while
+        `bk code path App "helper()"` worked, which is a contract only the
+        person who wrote the minting knows. So after exact id, labels are
+        matched with the `()` suffix optional on either side, case-insensitively.
+
+        A qualified spelling -- `lib.helper` for the helper in lib.py, or
+        `util.shared` when two modules define the same name -- resolves by
+        file-stem plus bare name before giving up. It is deliberately not a
+        general path search: ambiguity is still the caller's to resolve, via
+        the candidates the error lists.
+        """
 
         wanted = symbol.strip()
         nodes = graph.get("nodes", [])
         for node in nodes:
             if str(node.get("id")) == wanted:
                 return str(node["id"])
-        matches = [node for node in nodes if str(node.get("label")) == wanted]
+
+        def base(label: Any) -> str:
+            text = str(label)
+            return text[:-2] if text.endswith("()") else text
+
+        matches = [
+            node
+            for node in nodes
+            if str(node.get("label")) in {wanted, f"{wanted}()"}
+        ]
         if not matches:
-            lowered = wanted.casefold()
+            lowered = base(wanted).casefold()
             matches = [
-                node for node in nodes if str(node.get("label")).casefold() == lowered
+                node for node in nodes if base(node.get("label")).casefold() == lowered
+            ]
+        if not matches and "." in wanted:
+            stem, _, name = wanted.rpartition(".")
+            stem_l, name_l = stem.casefold(), name.casefold()
+            matches = [
+                node
+                for node in nodes
+                if base(node.get("label")).casefold() == name_l
+                and Path(str(node.get("path") or "")).stem.casefold() == stem_l
             ]
         if not matches:
             raise NotFoundError(

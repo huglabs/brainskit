@@ -10,6 +10,15 @@
       "captured_at": "2026-08-11T20:19:12.919582+00:00",
       "status": "ingested"
     },
+    "28f667a47ba7becb894dc22c188b31e5e753c4f19b4b0a9c39a190c3acb6dd87": {
+      "content_hash": "28f667a47ba7becb894dc22c188b31e5e753c4f19b4b0a9c39a190c3acb6dd87",
+      "path": "raw/40-research/2026-08-15-repowise-report-28f667a47ba7.md",
+      "original_name": "2026-08-15-repowise-report-28f667a47ba7.md",
+      "media_type": "text/markdown",
+      "size": 25945,
+      "captured_at": "2026-08-26T01:20:19.401133+00:00",
+      "status": "pending"
+    },
     "2991d63b7c905a15f79fef5c54b07a35665dc2b7ed11f869b6a845a96e553636": {
       "content_hash": "2991d63b7c905a15f79fef5c54b07a35665dc2b7ed11f869b6a845a96e553636",
       "path": "raw/_inbox/2026-08-11-benchmarks-2991d63b7c90.md",
@@ -27,6 +36,24 @@
       "size": 3102,
       "captured_at": "2026-08-11T20:15:49.646513+00:00",
       "status": "ingested"
+    },
+    "43257714618327663dbe1ecfe37d7efa9db462eea82895aa15e280f3c04d01c3": {
+      "content_hash": "43257714618327663dbe1ecfe37d7efa9db462eea82895aa15e280f3c04d01c3",
+      "path": "raw/40-research/2026-08-15-repowise-gif-analysis-432577146183.md",
+      "original_name": "2026-08-15-repowise-gif-analysis-432577146183.md",
+      "media_type": "text/markdown",
+      "size": 32169,
+      "captured_at": "2026-08-26T01:20:19.400784+00:00",
+      "status": "pending"
+    },
+    "48f64fdb094a6e582805a32e3734700cb4da95d440f4eac51efefdeb83d1e629": {
+      "content_hash": "48f64fdb094a6e582805a32e3734700cb4da95d440f4eac51efefdeb83d1e629",
+      "path": "raw/40-research/2026-08-15-arxiv-report-48f64fdb094a.md",
+      "original_name": "2026-08-15-arxiv-report-48f64fdb094a.md",
+      "media_type": "text/markdown",
+      "size": 15598,
+      "captured_at": "2026-08-26T01:20:19.398679+00:00",
+      "status": "pending"
     },
     "497531614142d205675d6f2903b5ef2c4bb9bf90a833fe789cf2c128fc3ebf4b": {
       "content_hash": "497531614142d205675d6f2903b5ef2c4bb9bf90a833fe789cf2c128fc3ebf4b",
@@ -46,6 +73,24 @@
       "captured_at": "2026-08-11T20:15:49.133589+00:00",
       "status": "ingested"
     },
+    "ab1b65381227a005e2c0d893c7cb48f6a93b860fbc90d58f9c9428457f8754b1": {
+      "content_hash": "ab1b65381227a005e2c0d893c7cb48f6a93b860fbc90d58f9c9428457f8754b1",
+      "path": "raw/40-research/2026-08-15-repo-scout-report-ab1b65381227.md",
+      "original_name": "2026-08-15-repo-scout-report-ab1b65381227.md",
+      "media_type": "text/markdown",
+      "size": 25736,
+      "captured_at": "2026-08-26T01:20:19.399339+00:00",
+      "status": "pending"
+    },
+    "c3230c8221922a0d027ac26add41ed03b2f14186598b5a92af78bd6a30549da1": {
+      "content_hash": "c3230c8221922a0d027ac26add41ed03b2f14186598b5a92af78bd6a30549da1",
+      "path": "raw/40-research/2026-08-15-superbrain-report-c3230c822192.md",
+      "original_name": "2026-08-15-superbrain-report-c3230c822192.md",
+      "media_type": "text/markdown",
+      "size": 23891,
+      "captured_at": "2026-08-26T01:20:19.401681+00:00",
+      "status": "pending"
+    },
     "d22dac0f3e9ba904013e22366365187b4802f4678337cf86aaf7160461728ecf": {
       "content_hash": "d22dac0f3e9ba904013e22366365187b4802f4678337cf86aaf7160461728ecf",
       "path": "raw/_inbox/2026-08-11-changelog-d22dac0f3e9b.md",
@@ -63,6 +108,15 @@
       "size": 80341,
       "captured_at": "2026-08-11T20:15:48.738973+00:00",
       "status": "ingested"
+    },
+    "e541db08ad6aa673c769162dd9c6ad57b89c67c809f04547100cb0384168e325": {
+      "content_hash": "e541db08ad6aa673c769162dd9c6ad57b89c67c809f04547100cb0384168e325",
+      "path": "raw/40-research/2026-08-15-repowise-frontend-report-e541db08ad6a.md",
+      "original_name": "2026-08-15-repowise-frontend-report-e541db08ad6a.md",
+      "media_type": "text/markdown",
+      "size": 25649,
+      "captured_at": "2026-08-26T01:20:19.400454+00:00",
+      "status": "pending"
     }
   }
 }

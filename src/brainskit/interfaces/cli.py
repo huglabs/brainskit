@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import shlex
 import subprocess
 import sys
 import time
 import traceback
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any, NamedTuple
 
@@ -23,9 +24,11 @@ from brainskit.domain.model import (
 )
 from brainskit.domain.privacy import Consumer
 from brainskit.infrastructure import pyenv
+from brainskit.infrastructure.credentials import CredentialStore
 from brainskit.infrastructure.extractor import (
     GraphifyExtractor,
     _extension_grammars,
+    grammar_audit,
     grammar_inventory,
 )
 from brainskit.infrastructure.graph import MarkdownGraph
@@ -527,6 +530,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    credential = commands.add_parser(
+        "credential",
+        help=(
+            "Hold a provider API key for this machine, under the name "
+            "api_key_env points at; an exported variable still wins"
+        ),
+    )
+    credential_sub = credential.add_subparsers(
+        dest="credential_command", required=True
+    )
+    credential_set = credential_sub.add_parser(
+        "set", help="Store a key; asked for without echo when --value is omitted"
+    )
+    credential_set.add_argument(
+        "name", metavar="VARIABLE", help="e.g. OPENROUTER_API_KEY"
+    )
+    credential_set.add_argument(
+        "--value",
+        default="",
+        help=(
+            "The key. Prefer omitting it at a terminal: a value passed here "
+            "lands in the shell history"
+        ),
+    )
+    credential_sub.add_parser(
+        "list",
+        help=(
+            "Variable names held on this machine, and whether the environment "
+            "already shadows each. Never prints a value"
+        ),
+    )
+    credential_forget = credential_sub.add_parser(
+        "forget", help="Drop a stored key. The environment is never touched"
+    )
+    credential_forget.add_argument(
+        "name", metavar="VARIABLE", help="Variable name to stop holding a key for"
+    )
+
     web = commands.add_parser("web", help="Run the complete local web viewer")
     web.add_argument("--host", help="Interface to bind; non-loopback requires --token-env")
     web.add_argument("--port", type=int, help="Port to bind")
@@ -619,7 +660,7 @@ HELP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Filing & review", ("ingest", "proposals", "approve", "reject", "apply")),
     ("Automation", ("digest", "resurface", "views", "graph", "enrich", "schedule")),
     ("Governance", ("gate", "hooks")),
-    ("Integrations & registry", ("export", "integration", "vaults")),
+    ("Integrations & registry", ("export", "integration", "vaults", "credential")),
     ("Serve", ("serve", "web")),
 )
 
@@ -1093,6 +1134,96 @@ def _mistyped_command(
     return None
 
 
+#: Commands whose first positional is free text a user may legitimately begin
+#: with `-` -- a term like `-retrieval`, negation-shaped on purpose. Deliberate
+#: a small named set rather than derived: the transform below reorders argv,
+#: and applying it to a command whose positionals are paths or ids would trade
+#: one dead end for wrong behaviour on a mistyped flag.
+_FREE_TEXT_COMMANDS = frozenset({"search", "context", "ask"})
+
+
+def _hoist_dash_leading_query(
+    argv: list[str], parser: argparse.ArgumentParser
+) -> list[str]:
+    """Let `bk search -retrieval` mean what it says.
+
+    argparse refuses any positional value that begins with `-`, whether or not
+    an option by that name exists -- so a query shaped like negation died with
+    "the following arguments are required: query" no matter where it was
+    placed, and the only spelling argparse accepts (`--` after every flag) is
+    one nobody is expected to know. The fix rewrites exactly that shape into
+    it: unknown dash-leading tokens after a free-text command are moved to the
+    end behind `--`, which parses to the same query.
+
+    Guard rails, because a rewrite that fires too often is worse than the bug:
+
+    - only the three free-text commands, per `_FREE_TEXT_COMMANDS`;
+    - only tokens that are *not* options of that subparser -- read off the
+      parser, never restated;
+    - a token following a value-taking flag is consumed as its value first,
+      so `--limit -1` and `--consumer -x` keep meaning what they said;
+    - only when no plain positional was typed at all. A half-typed command is
+      a mistake to report (see `_fill_missing_arguments`), and a mistyped flag
+      alongside a real query must stay argparse's error, not silently become
+      part of one.
+    """
+
+    command_index = next(
+        (i for i, token in enumerate(argv) if not token.startswith("-")), None
+    )
+    if command_index is None:
+        return argv
+    name = argv[command_index]
+    if name not in _FREE_TEXT_COMMANDS:
+        return argv
+    subparsers = _subparsers_of(parser)
+    if subparsers is None or name not in subparsers.choices:
+        return argv
+    subparser = subparsers.choices[name]
+    known = {
+        string
+        for action in subparser._actions
+        for string in action.option_strings
+    }
+    value_flags = {
+        string
+        for action in subparser._actions
+        if action.option_strings and action.nargs is None
+        for string in action.option_strings
+    }
+
+    rest = argv[command_index + 1 :]
+    if "--" in rest:
+        # An operator who already spelled `--` knows exactly what they are
+        # doing; reordering around their separator would un-mean it.
+        return argv
+    kept: list[str] = []
+    hoisted: list[str] = []
+    positional_seen = False
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token in value_flags:
+            kept.append(token)
+            index += 1
+            if index < len(rest):
+                kept.append(rest[index])
+                index += 1
+            continue
+        if token.startswith("-") and token not in known:
+            hoisted.append(token)
+            index += 1
+            continue
+        if not token.startswith("-"):
+            positional_seen = True
+        kept.append(token)
+        index += 1
+
+    if not hoisted or positional_seen:
+        return argv
+    return [*argv[: command_index + 1], *kept, "--", *hoisted]
+
+
 def _did_you_mean(unknown: str, parser: argparse.ArgumentParser) -> str:
     """Argparse's answer to a typo is to reprint all thirty command names.
 
@@ -1173,6 +1304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if mistyped is not None:
         print(_did_you_mean(mistyped, parser), file=sys.stderr)
         return 2
+    effective_argv = _hoist_dash_leading_query(effective_argv, parser)
     effective_argv = _fill_missing_arguments(parser, effective_argv, global_values)
     args = parser.parse_args(effective_argv)
     if getattr(args, "print_config", False):
@@ -1281,6 +1413,10 @@ def _finish_init(
     # `.` this command defaults to. `--config` never runs the wizard and
     # keeps naming its path on the command line.
     target = outcome.vault or target
+    # Before the vault, so a credential store that cannot be written fails while
+    # nothing has been created yet rather than leaving a vault whose provider
+    # has no key and no message saying why.
+    stored = _store_credentials(outcome.credentials)
     vault = FileVault.initialize(target, outcome.policy, force=force)
     service = create_service(str(vault.root))
     indexed = service.reindex()
@@ -1295,6 +1431,9 @@ def _finish_init(
         # only path that never registered one, so `bk vaults list` silently
         # omitted every vault the wizard made.
         "registered": _register_new_vault(vault.root),
+        # Names only. This dict is printed, and `bk init --json` output ends up
+        # in issue reports.
+        "credentials": stored,
     }
     # Wiring the agent is deliberately the *last* step: it writes outside
     # the vault, into the operator's project, and doing it before the vault
@@ -1314,6 +1453,63 @@ def _finish_init(
             skip_code_build=skip_code_build,
         )
     return vault, service, result
+
+
+def _store_credentials(secrets: Mapping[str, str]) -> list[str]:
+    """Write provider keys to the machine's store; return the names, never values."""
+
+    if not secrets:
+        return []
+    store = CredentialStore()
+    for name, value in sorted(secrets.items()):
+        store.remember(name, value)
+    return sorted(secrets)
+
+
+def _credential(args: argparse.Namespace) -> Any:
+    """`bk credential` — the non-interactive half of what the wizard asks for.
+
+    Separate from `bk vaults` and from any vault at all: a provider key is a
+    property of the machine, and the same key serves every vault that names it
+    in `api_key_env`. Putting it under a vault would mean storing one copy per
+    vault, which is how copies go stale.
+    """
+
+    store = CredentialStore()
+    if args.credential_command == "list":
+        return {
+            "path": str(store.path),
+            # Names only, and the environment reported separately, so an
+            # operator can see *which* answer is winning without printing either.
+            "credentials": [
+                {"name": name, "shadowed_by_environment": bool(os.environ.get(name))}
+                for name in store.names()
+            ],
+        }
+    if args.credential_command == "forget":
+        return {"name": args.name, "forgotten": store.forget(args.name)}
+
+    value = args.value or ""
+    if not value:
+        if not prompt.supports_interactive():
+            raise ValidationError(
+                "A credential value is required",
+                details={
+                    "name": args.name,
+                    "hint": (
+                        "Pass --value, or run this at a terminal to be asked "
+                        "without echoing the key."
+                    ),
+                },
+            )
+        value = prompt.secret(f"Value for {args.name}")
+    path = store.remember(args.name, value)
+    return {
+        "name": args.name,
+        "path": str(path),
+        "stored": True,
+        "shadowed_by_environment": bool(os.environ.get(args.name)),
+    }
 
 
 def _service_for_web(args: argparse.Namespace) -> BrainskitService:
@@ -1369,6 +1565,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
     # `bk vaults sync` builds a service per registered vault instead.
     if args.command == "vaults":
         return _vaults(args)
+
+    # A credential belongs to the machine, not to a vault, so this must work
+    # from a directory that is not one -- the same reason `vaults` sits above
+    # the service construction below.
+    if args.command == "credential":
+        return _credential(args)
 
     service = (
         _service_for_web(args) if args.command == "web" else create_service(args.vault)
@@ -1815,7 +2017,9 @@ def _doctor(service: BrainskitService) -> dict[str, Any]:
     """
 
     return service.doctor(
-        environment=pyenv.describe_environment(), grammars=grammar_inventory()
+        environment=pyenv.describe_environment(),
+        grammars=grammar_inventory(),
+        grammar_versions=grammar_audit(),
     )
 
 
@@ -2661,9 +2865,15 @@ def _doctor_headline(value: dict[str, Any]) -> str:
     if value.get("healthy"):
         return "installation complete"
     faults: list[str] = []
-    missing = (value.get("code") or {}).get("grammars_missing") or []
+    code = value.get("code") or {}
+    missing = code.get("grammars_missing") or []
     if missing:
         faults.append(f"{len(missing)} language(s) cannot be parsed")
+    outdated = code.get("grammars_outdated") or []
+    if outdated:
+        faults.append(
+            f"{len(outdated)} grammar(s) older than the pinned version"
+        )
     probe = (value.get("enforcement") or {}).get("write_gate_probe") or {}
     state = probe.get("state")
     if state not in {"enforcing", "absent", None}:
@@ -2698,6 +2908,27 @@ def _render_doctor(value: dict[str, Any]) -> str:
         parts.append(console.style("  " + ", ".join(missing), console.WARN))
         if code.get("install"):
             parts += ["", console.style("  " + str(code["install"]), console.MUTED)]
+    outdated = code.get("grammars_outdated") or []
+    if outdated:
+        # Present but out of range: the wheel imports, so nothing above flags
+        # it, and the failure arrives later as a per-file parse error no one
+        # traces back to the version. Named here with the pin it violates.
+        parts += ["", console.rule("outdated grammars")]
+        parts.append(
+            console.table(
+                ["distribution", "installed", "requires"],
+                [
+                    [
+                        entry.get("distribution", "?"),
+                        str(entry.get("installed", "?")),
+                        str(entry.get("required", "?")),
+                    ]
+                    for entry in outdated
+                ],
+            )
+        )
+        if code.get("upgrade"):
+            parts += ["", console.style("  " + str(code["upgrade"]), console.MUTED)]
     enforcement = value.get("enforcement") or {}
     layers = enforcement.get("layers") or []
     if layers:
@@ -2787,6 +3018,22 @@ def _render_code_status(value: dict[str, Any]) -> str:
     """
 
     rendered = _render_auto(value)
+    if value.get("state") == "partial" and int(value.get("unexplained_files") or 0):
+        # Persisted by the build, surfaced here: files that should have been
+        # indexed and were not, for no stated reason. The verdict alone says
+        # "incomplete"; this says how much and what to do.
+        rendered = "\n".join(
+            [
+                rendered,
+                "",
+                console.style(
+                    f"  {console.CROSS} {value['unexplained_files']} file(s) have "
+                    "an installed grammar but contributed no nodes — rebuild "
+                    "with bk code build, and report it if it repeats.",
+                    console.WARN,
+                ),
+            ]
+        )
     if value.get("state") != "malformed":
         return rendered
     where = str(value.get("collection", "the graph"))

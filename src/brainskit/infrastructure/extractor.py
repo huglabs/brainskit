@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import os
 import stat
@@ -135,6 +136,13 @@ def _cache_format_marker() -> str:
             digest.update(path.relative_to(_VENDORED_DIR).as_posix().encode())
             digest.update(path.read_bytes())
         digest.update(_NOTICE_PATH.read_bytes())
+        # This adapter is part of the extraction pipeline: it decides which
+        # files reach the vendored extractor. A change here can change what a
+        # cached entry *means* -- the symlink-collapse below left entries that
+        # were extracted under one path and would have been served for
+        # another (the cache salts by the resolved path, so alias and target
+        # share a key) -- so the adapter hashes itself into the marker too.
+        digest.update(Path(__file__).read_bytes())
     except OSError:
         return "unversioned"
     return digest.hexdigest()[:16]
@@ -547,6 +555,37 @@ def _grammars_for_extension(extension: str) -> tuple[str, ...]:
         return ()
 
 
+def _canonical_files(collected: list[Path]) -> list[Path]:
+    """One entry per real file, whoever the walk found first.
+
+    A file and a symlink to it are one source, but the extractor's own
+    content-dedup could not be told that apart reliably: under the process
+    pool the two paths raced, and the *symlink* sometimes won -- the graph
+    then credited `alias.py` with code whose bytes live in `real.py`, and the
+    real file contributed nothing for no stated reason. Which path won was an
+    artifact of worker scheduling, so repeated builds disagreed.
+
+    Collapsing by resolved path here, before extraction, removes the race
+    instead of arbitrating it: a real file always beats any symlink to it,
+    and ties (two symlinks, no original) break lexicographically. Two
+    distinct files with identical bytes keep both entries -- they are
+    different sources and both deserve credit.
+    """
+
+    by_real: dict[str, list[Path]] = {}
+    for path in collected:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        by_real.setdefault(key, []).append(path)
+    files: list[Path] = []
+    for members in by_real.values():
+        real = [p for p in members if not p.is_symlink()]
+        files.append(sorted(real or members, key=str)[0])
+    return sorted(files, key=str)
+
+
 class _ExtractFn(Protocol):
     #: `parallel` was always part of the vendored signature; this Protocol
     #: simply had not declared it, because nothing here passed it. Brainskit
@@ -629,16 +668,24 @@ class GraphifyExtractor:
         resolved_root = root.resolve()
         targets = paths or [resolved_root]
         seen: set[Path] = set()
-        by_extension: dict[str, int] = {}
+        collected: list[Path] = []
         for target in targets:
             candidate = target if target.is_absolute() else resolved_root / target
             for found in collect_fn(candidate, root=resolved_root):
                 if found in seen or _is_vault_file(found, resolved_root):
                     continue
                 seen.add(found)
-                by_extension[found.suffix.lower()] = (
-                    by_extension.get(found.suffix.lower(), 0) + 1
-                )
+                collected.append(found)
+        # The same canonical collapse `extract` applies: the survey's file
+        # count is what `_unexplained` is computed against, so a file dropped
+        # here but extracted there (or the reverse) would read as a gap that
+        # does not exist.
+        files = _canonical_files(collected)
+        by_extension: dict[str, int] = {}
+        for found in files:
+            by_extension[found.suffix.lower()] = (
+                by_extension.get(found.suffix.lower(), 0) + 1
+            )
 
         needs: dict[str, dict[str, Any]] = {}
         for extension, count in by_extension.items():
@@ -660,7 +707,7 @@ class GraphifyExtractor:
         )
         return ScanSurvey(
             root=str(resolved_root),
-            files=len(seen),
+            files=len(files),
             grammars=grammars,
             present=_present_on_disk(resolved_root, targets),
             skipped=_deliberate_skips(sorted(seen)),
@@ -709,14 +756,17 @@ class GraphifyExtractor:
         targets = paths or [resolved_root]
 
         seen: set[Path] = set()
-        files: list[Path] = []
+        collected: list[Path] = []
         for target in targets:
             candidate = target if target.is_absolute() else resolved_root / target
             for found in collect_fn(candidate, root=resolved_root):
                 if found in seen or _is_vault_file(found, resolved_root):
                     continue
                 seen.add(found)
-                files.append(found)
+                collected.append(found)
+        # One entry per real file, symlink collapsed onto its target -- see
+        # `_canonical_files` for the attribution race this removes.
+        files = _canonical_files(collected)
 
         cache_dir = self._prepare_cache_dir(cache_root)
         if cache_dir is not None:
@@ -821,3 +871,41 @@ def grammar_inventory() -> dict[str, bool]:
         module.replace("_", "-"): importlib.util.find_spec(module) is not None
         for module in sorted(modules)
     }
+
+
+def grammar_audit() -> dict[str, dict[str, Any]]:
+    """`grammar_inventory` with the installed version of each distribution.
+
+    The boolean inventory answers "can this language be parsed"; the audit
+    adds "with which build of its grammar", because a grammar can be present
+    and still wrong -- compiled wheels move fast and the pins in
+    `pyproject.toml` exist because mismatched parser/ABI pairs fail at
+    extraction time, far from their cause. `bk doctor` compares these
+    versions against the pins brainskit itself declares (read from this
+    distribution's own metadata, so there is no second table to rot) and
+    reports an outdated grammar exactly where it reports a missing one.
+    """
+
+    try:
+        modules = {m for grammars in _extension_grammars().values() for m in grammars}
+    except Exception:
+        return {}
+    audit: dict[str, dict[str, Any]] = {}
+    for module in sorted(modules):
+        distribution = module.replace("_", "-")
+        installed = importlib.util.find_spec(module) is not None
+        version: str | None = None
+        if installed:
+            try:
+                version = importlib.metadata.version(distribution)
+            except Exception:
+                # Present but unversioned (a hand-placed checkout). Reported
+                # as installed with no version; the pin check skips it rather
+                # than crying outdated about a version it cannot read.
+                version = None
+        audit[distribution] = {
+            "module": module,
+            "installed": installed,
+            "version": version,
+        }
+    return audit

@@ -554,6 +554,86 @@ class TopLevelHelpTest(unittest.TestCase):
         self.assertIn("unrecognized arguments", err)
 
 
+class DashLeadingQueryTest(unittest.TestCase):
+    """`bk search -retrieval` used to die in "arguments are required: query".
+
+    argparse refuses any positional beginning with `-`, so a negation-shaped
+    term -- a thing FTS5 users legitimately type -- could not be passed at all,
+    and the only spelling argparse accepts (`--` after every flag) is one
+    nobody knows. The CLI now rewrites exactly that shape before parsing.
+    """
+
+    def setUp(self) -> None:
+        from brainskit.interfaces.cli import build_parser
+
+        self.parser = build_parser()
+
+    def hoist(self, argv: list[str]) -> list[str]:
+        from brainskit.interfaces.cli import _hoist_dash_leading_query
+
+        return _hoist_dash_leading_query(argv, self.parser)
+
+    def test_a_dash_leading_query_is_moved_behind_the_separator(self) -> None:
+        self.assertEqual(
+            self.hoist(["search", "-retrieval"]), ["search", "--", "-retrieval"]
+        )
+
+    def test_flags_between_the_command_and_the_query_keep_their_order(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.hoist(["search", "-retrieval", "--consumer", "local"]),
+            ["search", "--consumer", "local", "--", "-retrieval"],
+        )
+
+    def test_a_value_taking_flag_consumes_a_dash_leading_value(self) -> None:
+        # `--limit -1` means a limit of minus one (and errors later); it must
+        # not be read as a query plus an unknown flag.
+        argv = ["search", "--limit", "-1", "-alpha"]
+        self.assertEqual(self.hoist(argv), ["search", "--limit", "-1", "--", "-alpha"])
+
+    def test_commands_outside_the_free_text_set_are_untouched(self) -> None:
+        # `capture -` is the stdin marker; its argv is argparse's business.
+        argv = ["capture", "-", "--json"]
+        self.assertEqual(self.hoist(argv), argv)
+
+    def test_a_real_positional_present_means_no_rewrite(self) -> None:
+        # A mistyped flag beside a real query must stay argparse's error, not
+        # silently become part of the query.
+        argv = ["search", "alpha", "--conusmer", "local"]
+        self.assertEqual(self.hoist(argv), argv)
+
+    def test_no_query_and_no_dash_token_changes_nothing(self) -> None:
+        self.assertEqual(self.hoist(["search", "--consumer", "local"]),
+                         ["search", "--consumer", "local"])
+
+    def test_an_explicit_separator_is_left_alone(self) -> None:
+        # Someone who already spelled `--` knows what they are doing; the
+        # rewrite must not reorder around their separator.
+        argv = ["search", "--", "-retrieval"]
+        self.assertEqual(self.hoist(argv), argv)
+
+    def test_every_rewritten_argv_parses_to_the_intended_query(self) -> None:
+        for original, dest, query in (
+            (["search", "-retrieval"], "query", "-retrieval"),
+            (["context", "-x", "--consumer", "cloud"], "query", "-x"),
+            (["ask", "-why", "--save"], "question", "-why"),
+        ):
+            with self.subTest(argv=original):
+                rewritten = self.hoist(original)
+                args = self.parser.parse_args(rewritten)
+                self.assertEqual(getattr(args, dest), query)
+
+    def test_the_transform_is_the_whole_fix_end_to_end(self) -> None:
+        """Negative control: without the rewrite, argparse rejects the query."""
+
+        self.parser.exit = lambda status=0, message="": (_ for _ in ()).throw(
+            SystemExit(2)
+        )  # type: ignore[method-assign]
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(["search", "-retrieval"])
+
+
 @unittest.skipUnless(hasattr(os, "openpty"), "needs a pty")
 class CommandBrowserTest(unittest.TestCase):
     """Bare `bk` at a terminal discloses progressively instead of dumping 30 rows.
