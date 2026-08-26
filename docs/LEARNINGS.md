@@ -172,3 +172,20 @@ correctness bugs, two gaps found:
   S310 by default and does not flag RUF100; a newer ad-hoc ruff inverts both.
   Lint gates are whatever `uv.lock` pins — check there before adding or
   removing a noqa.
+
+## Merging main into privacy: the conflict was trivial, the red test was not (2026-08-26)
+
+- **The two conflicts were both "keep both sides."** `_dispatch` in `cli.py`
+  gained two machine-level commands on separate branches (`credential` here,
+  `update` on main) that both sit above vault discovery; `docs/LEARNINGS.md`
+  was an add/add where only this branch appended a section. Nothing to choose.
+- **The failure that showed up after the merge predated it.** The privacy
+  branch changed `_assemble` to take a `ModelChoice` and added 80 test lines,
+  but left `PolicyAssemblyTest.assemble` on the old five-argument call — three
+  tests were already red on the branch tip. Before blaming a merge, diff the
+  failing files against the pre-merge tip: an empty diff means the merge is
+  innocent. The helper now builds a `ModelChoice`, and the "no model chosen"
+  case goes through `_default_ollama_choice`, where that guarantee lives now.
+- `cli.py` and parts of `test_onboarding.py` fail `ruff format --check` on
+  both parents; only `ruff check` is clean. Reformatting a 3000-line file in a
+  merge commit would bury the resolution, so it was left alone.
