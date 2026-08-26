@@ -67,11 +67,18 @@ class PolicyAssemblyTest(unittest.TestCase):
         )
 
     def assemble(self, tmp: Path, extras: list[str], model: str | None = "m") -> dict:
+        probe = OllamaProbe(base_url="http://127.0.0.1:11434", reachable=True)
+        choice = (
+            onboarding.ModelChoice(
+                provider="ollama", model=model, base_url=probe.base_url
+            )
+            if model
+            else onboarding._default_ollama_choice(probe)
+        )
         return onboarding._assemble(
             self.environment(tmp),
-            OllamaProbe(base_url="http://127.0.0.1:11434", reachable=True),
+            choice,
             dict(onboarding.PRESETS[0].branches),
-            model,
             extras,
         )
 
