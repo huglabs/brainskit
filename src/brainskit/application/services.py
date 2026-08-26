@@ -372,7 +372,11 @@ class BrainskitService:
         return install_agent(self.vault, agent, root=root, force=force)
 
     def doctor(
-        self, *, environment: EnvironmentPort, grammars: Mapping[str, bool]
+        self,
+        *,
+        environment: EnvironmentPort,
+        grammars: Mapping[str, bool],
+        grammar_versions: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Whether this installation still enforces. See `doctor_report`."""
         return doctor_report(
@@ -380,6 +384,7 @@ class BrainskitService:
             self.health.enforcement(),
             environment=environment,
             grammars=grammars,
+            grammar_versions=grammar_versions,
         )
 
     def search(

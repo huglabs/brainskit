@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -26,6 +28,7 @@ from brainskit.infrastructure import pyenv
 from brainskit.infrastructure.extractor import (
     GraphifyExtractor,
     _extension_grammars,
+    grammar_audit,
     grammar_inventory,
 )
 from brainskit.infrastructure.graph import MarkdownGraph
@@ -103,6 +106,21 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="Show vault health and counts")
     commands.add_parser(
         "doctor", help="Check the installation itself: deps, grammars, code root"
+    )
+    update = commands.add_parser(
+        "update",
+        help="Check PyPI for a newer brainskit and upgrade this installation",
+    )
+    update.add_argument(
+        "--check",
+        action="store_true",
+        help="Report what is available without upgrading",
+    )
+    update.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Upgrade without asking (required under --json)",
     )
     commands.add_parser("reconcile", help="Heal registry paths after manual moves")
     commands.add_parser("reindex", help="Rebuild the disposable FTS5 index")
@@ -612,7 +630,7 @@ def _document_global_options(parser: argparse.ArgumentParser) -> None:
 HELP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Vault & capture",
-        ("init", "capture", "status", "doctor", "reconcile", "reindex", "file", "forget", "watch", "lint"),
+        ("init", "capture", "status", "doctor", "update", "reconcile", "reindex", "file", "forget", "watch", "lint"),
     ),
     ("Search & context", ("search", "context", "ask")),
     ("Code graph", ("code",)),
@@ -1093,6 +1111,96 @@ def _mistyped_command(
     return None
 
 
+#: Commands whose first positional is free text a user may legitimately begin
+#: with `-` -- a term like `-retrieval`, negation-shaped on purpose. Deliberate
+#: a small named set rather than derived: the transform below reorders argv,
+#: and applying it to a command whose positionals are paths or ids would trade
+#: one dead end for wrong behaviour on a mistyped flag.
+_FREE_TEXT_COMMANDS = frozenset({"search", "context", "ask"})
+
+
+def _hoist_dash_leading_query(
+    argv: list[str], parser: argparse.ArgumentParser
+) -> list[str]:
+    """Let `bk search -retrieval` mean what it says.
+
+    argparse refuses any positional value that begins with `-`, whether or not
+    an option by that name exists -- so a query shaped like negation died with
+    "the following arguments are required: query" no matter where it was
+    placed, and the only spelling argparse accepts (`--` after every flag) is
+    one nobody is expected to know. The fix rewrites exactly that shape into
+    it: unknown dash-leading tokens after a free-text command are moved to the
+    end behind `--`, which parses to the same query.
+
+    Guard rails, because a rewrite that fires too often is worse than the bug:
+
+    - only the three free-text commands, per `_FREE_TEXT_COMMANDS`;
+    - only tokens that are *not* options of that subparser -- read off the
+      parser, never restated;
+    - a token following a value-taking flag is consumed as its value first,
+      so `--limit -1` and `--consumer -x` keep meaning what they said;
+    - only when no plain positional was typed at all. A half-typed command is
+      a mistake to report (see `_fill_missing_arguments`), and a mistyped flag
+      alongside a real query must stay argparse's error, not silently become
+      part of one.
+    """
+
+    command_index = next(
+        (i for i, token in enumerate(argv) if not token.startswith("-")), None
+    )
+    if command_index is None:
+        return argv
+    name = argv[command_index]
+    if name not in _FREE_TEXT_COMMANDS:
+        return argv
+    subparsers = _subparsers_of(parser)
+    if subparsers is None or name not in subparsers.choices:
+        return argv
+    subparser = subparsers.choices[name]
+    known = {
+        string
+        for action in subparser._actions
+        for string in action.option_strings
+    }
+    value_flags = {
+        string
+        for action in subparser._actions
+        if action.option_strings and action.nargs is None
+        for string in action.option_strings
+    }
+
+    rest = argv[command_index + 1 :]
+    if "--" in rest:
+        # An operator who already spelled `--` knows exactly what they are
+        # doing; reordering around their separator would un-mean it.
+        return argv
+    kept: list[str] = []
+    hoisted: list[str] = []
+    positional_seen = False
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token in value_flags:
+            kept.append(token)
+            index += 1
+            if index < len(rest):
+                kept.append(rest[index])
+                index += 1
+            continue
+        if token.startswith("-") and token not in known:
+            hoisted.append(token)
+            index += 1
+            continue
+        if not token.startswith("-"):
+            positional_seen = True
+        kept.append(token)
+        index += 1
+
+    if not hoisted or positional_seen:
+        return argv
+    return [*argv[: command_index + 1], *kept, "--", *hoisted]
+
+
 def _did_you_mean(unknown: str, parser: argparse.ArgumentParser) -> str:
     """Argparse's answer to a typo is to reprint all thirty command names.
 
@@ -1173,6 +1281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if mistyped is not None:
         print(_did_you_mean(mistyped, parser), file=sys.stderr)
         return 2
+    effective_argv = _hoist_dash_leading_query(effective_argv, parser)
     effective_argv = _fill_missing_arguments(parser, effective_argv, global_values)
     args = parser.parse_args(effective_argv)
     if getattr(args, "print_config", False):
@@ -1369,6 +1478,11 @@ def _dispatch(args: argparse.Namespace) -> Any:
     # `bk vaults sync` builds a service per registered vault instead.
     if args.command == "vaults":
         return _vaults(args)
+
+    # An update belongs to the machine, not to a vault, so like `vaults` it
+    # must run from a directory that is not one -- before vault discovery.
+    if args.command == "update":
+        return _run_update(args)
 
     service = (
         _service_for_web(args) if args.command == "web" else create_service(args.vault)
@@ -1815,8 +1929,174 @@ def _doctor(service: BrainskitService) -> dict[str, Any]:
     """
 
     return service.doctor(
-        environment=pyenv.describe_environment(), grammars=grammar_inventory()
+        environment=pyenv.describe_environment(),
+        grammars=grammar_inventory(),
+        grammar_versions=grammar_audit(),
     )
+
+
+#: The one network call `bk update` may make. Everything else in brainskit is
+#: local-first; this command exists to leave, and it says so by being the only
+#: place a PyPI URL appears.
+_PYPI_JSON_URL = "https://pypi.org/pypi/brainskit/json"
+
+
+def _latest_pypi_version(timeout: float = 8.0) -> str | None:
+    """The newest released version on PyPI, or None when it cannot be known.
+
+    Unreachable is an answer here, not an exception: a machine that is offline,
+    behind a captive portal or blocking pypi.org must get `state: "unavailable"`
+    and its prompt back, never a traceback. The URL is pinned and its scheme
+    checked before fetching -- `urlopen` happily follows `file:`, and a constant
+    this load-bearing should not depend on no one having edited it.
+    """
+
+    if urllib.parse.urlparse(_PYPI_JSON_URL).scheme != "https":
+        return None
+    request = urllib.request.Request(  # noqa: S310 - https-only, checked above
+        _PYPI_JSON_URL, headers={"User-Agent": f"brainskit/{__version__}"}
+    )
+    try:
+        # The scheme check above is the audit ruff's S310 asks for.
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            payload = json.load(response)
+    except (OSError, ValueError):
+        return None
+    version = (
+        payload.get("info", {}).get("version") if isinstance(payload, dict) else None
+    )
+    return str(version) if version else None
+
+
+def _outdated(current: str, latest: str) -> bool:
+    """Whether `latest` names a release newer than `current`.
+
+    The same dotted-integer comparison the grammar pin check uses -- imported
+    rather than restated, because two copies of a version rule are where they
+    drift. An unreadable shape (a dev build like `0.7.0.dev1`) compares on the
+    numeric prefix it can read, and equal prefixes count as up to date: a
+    local checkout must not be told to update over itself.
+    """
+
+    from brainskit.application.doctor import _version_key
+
+    got, want = _version_key(current), _version_key(latest)
+    width = max(len(got), len(want))
+    got += (0,) * (width - len(got))
+    want += (0,) * (width - len(want))
+    return want > got
+
+
+def _run_update(args: argparse.Namespace) -> dict[str, Any]:
+    """Check PyPI for a newer brainskit and, asked to, upgrade in place.
+
+    Lives beside `_doctor` because it answers the same question from the other
+    side: doctor says what this installation *is*, update says what it could
+    be. Like doctor it works outside any vault -- dispatch runs it before
+    vault discovery.
+
+    The upgrade command comes from `pyenv`'s classification of the running
+    interpreter (`uv tool upgrade`, `pipx upgrade`, or an in-place pip
+    upgrade), never from a table here: how `bk` was installed is exactly the
+    fact those artefacts exist to report. A tool-manager upgrade reinstalls
+    declared dependencies too, which is why grammars ride along.
+    """
+
+    current = __version__
+    latest = _latest_pypi_version()
+    environment = pyenv.describe_environment()
+
+    if latest is None:
+        return {
+            "state": "unavailable",
+            "current": current,
+            "detail": "could not reach pypi.org; check connectivity or try again",
+            "environment": environment.label,
+        }
+
+    base = {"current": current, "latest": latest, "environment": environment.label}
+    if not _outdated(current, latest):
+        return {"state": "up-to-date", "version": current, **base}
+
+    command = environment.upgrade_command()
+    plan = {
+        **base,
+        "state": "outdated",
+        "command": shlex.join(command) if command else None,
+    }
+    if not command:
+        return {
+            **plan,
+            "state": "unavailable",
+            "detail": (
+                "this installation cannot be upgraded from inside itself; "
+                "upgrade it however the interpreter is managed"
+            ),
+        }
+    if args.check:
+        return {**plan, "state": "available"}
+
+    if args.json and not args.yes:
+        # A script that did not say --yes gets the plan, not a mutation: the
+        # one answer it must never receive is a surprise upgrade mid-run.
+        return {**plan, "hint": "re-run with --yes to apply"}
+
+    if not args.yes and prompt.supports_interactive():
+        answer = prompt.confirm(
+            f"Upgrade brainskit {current} -> {latest} ({environment.label})?"
+        )
+        if not answer:
+            return {**plan, "state": "declined"}
+
+    done = subprocess.run(  # noqa: S603
+        command, capture_output=True, text=True, timeout=600, check=False
+    )
+    if done.returncode != 0:
+        return {
+            **plan,
+            "state": "failed",
+            "exit": done.returncode,
+            "stderr_tail": (done.stderr or "").strip()[-400:],
+        }
+    return {**plan, "state": "updated"}
+
+
+def _render_update(value: dict[str, Any]) -> str:
+    state = value.get("state")
+    label = value.get("environment", "?")
+    if state == "up-to-date":
+        return console.status_line(
+            True, f"brainskit {value.get('version')} is up to date ({label})"
+        )
+    if state == "unavailable":
+        return "\n".join(
+            [
+                console.status_line(False, str(value.get("detail", state))),
+                console.style(
+                    f"  installed: {value.get('current')} ({label})", console.MUTED
+                ),
+            ]
+        )
+    lines = [
+        console.style(
+            f"brainskit {value.get('current')} -> {value.get('latest')} ({label})",
+            console.BOLD,
+        )
+    ]
+    if value.get("command"):
+        lines.append(console.style(f"  {value['command']}", console.MUTED))
+    if state == "updated":
+        lines.append(console.status_line(True, "updated -- restart bk to run it"))
+    elif state == "failed":
+        tail = value.get("stderr_tail") or ""
+        detail = f" exited {value.get('exit')}" + (f": {tail}" if tail else "")
+        lines.append(console.status_line(False, f"upgrade failed{detail}"))
+    elif state == "declined":
+        lines.append(console.style("  declined; nothing changed", console.MUTED))
+    elif value.get("hint"):
+        lines.append(console.style(f"  {value['hint']}", console.MUTED))
+    return "\n".join(lines)
+
 
 
 def _offer_missing_grammars(
@@ -2661,9 +2941,15 @@ def _doctor_headline(value: dict[str, Any]) -> str:
     if value.get("healthy"):
         return "installation complete"
     faults: list[str] = []
-    missing = (value.get("code") or {}).get("grammars_missing") or []
+    code = value.get("code") or {}
+    missing = code.get("grammars_missing") or []
     if missing:
         faults.append(f"{len(missing)} language(s) cannot be parsed")
+    outdated = code.get("grammars_outdated") or []
+    if outdated:
+        faults.append(
+            f"{len(outdated)} grammar(s) older than the pinned version"
+        )
     probe = (value.get("enforcement") or {}).get("write_gate_probe") or {}
     state = probe.get("state")
     if state not in {"enforcing", "absent", None}:
@@ -2698,6 +2984,27 @@ def _render_doctor(value: dict[str, Any]) -> str:
         parts.append(console.style("  " + ", ".join(missing), console.WARN))
         if code.get("install"):
             parts += ["", console.style("  " + str(code["install"]), console.MUTED)]
+    outdated = code.get("grammars_outdated") or []
+    if outdated:
+        # Present but out of range: the wheel imports, so nothing above flags
+        # it, and the failure arrives later as a per-file parse error no one
+        # traces back to the version. Named here with the pin it violates.
+        parts += ["", console.rule("outdated grammars")]
+        parts.append(
+            console.table(
+                ["distribution", "installed", "requires"],
+                [
+                    [
+                        entry.get("distribution", "?"),
+                        str(entry.get("installed", "?")),
+                        str(entry.get("required", "?")),
+                    ]
+                    for entry in outdated
+                ],
+            )
+        )
+        if code.get("upgrade"):
+            parts += ["", console.style("  " + str(code["upgrade"]), console.MUTED)]
     enforcement = value.get("enforcement") or {}
     layers = enforcement.get("layers") or []
     if layers:
@@ -2787,6 +3094,22 @@ def _render_code_status(value: dict[str, Any]) -> str:
     """
 
     rendered = _render_auto(value)
+    if value.get("state") == "partial" and int(value.get("unexplained_files") or 0):
+        # Persisted by the build, surfaced here: files that should have been
+        # indexed and were not, for no stated reason. The verdict alone says
+        # "incomplete"; this says how much and what to do.
+        rendered = "\n".join(
+            [
+                rendered,
+                "",
+                console.style(
+                    f"  {console.CROSS} {value['unexplained_files']} file(s) have "
+                    "an installed grammar but contributed no nodes — rebuild "
+                    "with bk code build, and report it if it repeats.",
+                    console.WARN,
+                ),
+            ]
+        )
     if value.get("state") != "malformed":
         return rendered
     where = str(value.get("collection", "the graph"))
@@ -2821,6 +3144,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "capture": _render_capture,
     "status": _render_status,
     "doctor": _render_doctor,
+    "update": _render_update,
     "search": _render_search,
     "context": _render_context,
     "lint": _render_lint,

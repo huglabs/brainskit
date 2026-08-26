@@ -11,6 +11,37 @@ artifact was built from is the durable record of what shipped.
 
 ### Added
 
+- `bk update` — check PyPI for a newer brainskit and upgrade this installation
+  in place. The upgrade command is derived from how `bk` was installed
+  (`uv tool upgrade`, `pipx upgrade`, or an in-place pip upgrade), so it works
+  where the old advice (`pip install -U`) could not. `--check` reports only;
+  `--json` without `--yes` returns the plan instead of mutating; an
+  unreachable pypi.org degrades to `state: "unavailable"`, never a traceback.
+- `bk doctor` now also audits installed grammar *versions* against the pins
+  brainskit declares in its own package metadata, reporting outdated grammars
+  with the violated range and one upgrade command covering both missing and
+  outdated distributions.
+- A query beginning with `-` (`bk search -retrieval`) now parses: unknown
+  dash-leading tokens after `search`/`context`/`ask` are hoisted behind `--`
+  before argparse sees them.
+
+### Fixed
+
+- **Symlink shadowing under parallel extraction:** a file plus a symlink to
+  it raced through the process pool, and the symlink sometimes took the
+  credit — the real file contributed nothing while the graph pointed at an
+  alias. Paths are now collapsed to their canonical file before extraction,
+  deterministically. The AST cache namespace covers the adapter too, so
+  misattributed entries written before the fix cannot be served afterwards.
+- **A scoped rebuild no longer blesses edits it never extracted.**
+  `bk code build <scope>` re-hashed every recorded file from disk, so an edit
+  outside the scope was absorbed into freshness and `bk code status` answered
+  `fresh` over nodes describing code that no longer exists. Out-of-scope
+  digests are now carried from the stored graph until a full rebuild reads them.
+- **The unexplained-files gap is persisted** in the code-graph artefact and
+  reported by `bk code status` as `partial` with a count, instead of expiring
+  with the build output that mentioned it once.
+
 - `providers.<name>.reasoning` on the OpenAI-compatible driver, forwarded
   verbatim to the provider. Absent by default, so a model that reasons keeps
   doing so until an operator says otherwise. Measured on OpenRouter with
