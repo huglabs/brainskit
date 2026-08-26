@@ -91,6 +91,30 @@ class Environment:
             )
         return shlex.join(self.install_command(packages))
 
+    def upgrade_command(self) -> list[str] | None:
+        """Argv that upgrades brainskit itself in this environment, or None.
+
+        The tool managers have a first-class verb -- `uv tool upgrade` /
+        `pipx upgrade` -- which reinstalls the tool *and* its declared
+        dependencies, so it is preferred wherever it exists. A plain venv or
+        system install has no notion of "the tool"; there the distribution is
+        upgraded in place through whatever `install_command` already resolved.
+        `None` means this environment cannot be upgraded from inside itself
+        (a system interpreter with neither `uv` nor `pip`) and the caller must
+        say so rather than emit a command that cannot work -- the same rule
+        `install_hint` follows.
+        """
+
+        uv = shutil.which("uv")
+        if self.kind == "uv-tool":
+            return [uv, "tool", "upgrade", _PACKAGE] if uv else None
+        if self.kind == "pipx":
+            pipx = shutil.which("pipx")
+            return [pipx, "upgrade", _PACKAGE] if pipx else None
+        if not self.installable:
+            return None
+        return self.install_command(["--upgrade", _PACKAGE])
+
 
 def describe_environment() -> Environment:
     """Classify the interpreter running this process."""
