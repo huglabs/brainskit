@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import traceback
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any, NamedTuple
 
@@ -25,6 +26,7 @@ from brainskit.domain.model import (
 )
 from brainskit.domain.privacy import Consumer
 from brainskit.infrastructure import pyenv
+from brainskit.infrastructure.credentials import CredentialStore
 from brainskit.infrastructure.extractor import (
     GraphifyExtractor,
     _extension_grammars,
@@ -545,6 +547,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    credential = commands.add_parser(
+        "credential",
+        help=(
+            "Hold a provider API key for this machine, under the name "
+            "api_key_env points at; an exported variable still wins"
+        ),
+    )
+    credential_sub = credential.add_subparsers(
+        dest="credential_command", required=True
+    )
+    credential_set = credential_sub.add_parser(
+        "set", help="Store a key; asked for without echo when --value is omitted"
+    )
+    credential_set.add_argument(
+        "name", metavar="VARIABLE", help="e.g. OPENROUTER_API_KEY"
+    )
+    credential_set.add_argument(
+        "--value",
+        default="",
+        help=(
+            "The key. Prefer omitting it at a terminal: a value passed here "
+            "lands in the shell history"
+        ),
+    )
+    credential_sub.add_parser(
+        "list",
+        help=(
+            "Variable names held on this machine, and whether the environment "
+            "already shadows each. Never prints a value"
+        ),
+    )
+    credential_forget = credential_sub.add_parser(
+        "forget", help="Drop a stored key. The environment is never touched"
+    )
+    credential_forget.add_argument(
+        "name", metavar="VARIABLE", help="Variable name to stop holding a key for"
+    )
+
     web = commands.add_parser("web", help="Run the complete local web viewer")
     web.add_argument("--host", help="Interface to bind; non-loopback requires --token-env")
     web.add_argument("--port", type=int, help="Port to bind")
@@ -637,7 +677,7 @@ HELP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Filing & review", ("ingest", "proposals", "approve", "reject", "apply")),
     ("Automation", ("digest", "resurface", "views", "graph", "enrich", "schedule")),
     ("Governance", ("gate", "hooks")),
-    ("Integrations & registry", ("export", "integration", "vaults")),
+    ("Integrations & registry", ("export", "integration", "vaults", "credential")),
     ("Serve", ("serve", "web")),
 )
 
@@ -1390,6 +1430,10 @@ def _finish_init(
     # `.` this command defaults to. `--config` never runs the wizard and
     # keeps naming its path on the command line.
     target = outcome.vault or target
+    # Before the vault, so a credential store that cannot be written fails while
+    # nothing has been created yet rather than leaving a vault whose provider
+    # has no key and no message saying why.
+    stored = _store_credentials(outcome.credentials)
     vault = FileVault.initialize(target, outcome.policy, force=force)
     service = create_service(str(vault.root))
     indexed = service.reindex()
@@ -1404,6 +1448,9 @@ def _finish_init(
         # only path that never registered one, so `bk vaults list` silently
         # omitted every vault the wizard made.
         "registered": _register_new_vault(vault.root),
+        # Names only. This dict is printed, and `bk init --json` output ends up
+        # in issue reports.
+        "credentials": stored,
     }
     # Wiring the agent is deliberately the *last* step: it writes outside
     # the vault, into the operator's project, and doing it before the vault
@@ -1423,6 +1470,63 @@ def _finish_init(
             skip_code_build=skip_code_build,
         )
     return vault, service, result
+
+
+def _store_credentials(secrets: Mapping[str, str]) -> list[str]:
+    """Write provider keys to the machine's store; return the names, never values."""
+
+    if not secrets:
+        return []
+    store = CredentialStore()
+    for name, value in sorted(secrets.items()):
+        store.remember(name, value)
+    return sorted(secrets)
+
+
+def _credential(args: argparse.Namespace) -> Any:
+    """`bk credential` — the non-interactive half of what the wizard asks for.
+
+    Separate from `bk vaults` and from any vault at all: a provider key is a
+    property of the machine, and the same key serves every vault that names it
+    in `api_key_env`. Putting it under a vault would mean storing one copy per
+    vault, which is how copies go stale.
+    """
+
+    store = CredentialStore()
+    if args.credential_command == "list":
+        return {
+            "path": str(store.path),
+            # Names only, and the environment reported separately, so an
+            # operator can see *which* answer is winning without printing either.
+            "credentials": [
+                {"name": name, "shadowed_by_environment": bool(os.environ.get(name))}
+                for name in store.names()
+            ],
+        }
+    if args.credential_command == "forget":
+        return {"name": args.name, "forgotten": store.forget(args.name)}
+
+    value = args.value or ""
+    if not value:
+        if not prompt.supports_interactive():
+            raise ValidationError(
+                "A credential value is required",
+                details={
+                    "name": args.name,
+                    "hint": (
+                        "Pass --value, or run this at a terminal to be asked "
+                        "without echoing the key."
+                    ),
+                },
+            )
+        value = prompt.secret(f"Value for {args.name}")
+    path = store.remember(args.name, value)
+    return {
+        "name": args.name,
+        "path": str(path),
+        "stored": True,
+        "shadowed_by_environment": bool(os.environ.get(args.name)),
+    }
 
 
 def _service_for_web(args: argparse.Namespace) -> BrainskitService:
@@ -1478,6 +1582,12 @@ def _dispatch(args: argparse.Namespace) -> Any:
     # `bk vaults sync` builds a service per registered vault instead.
     if args.command == "vaults":
         return _vaults(args)
+
+    # A credential belongs to the machine, not to a vault, so this must work
+    # from a directory that is not one -- the same reason `vaults` sits above
+    # the service construction below.
+    if args.command == "credential":
+        return _credential(args)
 
     # An update belongs to the machine, not to a vault, so like `vaults` it
     # must run from a directory that is not one -- before vault discovery.

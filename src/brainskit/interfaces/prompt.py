@@ -27,6 +27,7 @@ Two rules hold throughout:
 
 from __future__ import annotations
 
+import getpass
 import os
 import select as _select
 import shlex
@@ -503,6 +504,49 @@ def text(
             return value
         if exhausted:
             raise Cancelled() from None
+        print(console.style(str(problem), console.WARN, stream=stream))
+
+
+def secret(
+    title: str,
+    *,
+    validate: object = None,
+    stream: IO[str] | None = None,
+) -> str:
+    """Ask for a value that must not be echoed, re-asking until `validate` accepts.
+
+    Three differences from `text`, each of them the reason this is not a flag on
+    it:
+
+    - **No echo and no default.** `getpass` reads from `/dev/tty` where it can,
+      so the key is not painted onto a terminal that someone else may be
+      watching and does not survive in the scrollback. There is no default to
+      offer, because a secret nobody typed is not one.
+    - **No `shell_value` normalisation.** That helper unquotes a single token,
+      which is right for a dragged-in path and wrong here: a key is bytes, and
+      one whose quoting was "corrected" fails authentication for a reason no
+      error message would name.
+    - **The answer is never echoed back.** Every other prompt collapses to
+      `✓ question  answer`; this one collapses to a fixed placeholder, so a
+      wizard transcript never contains the credential.
+
+    Off a terminal it falls through to `input`, which is what a here-doc driving
+    the wizard needs -- and `getpass` warns about the missing echo itself.
+    """
+
+    label = console.style(title, console.BOLD, stream=stream)
+    out = stream or sys.stdout
+    while True:
+        try:
+            value = getpass.getpass(f"{label}: ").strip()
+        except EOFError:
+            raise Cancelled() from None
+        except KeyboardInterrupt:
+            raise Cancelled() from None
+        problem = validate(value) if validate is not None else None  # type: ignore[operator]
+        if not problem:
+            out.write(_answered(title, "•" * 12, stream=stream) + "\n")
+            return value
         print(console.style(str(problem), console.WARN, stream=stream))
 
 

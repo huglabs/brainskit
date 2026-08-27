@@ -141,3 +141,51 @@ correctness bugs, two gaps found:
   reconcile heals registered paths, it never discovers new files; and
   `enrich list --json` requires an explicit `--consumer`, like every other
   machine read.
+
+## Building an MR out of a shared dirty tree — and the checkout that cost data (2026-08-25)
+
+- **The mistake, again, by my own hand:** `git checkout -- .` ran against the
+  *main* working tree instead of a scratch clone and reverted every
+  uncommitted change there — mine AND a concurrent session's. The learning
+  from 2026-08-08 said never to do this; what was missing was the guard rail:
+  before any destructive git command, print `pwd` and `git rev-parse
+  --show-toplevel` and check them against intent. Recovery this time was
+  partial and only because of luck + redundancy (below).
+- **What saved what:** a saved `git diff > patch` of one file (cli.py)
+  restored its exact pre-checkout state; copies made during a bisect into a
+  scratch dir preserved four other files' newer states; untracked files were
+  immune; and Claude Code's `~/.claude/file-history/` held older snapshots
+  (only up to Aug 16 — do not count on it for today's work). Lost for good:
+  uncommitted doc edits (README*, architecture, getting-started) and one
+  session's newest source state that its surviving tests now outrun.
+- **Worktree test trap #1:** a git worktree under `/var/folders/...` makes
+  `Path(__file__).resolve()` (`/private/var/...`) disagree with sibling paths
+  built without resolve — string-equality skips (a SHIM exclusion) silently
+  fail. Create worktrees at an already-real path.
+- **Worktree test trap #2:** running another checkout's suite with
+  `PYTHONPATH=<worktree>/src` still resolves SOME imports through the main
+  tree's editable install when a subprocess uses `-I` (which ignores
+  PYTHONPATH). The only faithful run is an editable install OF THE WORKTREE
+  in a throwaway venv (`uv venv + uv pip install -e '.[code]'`); beware
+  `@ file://` non-editable installs masquerading as `-e`.
+- **Two ruff versions in play:** the locked version (uv.lock, 0.12.x) selects
+  S310 by default and does not flag RUF100; a newer ad-hoc ruff inverts both.
+  Lint gates are whatever `uv.lock` pins — check there before adding or
+  removing a noqa.
+
+## Merging main into privacy: the conflict was trivial, the red test was not (2026-08-26)
+
+- **The two conflicts were both "keep both sides."** `_dispatch` in `cli.py`
+  gained two machine-level commands on separate branches (`credential` here,
+  `update` on main) that both sit above vault discovery; `docs/LEARNINGS.md`
+  was an add/add where only this branch appended a section. Nothing to choose.
+- **The failure that showed up after the merge predated it.** The privacy
+  branch changed `_assemble` to take a `ModelChoice` and added 80 test lines,
+  but left `PolicyAssemblyTest.assemble` on the old five-argument call — three
+  tests were already red on the branch tip. Before blaming a merge, diff the
+  failing files against the pre-merge tip: an empty diff means the merge is
+  innocent. The helper now builds a `ModelChoice`, and the "no model chosen"
+  case goes through `_default_ollama_choice`, where that guarantee lives now.
+- `cli.py` and parts of `test_onboarding.py` fail `ruff format --check` on
+  both parents; only `ruff check` is clean. Reformatting a 3000-line file in a
+  merge commit would bury the resolution, so it was left alone.

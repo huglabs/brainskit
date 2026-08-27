@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -21,8 +25,37 @@ from brainskit.domain.model import (
     VaultConfig,
 )
 from brainskit.domain.privacy import resolve_branch_policy, strictest_privacy
+from brainskit.infrastructure import credentials
+from brainskit.infrastructure.vaults import config_home
 
-SUPPORTED_PROVIDERS = {"anthropic", "openai", "openrouter", "ollama"}
+#: Providers reached by spawning a locally installed agent CLI rather than by
+#: calling an HTTP endpoint. They authenticate with the operator's own
+#: subscription, so no API key is configured for them and none is billed.
+#:
+#: They are still **remote** inference: `local-only` evidence is refused for
+#: them by the same check that refuses every non-Ollama provider. The desktop
+#: applications are not an option at all -- Claude Desktop and ChatGPT Desktop
+#: are MCP *clients* and expose no endpoint anything can call into.
+SUBSCRIPTION_CLI_PROVIDERS = {"claude-code", "codex"}
+
+SUPPORTED_PROVIDERS = {
+    "anthropic",
+    "openai",
+    "openrouter",
+    "ollama",
+    *SUBSCRIPTION_CLI_PROVIDERS,
+}
+
+#: Spawning an agent CLI costs a process start and a large fixed prompt prefix
+#: before any work begins -- measured at ~2s for a trivial completion -- and
+#: these are the slow, unattended jobs. The HTTP default of 120s would time out
+#: a digest that was progressing.
+DEFAULT_CLI_TIMEOUT = 600.0
+
+#: `job_models` requires a model, and "whichever one the CLI is already
+#: configured with" is a legitimate answer that no model id can express. This
+#: sentinel says it out loud instead of inventing an id that rots.
+CLI_DEFAULT_MODEL = "default"
 
 #: Attempts `_post_json` makes before giving up on a retryable failure. Named
 #: because the refusals quote it: "rate limited on all 3 attempts" is what
@@ -449,6 +482,505 @@ class OllamaDriver:
             ) from exc
 
 
+#: Auth preflight verdicts by resolved executable path: `""` for authenticated,
+#: otherwise the reason. Cached because `_create_driver` runs once per job and
+#: asking a CLI about its own login costs a process start each time.
+_CLI_AUTH: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class CliStatus:
+    """What a machine can say about an agent CLI without running a job."""
+
+    provider: str
+    executable: str
+    installed: bool
+    signed_in: bool
+    #: What the session is, in the CLI's own words -- "max plan", "ChatGPT".
+    detail: str = ""
+    error: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.installed and self.signed_in
+
+    @property
+    def note(self) -> str:
+        if not self.installed:
+            return self.error or "not installed"
+        if not self.signed_in:
+            return self.error or "installed, not signed in"
+        return self.detail or "signed in"
+
+
+class _AgentCliDriver:
+    """Drive a locally installed agent CLI signed in with the operator's plan.
+
+    The subscription an operator already pays for is reachable only through the
+    CLI that owns the session -- the desktop applications expose no endpoint, so
+    there is nothing to point a `base_url` at. That makes this the one driver
+    that spawns a process instead of making a request, and the differences that
+    follow are all consequences of that:
+
+    - **The prompt goes on stdin, never in argv.** An evidence bundle plus a
+      repair-feedback round is comfortably past `ARG_MAX` on macOS, and a limit
+      that is only reached by the *large* jobs is the worst kind to discover in
+      production. It also keeps the prompt out of `ps` output.
+    - **The operator's own configuration is excluded.** Left inherited, a job
+      picks up their MCP servers, hooks, plugins and project instructions --
+      unpredictable behaviour, and a token floor measured at ~11x the isolated
+      one. Isolation here is a correctness requirement, not a tidiness one.
+    - **API-key variables are stripped from the child environment.** A stray
+      `ANTHROPIC_API_KEY` silently bills the API account rather than using the
+      subscription that was chosen, and `*_BASE_URL` would redirect the CLI to
+      an entirely different backend without saying so.
+    - **This is not local inference.** The process is local; the model is not.
+      `PolicyJudgmentRouter` refuses `local-only` evidence for every provider
+      that is not Ollama, which covers these by construction -- and must
+      continue to, however local a desktop app feels.
+    """
+
+    #: Set by each subclass. `executable` is the command looked up on PATH.
+    provider: str = ""
+    executable: str = ""
+
+    def __init__(self, *, executable: str = "", timeout: float = DEFAULT_CLI_TIMEOUT):
+        self.executable = executable or type(self).executable
+        self.timeout = timeout
+        # Named for `ProviderContext`, which every driver fills in. There is no
+        # variable to name: the credential belongs to the CLI's own session.
+        self.api_key_env = ""
+        self.resolved = self._preflight()
+
+    def _preflight(self) -> str:
+        """Prove the CLI is installed and signed in before any job runs.
+
+        Deliberately at construction. `_create_driver` runs when a job is
+        routed, so a missing login surfaces as the first job refusing with a
+        `bk`-shaped message naming the login command -- rather than as a digest
+        that dies halfway through on a subprocess exit code.
+        """
+
+        resolved = shutil.which(self.executable)
+        if resolved is None:
+            raise NotConfiguredError(
+                "Agent CLI is not installed",
+                details={
+                    "provider": self.provider,
+                    "executable": self.executable,
+                    "hint": (
+                        f"{self.executable} is not on PATH. Install it, or route "
+                        f"this job to another provider in job_models."
+                    ),
+                },
+            )
+        if resolved not in _CLI_AUTH:
+            _CLI_AUTH[resolved] = self._auth_error(resolved)
+        problem = _CLI_AUTH[resolved]
+        if problem:
+            raise NotConfiguredError(
+                "Agent CLI is not signed in",
+                details={
+                    "provider": self.provider,
+                    "executable": resolved,
+                    "reason": problem,
+                    "hint": self.login_hint,
+                },
+            )
+        return resolved
+
+    @property
+    def login_hint(self) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    def _describe(cls, resolved: str) -> tuple[bool, str, str]:
+        """`(signed in, what the account is, why not)` — asked of the CLI itself."""
+
+        raise NotImplementedError
+
+    @classmethod
+    def status(cls, executable: str = "") -> CliStatus:
+        """Installed? signed in? as what? — for the wizard and `bk doctor`.
+
+        Shares `_describe` with the preflight above rather than parsing the same
+        output twice, so a screen can never report a CLI as ready that the
+        driver would then refuse.
+        """
+
+        wanted = executable or cls.executable
+        resolved = shutil.which(wanted)
+        if resolved is None:
+            return CliStatus(
+                provider=cls.provider,
+                executable=wanted,
+                installed=False,
+                signed_in=False,
+                error=f"{wanted} is not on PATH",
+            )
+        signed_in, detail, error = cls._describe(resolved)
+        return CliStatus(
+            provider=cls.provider,
+            executable=resolved,
+            installed=True,
+            signed_in=signed_in,
+            detail=detail,
+            error=error,
+        )
+
+    def _auth_error(self, resolved: str) -> str:
+        signed_in, _detail, error = type(self)._describe(resolved)
+        return "" if signed_in else (error or "the CLI reports no active session")
+
+    def constrains(self, schema: dict[str, Any]) -> bool:
+        """Whether this CLI can be made to *enforce* the shape, not just ask.
+
+        False by default, which is the honest answer for a CLI that takes no
+        schema at all.
+        """
+
+        return False
+
+    def _argv(self, *, model: str, scratch: Path, constrained: bool) -> list[str]:
+        raise NotImplementedError
+
+    def _stdin(self, prompt: str, asked_schema: dict[str, Any] | None) -> str:
+        """`asked_schema` is set only when the shape could not be enforced."""
+
+        if not asked_schema:
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            "Return only a JSON object matching this schema. No prose, no "
+            "explanation, no code fence.\n"
+            f"{json.dumps(asked_schema)}"
+        )
+
+    def _result(self, stdout: str, scratch: Path) -> str:
+        raise NotImplementedError
+
+    def _environment(self, scratch: Path) -> dict[str, str]:
+        return {k: v for k, v in os.environ.items() if k not in self.stripped_vars}
+
+    #: Variables removed from the child environment; see the class docstring.
+    stripped_vars: frozenset[str] = frozenset()
+
+    def complete(
+        self, prompt: str, *, model: str, output_schema: dict[str, Any] | None
+    ) -> str:
+        projected = _structured_schema(output_schema) if output_schema else None
+        # Enforced where the CLI can enforce it, asked for where it cannot --
+        # never both, and never silently dropped. The ingest schema is the live
+        # case: it holds a deliberately open `metadata` object, which strict
+        # decoding cannot express, so it is asked for even on the CLI that
+        # otherwise constrains.
+        constrained = projected is not None and self.constrains(projected)
+        with tempfile.TemporaryDirectory(prefix="brainskit-cli-") as name:
+            scratch = Path(name)
+            if constrained and projected is not None:
+                (scratch / "schema.json").write_text(
+                    json.dumps(projected), encoding="utf-8"
+                )
+            argv = [
+                self.resolved,
+                *self._argv(model=model, scratch=scratch, constrained=constrained),
+            ]
+            try:
+                completed = subprocess.run(  # noqa: S603 -- argv is built here, resolved from PATH
+                    argv,
+                    input=self._stdin(prompt, None if constrained else projected),
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    cwd=scratch,
+                    env=self._environment(scratch),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise NotConfiguredError(
+                    "Agent CLI did not finish in time",
+                    details={
+                        "provider": self.provider,
+                        "model": model,
+                        "timeout_seconds": self.timeout,
+                        "hint": (
+                            "Raise providers."
+                            f"{self.provider}.timeout_seconds, or route this job "
+                            "to a provider that answers over HTTP."
+                        ),
+                    },
+                ) from exc
+            if completed.returncode != 0:
+                raise NotConfiguredError(
+                    "Agent CLI exited with an error",
+                    details={
+                        "provider": self.provider,
+                        "model": model,
+                        "exit_code": completed.returncode,
+                        # Tail, not head: a CLI prints progress first and the
+                        # cause last, so the front of the stream is the part
+                        # worth dropping.
+                        "stderr": (completed.stderr or completed.stdout)[-2_000:],
+                    },
+                )
+            text = self._result(completed.stdout, scratch)
+        if not text.strip():
+            raise ModelResponseError(
+                "Agent CLI returned an empty completion",
+                details={
+                    "provider": self.provider,
+                    "model": model,
+                    "remedy": (
+                        "The CLI succeeded but wrote no answer. Retry, or route "
+                        "this job to a provider with constrained decoding."
+                    ),
+                },
+            )
+        return text
+
+
+class ClaudeCodeDriver(_AgentCliDriver):
+    """`claude -p`, authenticated by a Claude subscription.
+
+    No constrained decoding: the CLI takes no schema, so the projected schema is
+    appended to the prompt and the answer is *asked* for rather than enforced.
+    The repair loop above already handles a response that misses the shape, so
+    the cost is retries rather than correctness -- but it is a real difference
+    from every HTTP driver here, and the reason `codex`, which does take a
+    schema file, is the better choice for schema-heavy jobs.
+    """
+
+    provider = "claude-code"
+    executable = "claude"
+    stripped_vars = frozenset(
+        {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+    )
+
+    @property
+    def login_hint(self) -> str:
+        return "Run `claude` and sign in, then re-run this job."
+
+    @classmethod
+    def _describe(cls, resolved: str) -> tuple[bool, str, str]:
+        completed = _run_cli(resolved, ["auth", "status"])
+        if completed is None:
+            return False, "", "the CLI did not answer"
+        try:
+            # Parsed whole, never line by line: unlike the streaming output
+            # this is one pretty-printed document.
+            status = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            return False, "", (completed.stderr or completed.stdout).strip()[:200]
+        if not status.get("loggedIn"):
+            return False, "", "the CLI reports no active session"
+        method = str(status.get("authMethod") or "")
+        plan = str(status.get("subscriptionType") or "")
+        if method != "claude.ai":
+            # Worth saying rather than passing silently: an API-key session
+            # bills per token, which is the thing choosing this provider was
+            # meant to avoid, and the `anthropic` provider serves it better.
+            return True, f"{method or 'unknown auth'} — billed per token", ""
+        return True, f"{plan or 'subscription'} plan", ""
+
+    def _argv(self, *, model: str, scratch: Path, constrained: bool) -> list[str]:
+        argv = [
+            "-p",
+            "--output-format",
+            "json",
+            # The isolation pair. `--setting-sources ""` drops user, project and
+            # local settings -- which is also what drops hooks and CLAUDE.md --
+            # and `--strict-mcp-config` drops every configured MCP server.
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+        ]
+        if model and model != CLI_DEFAULT_MODEL:
+            argv += ["--model", model]
+        return argv
+
+    def _result(self, stdout: str, scratch: Path) -> str:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise ModelResponseError(
+                "Agent CLI returned output that is not the documented envelope",
+                details={"provider": self.provider, "stdout": stdout[-2_000:]},
+            ) from exc
+        if payload.get("is_error"):
+            raise ModelResponseError(
+                "Agent CLI reported an error result",
+                details={
+                    "provider": self.provider,
+                    "subtype": payload.get("subtype"),
+                    "result": str(payload.get("result", ""))[-2_000:],
+                },
+            )
+        return _unfence(str(payload.get("result") or ""))
+
+
+class CodexDriver(_AgentCliDriver):
+    """`codex exec`, authenticated by a ChatGPT subscription.
+
+    Unlike Claude Code this CLI takes `--output-schema`, so structured jobs keep
+    real constrained decoding, and `--output-last-message` yields the final
+    answer without parsing an event stream.
+
+    Isolation needs a whole `CODEX_HOME` rather than a flag, and the credential
+    lives inside it -- so the isolated home holds a *symlink* to the real
+    `auth.json` and nothing else the operator wrote. Verified: the CLI reads
+    through the link and leaves it a link, so a token refresh still lands in the
+    operator's own file. It is kept out of any directory a job can write to.
+    """
+
+    provider = "codex"
+    executable = "codex"
+    stripped_vars = frozenset({"OPENAI_API_KEY", "OPENAI_BASE_URL"})
+
+    @property
+    def login_hint(self) -> str:
+        return "Run `codex login` and sign in with ChatGPT, then re-run this job."
+
+    @classmethod
+    def _describe(cls, resolved: str) -> tuple[bool, str, str]:
+        completed = _run_cli(resolved, ["login", "status"])
+        if completed is None:
+            return False, "", "the CLI did not answer"
+        # `codex login status` writes its verdict to **stderr** and leaves
+        # stdout empty -- verified live. Reading stdout first looks correct and
+        # yields nothing at all.
+        said = (completed.stderr or completed.stdout).strip()
+        if completed.returncode != 0:
+            return False, "", said[:200] or "the CLI reports no active session"
+        first = said.splitlines()[0] if said else ""
+        return True, first[:80] or "signed in", ""
+
+    def constrains(self, schema: dict[str, Any]) -> bool:
+        """Only when the schema survives strict decoding.
+
+        `--output-schema` has no lenient mode -- unlike the HTTP drivers, which
+        send a non-strict schema as guidance. Handing it one it cannot compile
+        fails the whole run with a 400 (`schema must have a 'type' key`,
+        observed on the ingest schema), so an inexpressible schema is asked for
+        in the prompt instead of enforced.
+        """
+
+        return _strictly_expressible(schema)
+
+    def _argv(self, *, model: str, scratch: Path, constrained: bool) -> list[str]:
+        argv = [
+            "exec",
+            "-",  # the prompt is on stdin
+            "--output-last-message",
+            str(scratch / "answer.txt"),
+            # A judgment job reasons over evidence it was handed; it has no
+            # business running commands, so the sandbox is read-only and the
+            # working directory is a throwaway.
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color",
+            "never",
+        ]
+        if constrained:
+            argv += ["--output-schema", str(scratch / "schema.json")]
+        if model and model != CLI_DEFAULT_MODEL:
+            argv += ["--model", model]
+        return argv
+
+    def _environment(self, scratch: Path) -> dict[str, str]:
+        return {**super()._environment(scratch), "CODEX_HOME": str(_codex_home())}
+
+    def _result(self, stdout: str, scratch: Path) -> str:
+        answer = scratch / "answer.txt"
+        if answer.is_file():
+            return _unfence(answer.read_text(encoding="utf-8"))
+        # The flag is always passed, so a missing file means the run ended
+        # without a final message. Falling back to stdout would return the
+        # event log as if it were the answer.
+        return ""
+
+
+def _run_cli(
+    resolved: str, argv: Sequence[str], timeout: float = 30
+) -> subprocess.CompletedProcess[str] | None:
+    """A short side command, returning `None` rather than raising.
+
+    Asking a CLI about its own login must never be able to fail onboarding:
+    the answer is a fact to put on a screen, exactly as an unreachable ollama is.
+    """
+
+    try:
+        return subprocess.run(  # noqa: S603 -- resolved from PATH by the caller
+            [resolved, *argv],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            # Not inherited. `bk init` asks this question *at a terminal* with
+            # the operator's next answers already queued on it, and a child
+            # that reads stdin either eats them or blocks forever waiting for
+            # input nobody knows it wants. Observed as the wizard hanging.
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def cli_status(provider: str, executable: str = "") -> CliStatus:
+    """Whether an agent CLI could run a job right now, without running one."""
+
+    if provider not in SUBSCRIPTION_CLI_PROVIDERS:
+        raise ValidationError(
+            "Not an agent CLI provider",
+            details={"provider": provider, "choices": sorted(SUBSCRIPTION_CLI_PROVIDERS)},
+        )
+    driver = ClaudeCodeDriver if provider == "claude-code" else CodexDriver
+    return driver.status(executable)
+
+
+def _codex_home() -> Path:
+    """An isolated `CODEX_HOME` that borrows only the operator's credential.
+
+    Under brainskit's own config directory rather than a temporary or working
+    one: the credential is reachable from here, so it must not sit anywhere a
+    job's own sandbox can read or write. Rebuilt on demand, never removed --
+    the CLI keeps caches here that are worth reusing between jobs.
+    """
+
+    home = config_home() / "brainskit" / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    os.chmod(home, 0o700)
+    link = home / "auth.json"
+    real = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+    if not link.is_symlink() and real.exists():
+        link.unlink(missing_ok=True)
+        link.symlink_to(real)
+    settings = home / "config.toml"
+    if not settings.exists():
+        # Empty on purpose. This file existing is what stops the CLI looking
+        # anywhere else for one.
+        settings.write_text("", encoding="utf-8")
+    return home
+
+
+def _unfence(text: str) -> str:
+    """Strip a ```json fence, which a CLI without constrained decoding may add.
+
+    Done in the driver rather than in the shared parser: every HTTP provider
+    returns bare JSON because the schema was enforced on the wire, and loosening
+    the parser for all of them would hide a real failure from the ones that
+    promise strictness.
+    """
+
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+    body = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+    closing = body.rfind("```")
+    return (body[:closing] if closing != -1 else body).strip()
+
+
 def _structured_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Project a vault schema onto the subset constrained decoding accepts.
 
@@ -480,6 +1012,14 @@ def _structured_schema(schema: dict[str, Any]) -> dict[str, Any]:
             projected[keyword] = [_structured_schema(entry) for entry in value]
         else:
             projected[keyword] = value
+    if "const" in projected and "type" not in projected:
+        # Strict validators require a `type` beside a `const` -- OpenAI answers
+        # a bare one with `schema must have a 'type' key` and rejects the whole
+        # request. Derived from the constant rather than guessed, so it can only
+        # restate what the constant already says.
+        inferred = _JSON_TYPES.get(type(projected["const"]))
+        if inferred:
+            projected["type"] = inferred
     properties = projected.get("properties")
     if isinstance(properties, dict):
         optional = sorted(set(properties) - set(schema.get("required", [])))
@@ -488,6 +1028,16 @@ def _structured_schema(schema: dict[str, Any]) -> dict[str, Any]:
         projected["required"] = sorted(properties)
         projected["additionalProperties"] = False
     return projected
+
+
+#: `bool` before `int`, because `bool` is a subclass of it and a dict lookup on
+#: `type(value)` would otherwise be fine but the ordering is worth stating.
+_JSON_TYPES: dict[type, str] = {
+    bool: "boolean",
+    int: "integer",
+    float: "number",
+    str: "string",
+}
 
 
 def _strictly_expressible(schema: Any) -> bool:
@@ -594,6 +1144,12 @@ def _reasoning_option(config: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _create_driver(name: str, config: dict[str, Any]) -> ProviderDriver:
+    if name in SUBSCRIPTION_CLI_PROVIDERS:
+        driver = ClaudeCodeDriver if name == "claude-code" else CodexDriver
+        return driver(
+            executable=str(config.get("executable", "")),
+            timeout=float(config.get("timeout_seconds", DEFAULT_CLI_TIMEOUT)),
+        )
     timeout = float(config.get("timeout_seconds", 120))
     if name == "ollama":
         base_url = _required(config, "base_url", provider=name)
@@ -603,11 +1159,22 @@ def _create_driver(name: str, config: dict[str, Any]) -> ProviderDriver:
             options=_ollama_options(config),
         )
     api_key_env = _required(config, "api_key_env", provider=name)
-    api_key = os.environ.get(api_key_env)
+    # The environment first, then whatever `bk init` was told. A stored
+    # credential that could override an exported variable would let a key typed
+    # once on a laptop silently redirect a scripted deployment to another
+    # account, and both paths would still produce working requests.
+    api_key = os.environ.get(api_key_env) or credentials.lookup(api_key_env)
     if not api_key:
         raise NotConfiguredError(
             "Provider API key environment variable is not set",
-            details={"provider": name, "api_key_env": api_key_env},
+            details={
+                "provider": name,
+                "api_key_env": api_key_env,
+                "hint": (
+                    f"Export {api_key_env}, or store it for this machine with "
+                    f"`bk credential set {api_key_env}`."
+                ),
+            },
         )
     if name == "anthropic":
         return AnthropicDriver(

@@ -186,18 +186,30 @@ class VaultRegistry:
             raise
 
 
-def default_registry_path(environment: Mapping[str, str] | None = None) -> Path:
-    """`$XDG_CONFIG_HOME/brainskit/vaults.json`, falling back to `~/.config`.
+def config_home(environment: Mapping[str, str] | None = None) -> Path:
+    """`$XDG_CONFIG_HOME`, falling back to `~/.config`.
 
     The XDG basedir specification requires an absolute path and says to ignore
     anything else, so a relative value falls back rather than resolving against
     whatever directory the command happened to be run from.
+
+    Owned here because this is the module that already had to answer it, and
+    `credentials.py` needs the same answer: two copies of this rule would
+    diverge the first time one of them learned about a new variable.
     """
+
     values = os.environ if environment is None else environment
     configured = str(values.get("XDG_CONFIG_HOME", "")).strip()
     base = Path(configured)
     if not configured or not base.is_absolute():
         base = Path.home() / ".config"
+    return base
+
+
+def default_registry_path(environment: Mapping[str, str] | None = None) -> Path:
+    """`$XDG_CONFIG_HOME/brainskit/vaults.json`, falling back to `~/.config`."""
+
+    base = config_home(environment)
     current = base / "brainskit" / "vaults.json"
     # The product was called brainkit until 0.5. A machine that registered its
     # vaults under the old name still has them there and nowhere else, so the
