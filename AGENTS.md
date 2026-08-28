@@ -1192,3 +1192,18 @@ Two process lessons from the repair round itself:
 - Cross-process tests are the receipt for a lock abstraction. Prove both sides:
   shared readers coexist, while an exclusive holder blocks a reader and a
   shared holder blocks a writer until release.
+
+## A memory bridge is also an authority bridge (2026-08-19)
+
+- A generic MCP client correctly exposes every server tool; that does not make
+  every tool an appropriate default for an autonomous agent. The DSH bundle
+  therefore leaves append-only `capture` and consumer-scoped reads available,
+  but places a monotonic guard over wiki application, filing decisions and
+  integration lifecycle changes until the operator explicitly opts in.
+- Keep the vault owner and the bridge separate. DSH starts `bk serve --mcp`
+  over stdio and owns only that child process; Brainskit still owns vault
+  initialization, provider configuration, privacy and every durable write.
+- Do not install Python from an npm lifecycle script. The bundle detects
+  failures through the MCP client's normal startup diagnostics and documents
+  the pinned `uv tool install` prerequisite, so installing a DSH profile never
+  executes an unrelated package manager with the user's permissions.

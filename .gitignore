@@ -29,6 +29,9 @@ dist/
 .venv/
 env/
 
+# JavaScript dependencies used by the optional DSH bundle.
+node_modules/
+
 # Vault working directories produced by running bk from the repo root.
 # A vault's own disposables (.brain/index.db and its -shm/-wal siblings) are
 # covered by the .gitignore that `bk init` writes into the vault itself.

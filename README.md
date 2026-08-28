@@ -226,6 +226,7 @@ a file runs.
 | [Enrichment](./docs/enrichment.md) | Model-proposed edges, and the rules that make one admissible |
 | [Persistent integrations](./docs/integrations.md) | Obsidian, Neo4j, PostgreSQL, many vaults into one store |
 | [Serving a vault](./docs/serving.md) | The local web viewer, and MCP over stdio or HTTP |
+| [DeepSeek Harness plugin](./plugins/dsh-brainskit/README.md) | Connect a local vault to DSH through its official MCP client |
 | [Coding agents](./docs/agents.md) | `bk hooks install`, and proving the write gate actually guards |
 | [Architecture](./docs/architecture.md) | Layering, application modules, judgment routing |
 | [Benchmarks](./docs/benchmarks.md) | Code-graph coverage and LOCOMO retrieval |
