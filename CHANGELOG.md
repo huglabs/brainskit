@@ -54,6 +54,12 @@ artifact was built from is the durable record of what shipped.
 
 ### Fixed
 
+- `bk` now imports and locks vault state on Windows. The vault keeps the same
+  blocking shared/exclusive lock contract and ordering: POSIX uses `flock`,
+  while Windows locks a stable one-byte region through `LockFileEx`.
+  Previously the module-level `fcntl` import made every Windows command fail
+  before argument parsing.
+
 - An empty completion from an OpenAI-compatible provider is refused instead of
   returned as an answer. A reasoning model that spends its whole budget
   thinking returns a well-formed response whose `content` is empty;
