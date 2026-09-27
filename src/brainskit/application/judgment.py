@@ -16,7 +16,12 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from brainskit.application.ports import JobSpecPort, JudgmentPort
+from brainskit.application.ports import (
+    JobSpecPort,
+    JudgmentPort,
+    JudgmentRoute,
+    JudgmentRoutePort,
+)
 from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     ModelResponseError,
@@ -107,6 +112,19 @@ class JudgmentRunner:
                 "failures": last_failures,
             },
         )
+
+    def route_for(self, *, job: str, branches: list[str]) -> JudgmentRoute | None:
+        """Where the configured provider would route `job`, if it can say.
+
+        None for a port that only runs (a substitute), which a caller treats
+        as the strictest route. Refusals propagate: they are the ones `run`
+        would raise for the same arguments.
+        """
+
+        judgment = self.require()
+        if not isinstance(judgment, JudgmentRoutePort):
+            return None
+        return judgment.route_for(job=job, branches=branches)
 
     def require(self) -> JudgmentPort:
         """The configured provider, or a clear error naming what is missing."""

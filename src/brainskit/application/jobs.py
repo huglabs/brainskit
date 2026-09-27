@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 from brainskit.application.filing import Filing
@@ -21,18 +22,16 @@ from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.ports import VaultPort
-from brainskit.application.privacy import for_consumer
+from brainskit.application.privacy import PrivacyBoundary, for_consumer
 from brainskit.application.retrieval import Retrieval
 from brainskit.domain.model import (
+    BrainskitError,
     PolicyError,
-    PrivacyMode,
-    VaultConfig,
     utc_now,
 )
 from brainskit.domain.privacy import (
     context_branches,
     record_branch,
-    resolve_branch_policy,
 )
 
 #: Conversation bounds for `Jobs.ask`. History is model context only -- it
@@ -80,42 +79,139 @@ def _bounded_history(
     return items
 
 
-def _resolved_query_route(
-    config: VaultConfig, branches: list[str]
-) -> tuple[str | None, str | None]:
-    """The provider/model the judgment router selects for job="query".
+_CITED_SOURCE_RE = re.compile(r"source:([0-9a-f]{64})")
 
-    Mirrors the selection in `PolicyJudgmentRouter.run` (infrastructure/llm.py),
-    which stays authoritative: this runs only after that call succeeded, so
-    every state the router refuses -- an unknown branch, a never-ingest policy,
-    a missing or malformed mapping -- has already raised there. A miss here
-    therefore means the judgment port is a substitute (tests), and the honest
-    answer is None, not a guess.
+
+def _hashes_allowed(boundary: PrivacyBoundary, hashes: list[Any]) -> bool:
+    """Whether every hash names a source the boundary lets through.
+
+    A hash the registry no longer resolves is unknown provenance, and unknown
+    provenance is withheld -- the same answer `_evidence_privacy` gives.
     """
 
-    mapping = config.job_models.get("query")
-    if not isinstance(mapping, dict):
-        return None, None
-    try:
-        policies = [
-            resolve_branch_policy(config, branch) for branch in (branches or ["_inbox"])
+    for content_hash in hashes:
+        record = boundary.records.get(str(content_hash))
+        if record is None or not boundary.allows_record(record):
+            return False
+    return True
+
+
+def _branch_allowed(boundary: PrivacyBoundary, branch: str) -> bool:
+    return boundary.allows_path(PurePosixPath("raw", branch))
+
+
+def _status_within(
+    boundary: PrivacyBoundary, status: dict[str, Any]
+) -> dict[str, Any]:
+    """`bk status` output without what the boundary withholds.
+
+    Totals stay: a count is what a redacted source is allowed to contribute.
+    A branch name is not, and neither is an installation fact (ADR 0009) --
+    the vault root, a hook script's path, a hint or detail that names one.
+    """
+
+    by_branch = status.get("by_branch") or {}
+    reduced = {
+        **status,
+        "by_branch": {
+            branch: count
+            for branch, count in by_branch.items()
+            if _branch_allowed(boundary, branch)
+        },
+    }
+    return dict(_without_installation_facts(boundary, reduced))
+
+
+# An absolute path anywhere in a string: POSIX (at least two segments, so a
+# lone `/` in prose does not count), home-relative, or a Windows drive.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"(=:])(?:/[^\s/'\"]+/|~/|[A-Za-z]:[\\/])"
+)
+
+
+def _without_installation_facts(boundary: PrivacyBoundary, value: Any) -> Any:
+    """`value` with every path-bearing string put to `installation_facts`.
+
+    Walked rather than listed key by key, because the status payload grows:
+    a key added later that carries a path is withheld without anyone having
+    to remember this function exists.
+    """
+
+    if isinstance(value, dict):
+        kept: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, str) and _ABSOLUTE_PATH_RE.search(item):
+                kept.update(boundary.installation_facts(**{str(key): item}))
+            else:
+                kept[key] = _without_installation_facts(boundary, item)
+        return kept
+    if isinstance(value, list):
+        return [
+            _without_installation_facts(boundary, item)
+            for item in value
+            if not (isinstance(item, str) and _ABSOLUTE_PATH_RE.search(item))
+            or boundary.installation_facts(item=item)
         ]
-    except PolicyError:
-        return None, None
-    effective = (
-        PrivacyMode.LOCAL_ONLY
-        if any(policy.privacy == PrivacyMode.LOCAL_ONLY for policy in policies)
-        else PrivacyMode.CLOUD
-    )
-    route = mapping.get(effective.value, mapping)
-    if not isinstance(route, dict):
-        return None, None
-    provider = route.get("provider")
-    model = route.get("model")
-    return (
-        provider if isinstance(provider, str) else None,
-        model if isinstance(model, str) else None,
-    )
+    return value
+
+
+def _freshness_within(
+    boundary: PrivacyBoundary, state: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    """The freshness state minus every page the boundary withholds.
+
+    An entry goes when its page's provenance is withheld or unresolvable, when
+    it records a source hash that is, or when its review reason names one (a
+    capture marks related pages with the capture's own hash, and that capture
+    may since have been filed into a never-ingest branch). A page that can no
+    longer be read cannot be judged, so it goes too.
+    """
+
+    pages = state.get("pages")
+    if not isinstance(pages, dict):
+        return dict(state), 0
+    kept: dict[str, Any] = {}
+    for path, entry in pages.items():
+        details = entry if isinstance(entry, dict) else {}
+        hashes = list(details.get("source_hashes") or [])
+        hashes += _CITED_SOURCE_RE.findall(str(details.get("review_reason") or ""))
+        try:
+            allowed = boundary.allows_path(
+                PurePosixPath(str(path))
+            ) and _hashes_allowed(boundary, hashes)
+        except (BrainskitError, OSError):
+            allowed = False
+        if allowed:
+            kept[path] = entry
+    return {**state, "pages": kept}, len(pages) - len(kept)
+
+
+def _proposals_within(
+    boundary: PrivacyBoundary, payload: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    """Filing proposals whose source, destination and cited hashes may pass.
+
+    A proposal carries its apply payload -- page bodies compiled from the
+    source -- so one for a source since filed into a never-ingest branch is
+    that source's content by another route.
+    """
+
+    proposals = payload.get("proposals") or []
+    kept = []
+    for proposal in proposals:
+        apply_payload = proposal.get("apply_proposal") or {}
+        hashes = [proposal.get("source_hash")]
+        for operation in apply_payload.get("operations") or []:
+            hashes += list(operation.get("source_hashes") or [])
+        try:
+            allowed = _branch_allowed(
+                boundary, str(proposal.get("destination_branch", ""))
+            ) and _hashes_allowed(boundary, hashes)
+        except BrainskitError:
+            allowed = False
+        if allowed:
+            kept.append(proposal)
+    return {"count": len(kept), "proposals": kept}, len(proposals) - len(kept)
 
 
 class Jobs:
@@ -137,6 +233,37 @@ class Jobs:
         self.filing = filing
         self.ledger = ledger
 
+    def _judgment_context(
+        self, query: str, **kwargs: Any
+    ) -> tuple[dict[str, Any], int]:
+        """Evidence a model may read for `query`, and how much was withheld.
+
+        Read under the `local` boundary because it excludes exactly
+        `never-ingest` -- the set the judgment router refuses outright. Read
+        as `human`, one such match anywhere in BM25 recall made the router
+        refuse the whole question; narrowing here leaves that refusal as the
+        last line of defence rather than the first. The withheld side is a
+        count only: its path would name the document and its branch.
+        """
+
+        context = self.retrieval.context(
+            query, consumer="local", include_apply_contract=False, **kwargs
+        )
+        withheld = int(context["redacted"])
+        if withheld and not context["evidence"]:
+            raise PolicyError(
+                "Every source matching this request is withheld from models "
+                "by its branch privacy policy",
+                details={
+                    "withheld_sources": withheld,
+                    "hint": (
+                        "Rephrase toward material a model may read, or read the "
+                        "withheld evidence yourself with bk search -- it is "
+                        "withheld from models, not from you"
+                    ),
+                },
+            )
+        return context, withheld
 
     def ask(
         self,
@@ -153,7 +280,7 @@ class Jobs:
         # would pollute BM25 term matching with every word already discussed,
         # burying the terms this question is actually about. History is model
         # context for *interpreting* the question, and rides only the prompt.
-        context = self.retrieval.context(question, include_apply_contract=False)
+        context, withheld = self._judgment_context(question)
         branches = context_branches(context)
         response = self.judgment_runner.run(
             job="query",
@@ -165,7 +292,11 @@ class Jobs:
             },
         )
         answer = str(response["answer"])
-        provider, model = _resolved_query_route(self.vault.config(), branches)
+        # Asked after `run` succeeded, so it names the route that answered;
+        # None only for a substitute port that cannot say.
+        route = self.judgment_runner.route_for(job="query", branches=branches)
+        provider = route.provider if route else None
+        model = route.model if route else None
         path: str | None = None
         if save:
             slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60]
@@ -182,6 +313,7 @@ class Jobs:
             "saved_to": path,
             "provider": provider,
             "model": model,
+            "withheld_sources": withheld,
         }
 
     def digest(self, since: str = "7d") -> dict[str, Any]:
@@ -191,27 +323,47 @@ class Jobs:
             key=lambda item: item.captured_at,
             reverse=True,
         )[:50]
-        # `local` is the boundary that excludes exactly never-ingest evidence.
-        boundary = for_consumer("local", self.vault)
-        allowed_recent = [record for record in recent if boundary.allows_record(record)]
-        digest_branches = sorted({record_branch(record) for record in allowed_recent})
+        # `local` is the boundary that excludes exactly never-ingest evidence,
+        # and the sources it keeps decide the route, as they always have.
+        local = for_consumer("local", self.vault)
+        routed = [record for record in recent if local.allows_record(record)]
+        digest_branches = sorted({record_branch(record) for record in routed})
         if not digest_branches:
             digest_branches = ["_inbox"]
+        # The metadata is then held to the boundary of the model it will
+        # actually reach, as the router itself reports it: a branch name, a
+        # page path, a source hash and an absolute path are each disclosure in
+        # their own right. A port that cannot say is assumed to be cloud.
+        route = self.judgment_runner.route_for(job="digest", branches=digest_branches)
+        boundary = (
+            local if route is not None and route.local
+            else for_consumer("cloud", self.vault)
+        )
+        allowed_recent = [
+            record for record in routed if boundary.allows_record(record)
+        ]
+        freshness, withheld_pages = _freshness_within(
+            boundary, self.ledger.snapshot().state
+        )
+        proposals, withheld_proposals = _proposals_within(
+            boundary, self.filing.proposals()
+        )
+        withheld = (
+            len(recent) - len(allowed_recent) + withheld_pages + withheld_proposals
+        )
         digest_payload = self.judgment_runner.run(
             job="digest",
             branches=digest_branches,
             variables={
                 "since": since,
-                "status": json.dumps(status, ensure_ascii=False),
+                "status": json.dumps(
+                    _status_within(boundary, status), ensure_ascii=False
+                ),
                 "sources": json.dumps(
                     [item.to_dict() for item in allowed_recent], ensure_ascii=False
                 ),
-                "proposals": json.dumps(
-                    self.filing.proposals(), ensure_ascii=False
-                ),
-                "freshness": json.dumps(
-                    self.ledger.snapshot().state, ensure_ascii=False
-                ),
+                "proposals": json.dumps(proposals, ensure_ascii=False),
+                "freshness": json.dumps(freshness, ensure_ascii=False),
             },
         )
         digest = str(digest_payload["markdown"])
@@ -222,12 +374,14 @@ class Jobs:
             "actions": digest_payload["actions"],
             "resurfaced": digest_payload["resurfaced"],
             "path": path,
+            "withheld_sources": withheld,
         }
 
     def resurface(self) -> dict[str, Any]:
-        # `resurface` only ever reads (see `ask`, above, for why this stays off).
-        context = self.retrieval.context(
-            "durable insight worth revisiting", limit=20, include_apply_contract=False
+        # `resurface` only ever reads (see `ask`, above, for why the apply
+        # contract stays off).
+        context, withheld = self._judgment_context(
+            "durable insight worth revisiting", limit=20
         )
         result = self.judgment_runner.run(
             job="resurface",
@@ -239,4 +393,4 @@ class Jobs:
         # An annotation, not a freshness verdict -- see `record_resurfaced`,
         # which also refuses to invent an entry for a page that is not there.
         self.ledger.record_resurfaced(str(result["page"]))
-        return {**result, "path": path}
+        return {**result, "path": path, "withheld_sources": withheld}

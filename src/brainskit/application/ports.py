@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from brainskit.domain.model import ScanSurvey, SearchHit, SourceRecord, VaultConfig
 
@@ -54,7 +54,9 @@ class VaultPort(Protocol):
 
     def save_registry(self, records: dict[str, SourceRecord]) -> None: ...
 
-    def capture_file(self, source: Path) -> tuple[SourceRecord, bool]: ...
+    def capture_file(
+        self, source: Path, *, revive: bool = True
+    ) -> tuple[SourceRecord, bool]: ...
 
     def capture_text(
         self, text: str, title: str, suffix: str = ".md"
@@ -145,6 +147,31 @@ class JudgmentPort(Protocol):
         variables: dict[str, Any],
         output_schema: dict[str, Any] | None = None,
     ) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class JudgmentRoute:
+    """Where a judgment job over some branches would be sent.
+
+    `local` means the provider keeps the prompt on this machine -- the
+    router's answer, not the caller's, so a job deciding what may enter its
+    prompt asks the same owner that decides where the prompt goes.
+    """
+
+    provider: str
+    model: str
+    local: bool
+
+
+@runtime_checkable
+class JudgmentRoutePort(Protocol):
+    """A judgment port that can say where `run` would route, without running.
+
+    Separate from `JudgmentPort` so a substitute that only runs stays a valid
+    port; a caller that finds no route treats it as the strictest one.
+    """
+
+    def route_for(self, *, job: str, branches: Sequence[str]) -> JudgmentRoute: ...
 
 
 class JobSpecPort(Protocol):

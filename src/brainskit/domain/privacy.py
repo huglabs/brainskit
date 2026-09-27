@@ -52,6 +52,19 @@ class Consumer(StrEnum):
             return privacy != PrivacyMode.NEVER_INGEST
         return privacy == PrivacyMode.CLOUD
 
+    def sees_installation(self) -> bool:
+        """Whether this consumer may be told where the vault lives on this machine.
+
+        Installation facts -- the vault's absolute path, the home directory,
+        the workspace -- are inside the boundary (ADR 0009). A filename and a
+        branch name are disclosure in their own right, and an absolute path is
+        the same class of fact: it names the user, the project and the layout
+        of a machine the cloud consumer is by definition not on. `local` and
+        `human` are on it, so there is nothing to withhold from them.
+        """
+
+        return self is not Consumer.CLOUD
+
 
 def strictest_privacy(
     modes: Iterable[PrivacyMode], *, on_empty: PrivacyMode

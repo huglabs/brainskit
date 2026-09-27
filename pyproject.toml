@@ -211,11 +211,6 @@ ignore = [
 # environment variable's name — never a value. The two subprocess calls carry
 # their reasoning inline, at the site.
 "src/brainskit/interfaces/cli.py" = ["S105"]
-#   S607 — one fixed argument vector with no shell, asking `git` where it runs
-#     hooks from. It must be the same `git` the operator's commit will use, so
-#     it is invoked by name on PATH; an absolute path would answer for a
-#     different install than the one that matters.
-"src/brainskit/application/health.py" = ["S607"]
 
 [tool.mypy]
 python_version = "3.11"

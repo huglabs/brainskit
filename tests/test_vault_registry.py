@@ -415,6 +415,7 @@ class MissingVaultTest(RegistryFixture):
         shutil.rmtree(doomed)
         code, payload = self.run_cli(["vaults", "sync"])
         self.assertEqual(code, 1)
+        self.assertFalse(payload["ok"], "the envelope and the exit status are one answer")
         result = payload["result"]
         self.assertEqual(result["failed"], 1)
         entry = result["vaults"][0]

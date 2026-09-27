@@ -13,7 +13,7 @@ status too.
 from __future__ import annotations
 
 import json
-import subprocess
+import shlex
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -32,7 +32,7 @@ from brainskit.application.freshness import (
     _age_in_days,
     _projection_source_hash,
 )
-from brainskit.application.gate import INSTRUCTION_START
+from brainskit.application.gate import HOOK_SENTINEL, INSTRUCTION_START
 from brainskit.application.install import (
     COMMIT_LINT,
     COMMIT_LINT_MECHANISM,
@@ -43,6 +43,13 @@ from brainskit.application.install import (
     adapter_path,
     agent_install,
     installed_agents,
+    redirected_git_hooks_path,
+)
+from brainskit.application.installer import (
+    command_script,
+    is_generated_pre_commit,
+    render_hook_script,
+    render_pre_commit,
 )
 from brainskit.application.judgment import JudgmentRunner
 from brainskit.application.pages import parse_frontmatter
@@ -55,13 +62,12 @@ from brainskit.domain.model import (
     WIKI_LINK_RE,
     CodeSource,
     LintFinding,
+    NotConfiguredError,
+    PolicyError,
     SourceRecord,
     ValidationError,
 )
 from brainskit.domain.privacy import context_branches
-
-#: Where git reads hooks from when `core.hooksPath` says nothing.
-DEFAULT_GIT_HOOKS = Path(".git") / "hooks"
 
 #: Returned by `_artefact_fault` when the anchor could not be opened at all.
 #: Compared by identity, never by value, so it can never be confused with a real
@@ -100,58 +106,18 @@ def _is_seeded_shape(body: str) -> bool:
     return len(lines) == 1 and lines[0].startswith("# ")
 
 
-def redirected_git_hooks_path(root: Path) -> Path | None:
-    """Where git actually runs hooks from, when that is not `.git/hooks`.
+def _reinstall_hint(agent: str, workspace: Path, vault_root: Path) -> str:
+    """The command that rewrites an agent's install where it already is.
 
-    `core.hooksPath` moves the directory git reads -- Husky sets it on every
-    install -- and once it is set git never looks at `.git/hooks/pre-commit`
-    again. A hook written there is dead code, and reporting it as an active
-    layer is reporting a guard that does not run: the artefact exists, but it
-    is not the thing executing. That is the precise failure `_enforcement_state`
-    exists to catch, so it has to be caught here too.
-
-    Asks git rather than parsing `.git/config`, because the setting may come
-    from the local, global or system file and git is the only thing that
-    resolves all three the way a commit will. `None` means git runs the default
-    directory, or could not be asked at all -- and a machine with no usable git
-    runs no hook of any kind, so there is no claim left to correct.
-
-    Answered only for a repository root. Asked from a subdirectory git answers
-    about the repository above, which would read here as a redirect away from a
-    `.git/hooks` that was never this directory's to begin with. `.git` is a file
-    rather than a directory in a worktree or submodule, and both are roots.
+    `--root` only when the adapter recorded a workspace other than the vault:
+    without it `hooks install` writes beside the vault, and a nested vault
+    would gain a second, unloaded copy while the stale one stayed in use.
     """
-    if not (root / ".git").exists():
-        return None
-    try:
-        # A fixed argument vector with no shell, asking `git` where it reads
-        # hooks from -- the same reasoning `cli.py`'s S607 ignore already
-        # states for this file, extended to the untrusted-input check.
-        completed = subprocess.run(
-            ["git", "rev-parse", "--git-path", "hooks"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    reported = completed.stdout.strip()
-    if not reported:
-        return None
-    # Reported relative to the cwd the question was asked from, which is `root`.
-    hooks = Path(reported)
-    if not hooks.is_absolute():
-        hooks = root / hooks
-    default = root / DEFAULT_GIT_HOOKS
-    try:
-        same = hooks.resolve() == default.resolve()
-    except OSError:
-        same = hooks == default
-    return None if same else hooks
+
+    command = f"bk hooks install --agent {agent}"
+    if workspace != vault_root:
+        command += f" --root {shlex.quote(str(workspace))}"
+    return command
 
 
 def enforcement_ok(enforcement: dict[str, Any]) -> bool:
@@ -205,22 +171,51 @@ class Health:
         findings = self._mechanical_lint()
         self._review_drifted_code_citations(findings)
         semantic_report: dict[str, Any] | None = None
+        withheld = 0
         if semantic:
             # `lint-semantic` judges consistency, never proposes a write (see
             # `Jobs.ask` for why the apply-proposal shape stays off here).
+            #
+            # Read as `local`, the boundary that excludes exactly what the
+            # router refuses, for the reason `Jobs._judgment_context` gives: as
+            # `human`, one never-ingest page anywhere in recall refused the
+            # whole lint, and a page whose provenance does not resolve went to
+            # the model. The router's refusal stays as the last defence.
             context = self.retrieval.context(
-                "contradictions unsupported claims", limit=20, include_apply_contract=False
+                "contradictions unsupported claims",
+                limit=20,
+                consumer="local",
+                include_apply_contract=False,
             )
+            withheld = int(context["redacted"])
+            if withheld and not context["evidence"]:
+                raise PolicyError(
+                    "Every page semantic lint would read is withheld from models "
+                    "by its branch privacy policy",
+                    details={
+                        "withheld_sources": withheld,
+                        "hint": (
+                            "Run bk lint without --semantic, which checks every "
+                            "page, or review the withheld pages yourself with "
+                            "bk search -- they are withheld from models, not "
+                            "from you"
+                        ),
+                    },
+                )
             semantic_report = self.judgment_runner.run(
                 job="lint-semantic",
                 branches=context_branches(context),
                 variables={"context": json.dumps(context, ensure_ascii=False)},
             )
-        return {
+        result: dict[str, Any] = {
             "ok": not any(item.severity == "error" for item in findings),
             "findings": [item.to_dict() for item in findings],
             "semantic_report": semantic_report,
         }
+        if semantic:
+            # A count only: a path would name the page and its branch.
+            result["withheld_sources"] = withheld
+        return result
 
     def status(self) -> dict[str, Any]:
         records = self.vault.registry()
@@ -775,9 +770,18 @@ class Health:
             name = str(layer["layer"])
             if not layer["active"] and name not in inactive:
                 inactive.append(name)
+        # Beside `inactive` rather than folded into it: an outdated gate is in
+        # both, an outdated session-status script only here, because it still
+        # runs and only its report is suspect.
+        outdated: list[str] = []
+        for layer in layers:
+            name = str(layer["layer"])
+            if layer.get("outdated") and name not in outdated:
+                outdated.append(name)
         return {
             "layers": layers,
             "inactive": inactive,
+            "outdated": outdated,
             # Specifically the write gate, not "any non-advisory layer is on".
             # session_status is observability and commit_lint catches a bypass
             # only after the fact; neither one keeps a write out of the wiki, so
@@ -841,6 +845,10 @@ class Health:
             for command in events.get(event, set()):
                 if command in candidates or any(c in command for c in candidates):
                     return True
+                # The installer shell-quotes the path, and a quoted `'` is no
+                # longer a substring of the command.
+                if command_script(command) in candidates:
+                    return True
                 # The command may spell the same file a different way. Compare
                 # resolved forms, guarded because a command is often a shell
                 # snippet rather than a bare path.
@@ -850,6 +858,8 @@ class Health:
                 except (OSError, ValueError):
                     continue
             return False
+
+        recorded = (self.vault.root / install.adapter).is_file()
 
         def hook_layer(hook: AgentHook) -> dict[str, Any]:
             path = root / ".claude" / "hooks" / hook.script
@@ -861,7 +871,7 @@ class Health:
                 detail = (
                     f"{hook.script} exists but is not registered under {hook.event}"
                 )
-            return {
+            layer: dict[str, Any] = {
                 "layer": hook.layer,
                 "mechanism": hook.mechanism,
                 "active": active,
@@ -871,6 +881,27 @@ class Health:
                 # rebuilding the path from assumptions about the workspace.
                 "script": str(path),
             }
+            if recorded and self._hook_outdated(hook, path, root):
+                layer["outdated"] = True
+                layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
+                if active:
+                    # The gate is the layer `gated` means, and a stale copy is
+                    # not the gate this version specifies: it may deny by rules
+                    # since changed, or miss a path since added. Observability
+                    # stays active and warns, because an out-of-date summary
+                    # misreports the vault without letting a write through.
+                    if hook.layer == WRITE_GATE:
+                        layer["active"] = False
+                        layer["detail"] = (
+                            f"{hook.script} is older than the one this version "
+                            "installs, so it may enforce old rules"
+                        )
+                    else:
+                        layer["detail"] = (
+                            f"{hook.script} is older than the one this version "
+                            "installs, so what it reports may be wrong"
+                        )
+            return layer
 
         pre_commit = root / ".git" / "hooks" / "pre-commit"
         # A redirected hooks directory disqualifies the layer no matter what the
@@ -906,14 +937,23 @@ class Health:
         except OSError:
             advisory_active = False
 
+        commit_layer: dict[str, Any] = {
+            "layer": COMMIT_LINT,
+            "mechanism": COMMIT_LINT_MECHANISM,
+            "active": commit_active,
+            "detail": commit_detail,
+        }
+        if recorded and commit_active and self._pre_commit_outdated(pre_commit):
+            # Stays active: the rules live in `bk lint`, not in the hook.
+            commit_layer["outdated"] = True
+            commit_layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
+            commit_layer["detail"] = (
+                "pre-commit is older than the one this version installs"
+            )
+
         return [
             *(hook_layer(hook) for hook in install.hooks),
-            {
-                "layer": COMMIT_LINT,
-                "mechanism": COMMIT_LINT_MECHANISM,
-                "active": commit_active,
-                "detail": commit_detail,
-            },
+            commit_layer,
             {
                 "layer": INSTRUCTIONS,
                 "mechanism": install.instructions_mechanism,
@@ -922,6 +962,46 @@ class Health:
                 "detail": "active" if advisory_active else "no managed block found",
             },
         ]
+
+    def _hook_outdated(self, hook: AgentHook, path: Path, workspace: Path) -> bool:
+        """Whether a brainskit-generated hook differs from what an install writes now.
+
+        "Installed and registered" was the whole question, so a copy written by
+        an older brainskit read `active` for as long as it existed -- including
+        a session-status script that under-reported lint errors after its
+        template changed. The comparison is against `render_hook_script`, the
+        renderer the installer itself writes with, so there is no second notion
+        of "current" here to drift.
+
+        A script without the generated marker belongs to the operator and is
+        not judged; nor is one this build cannot render a template for.
+        """
+
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        if HOOK_SENTINEL not in existing:
+            return False
+        try:
+            expected = render_hook_script(hook.template, self.vault.root, workspace)
+        except NotConfiguredError:
+            return False
+        return existing != expected
+
+    def _pre_commit_outdated(self, path: Path) -> bool:
+        """`_hook_outdated` for the git pre-commit hook, which has no template.
+
+        A hook brainskit did not write is the operator's and is not judged.
+        """
+
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        if not is_generated_pre_commit(existing):
+            return False
+        return existing != render_pre_commit(self.vault.root)
 
     def _agent_workspace(self, agent: str) -> Path:
         """Where the agent's configuration lives, per the adapter that recorded it.

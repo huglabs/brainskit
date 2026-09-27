@@ -37,6 +37,7 @@ from test_projections import policy as _base_policy
 from brainskit.application.codegraph import CodeGraph
 from brainskit.domain.model import (
     DEFAULT_CODE_SCAN_LIMIT,
+    VAULT_DIRECTORIES,
     GrammarNeed,
     ScanSurvey,
     ValidationError,
@@ -290,6 +291,15 @@ class VaultGitignoreTest(unittest.TestCase):
             {".brain"},
             "a generated directory is neither ignored nor deliberately kept",
         )
+
+    def test_every_directory_a_vault_creates_is_named_as_the_vault_s_own(self) -> None:
+        # `bk code build` on a vault that is its own code root tells the
+        # vault's files from the project's by these names alone; a directory
+        # the scaffold grows without joining the list would be graphed.
+        vault = FileVault.initialize(self.root / "vault", policy())
+        created = {path.name for path in vault.root.iterdir() if path.is_dir()}
+        self.assertLessEqual(created, set(VAULT_DIRECTORIES))
+        self.assertLessEqual(set(GENERATED_DIRECTORIES), set(VAULT_DIRECTORIES))
 
     def test_an_existing_gitignore_survives(self) -> None:
         target = self.root / "project"

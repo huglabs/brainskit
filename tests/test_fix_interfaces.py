@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,11 +33,12 @@ from brainskit.interfaces.mcp import (
     BrainskitMcpHttpHandler,
     BrainskitMcpHttpServer,
     _call_tool,
+    _handle,
     _safe_reason,
     _tool_definitions,
     run_stdio,
 )
-from brainskit.interfaces.web import build_server
+from brainskit.interfaces.web import WEB_VIEWER_HTML, build_server
 
 
 def policy() -> dict:
@@ -210,6 +214,129 @@ class CliSafetyNetTest(unittest.TestCase):
         finally:
             cli._dispatch = original  # type: ignore[assignment]
         self.assertEqual(code, 130)
+
+
+class CliEnvelopeAgreesWithExitStatusTest(unittest.TestCase):
+    """The envelope's `ok` and the exit status are one answer (issue #10).
+
+    `bk lint --json` used to print `{"ok": true, "result": {"ok": false}}` and
+    exit 1: the envelope was a literal, the status was decided elsewhere.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        # `vaults sync` opens the machine's registry; keep it off the real one.
+        environment = mock.patch.dict(
+            "os.environ", {"XDG_CONFIG_HOME": str(self.root / "config")}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _service(self) -> BrainskitService:
+        return BrainskitService(
+            self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
+        )
+
+    def _dirty(self) -> None:
+        captured = self._service().capture(None, text="Immutable", title="Immutable")
+        (self.root / captured["source"]["path"]).write_text("Mutated", encoding="utf-8")
+
+    def _lint(self) -> tuple[int, dict[str, Any]]:
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            code = cli.main(["--json", "--vault", str(self.root), "lint"])
+        return code, json.loads(stream.getvalue())
+
+    def _mcp_lint(self) -> dict[str, Any]:
+        response = _handle(
+            self._service(),
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "lint", "arguments": {}},
+            },
+        )
+        assert response is not None
+        return response["result"]
+
+    def test_a_lint_error_fails_the_envelope_and_the_process_together(self) -> None:
+        self._dirty()
+
+        code, payload = self._lint()
+
+        self.assertFalse(payload["result"]["ok"])
+        self.assertFalse(payload["ok"], payload)
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "raw.content_modified",
+            {finding["code"] for finding in payload["result"]["findings"]},
+        )
+
+    def test_a_clean_vault_succeeds_on_every_reading(self) -> None:
+        code, payload = self._lint()
+
+        self.assertTrue(payload["result"]["ok"])
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(code, 0)
+
+    def test_the_mcp_lint_tool_flags_a_lint_error_as_a_tool_error(self) -> None:
+        self._dirty()
+
+        result = self._mcp_lint()
+
+        self.assertFalse(result["structuredContent"]["ok"])
+        self.assertTrue(result["isError"], "the MCP twin of the envelope's ok")
+
+    def test_the_mcp_lint_tool_on_a_clean_vault_is_not_an_error(self) -> None:
+        result = self._mcp_lint()
+
+        self.assertTrue(result["structuredContent"]["ok"])
+        self.assertFalse(result["isError"])
+
+    def test_every_result_that_can_carry_a_failure_agrees_with_its_status(self) -> None:
+        # (argv, what the command returns, envelope ok == exit 0). The advisory
+        # rows are reports whose answer is a state, not a failure: they exit 0,
+        # so their envelope stays ok.
+        cases: list[tuple[list[str], str, dict[str, Any], bool]] = [
+            (["lint"], "lint", {"ok": False, "findings": [], "semantic_report": None}, False),
+            (["lint"], "lint", {"ok": True, "findings": [], "semantic_report": None}, True),
+            (["status"], "status", {"healthy": False, "lint_errors": 1}, True),
+            (["code", "status"], "code_status", {"state": "stale", "stale": True}, True),
+            (
+                ["watch", "--once"],
+                "watch_once",
+                {"created": 0, "duplicates": 0, "ignored": 0,
+                 "failures": [{"path": "gone", "error": "missing"}]},
+                True,
+            ),
+            (["vaults", "sync"], "_sync_registered_vaults", {"ok": 1, "failed": 1}, False),
+            (["vaults", "sync"], "_sync_registered_vaults", {"ok": 2, "failed": 0}, True),
+            (["update", "--yes"], "_run_update", {"state": "failed", "exit": 1}, False),
+            (["update", "--yes"], "_run_update", {"state": "unavailable"}, True),
+            (["update", "--yes"], "_run_update", {"state": "updated"}, True),
+        ]
+        for argv, method, value, succeeds in cases:
+            with self.subTest(argv=argv, value=value):
+                service = mock.MagicMock()
+                getattr(service, method).return_value = value
+                with mock.patch.object(cli, "create_service", return_value=service), \
+                        mock.patch.object(
+                            cli, "_sync_registered_vaults", return_value=value
+                        ), \
+                        mock.patch.object(cli, "_run_update", return_value=value):
+                    stream = io.StringIO()
+                    with redirect_stdout(stream):
+                        code = cli.main(["--json", *argv])
+                payload = json.loads(stream.getvalue())
+                self.assertEqual(payload["result"], value)
+                self.assertEqual(payload["ok"], succeeds)
+                self.assertEqual(code == 0, succeeds)
 
 
 class CliWebNoBrowserFlagTest(unittest.TestCase):
@@ -1034,6 +1161,149 @@ class WebIntegrationsConsumerTest(unittest.TestCase):
         self.assertNotIn("BRAINSKIT_TEST_PG_DSN", machine_body)
 
 
+class CloudTransportsNameNoLocalPathTest(unittest.TestCase):
+    """ADR 0009 on the wire: a cloud caller is never told where the vault is.
+
+    The service-level scan lives in `test_fix_services.py`; this one reads the
+    serialized bytes each transport actually sends, because a transport that
+    adds a key of its own (an envelope field, error details) would slip past a
+    check made one layer down.
+    """
+
+    WEB_PATHS = (
+        "/api/status",
+        "/api/graph",
+        "/api/search?q=nota",
+        "/api/proposals",
+        "/api/sources",
+        "/api/pages",
+        "/api/timeline",
+        "/api/integrations",
+        "/api/resource?id=page:wiki/missing.md",
+    )
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.service = BrainskitService(
+            self.vault,
+            SqliteFtsIndex(self.vault.index_path),
+            graph=MarkdownGraph(),
+            integrations=NativeIntegrations(self.vault),
+        )
+        self.service.capture(None, text="Nota de pesquisa.", title="nota")
+        self.service.reindex()
+        self.markers = {str(self.root), str(self.vault.root), str(Path.home())}
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def fetch_all(self, consumer: str) -> dict[str, tuple[int, str]]:
+        server = build_server(self.service, host="127.0.0.1", port=0, consumer=consumer)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        bodies: dict[str, tuple[int, str]] = {}
+        try:
+            for path in self.WEB_PATHS:
+                request = Request(f"http://127.0.0.1:{server.server_port}{path}")
+                try:
+                    with urlopen(request, timeout=3) as response:
+                        bodies[path] = (response.status, response.read().decode())
+                except HTTPError as error:
+                    bodies[path] = (error.code, error.read().decode())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        return bodies
+
+    def test_no_web_response_to_a_cloud_viewer_names_a_local_path(self) -> None:
+        for path, (_status, body) in self.fetch_all("cloud").items():
+            with self.subTest(path=path):
+                for marker in self.markers:
+                    self.assertNotIn(marker, body)
+
+    def test_a_local_viewer_is_still_told_where_the_vault_is(self) -> None:
+        status, body = self.fetch_all("local")["/api/status"]
+        self.assertEqual(status, HTTPStatus.OK)
+        self.assertEqual(json.loads(body)["result"]["vault"], str(self.vault.root))
+
+    def test_no_mcp_call_declared_cloud_names_a_local_path(self) -> None:
+        for tool in ("search", "context"):
+            with self.subTest(tool=tool):
+                response = _handle(
+                    self.service,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool,
+                            "arguments": {"query": "nota", "consumer": "cloud"},
+                        },
+                    },
+                )
+                blob = json.dumps(response, ensure_ascii=False)
+                for marker in self.markers:
+                    self.assertNotIn(marker, blob)
+
+
+@unittest.skipUnless(shutil.which("node"), "requires node to run the viewer JS")
+class WebViewerNamesOutdatedHooksTest(unittest.TestCase):
+    """The header names a stale hook script, even on a healthy vault.
+
+    An outdated session-status copy still runs, so it does not sink `healthy`;
+    before this the header read "healthy" and nothing else while the script
+    under-reported lint errors. The real `healthLabel` runs against the status
+    shapes `/api/status` sends.
+    """
+
+    def label(self, status: dict[str, Any]) -> str:
+        functions = "".join(
+            match.group(0)
+            for name in ("staleHooks", "healthLabel")
+            if (match := re.search(rf"\nfunction {name}\(status\)\{{.*?\n", WEB_VIEWER_HTML))
+        )
+        harness = f"{functions}console.log(healthLabel({json.dumps(status)}))"
+        completed = subprocess.run(
+            ["node", "-e", harness], capture_output=True, text=True, check=True
+        )
+        return completed.stdout.strip()
+
+    def status(self, *, healthy: bool, hint: str | None) -> dict[str, Any]:
+        layer: dict[str, Any] = {"layer": "session_status", "active": True}
+        if hint is not None:
+            layer.update(outdated=True, hint=hint)
+        return {
+            "healthy": healthy,
+            "lint_errors": 0,
+            "enforcement": {
+                "outdated": ["session_status"] if hint is not None else [],
+                "layers": [layer],
+            },
+        }
+
+    def test_a_current_install_reads_healthy_alone(self) -> None:
+        self.assertEqual(self.label(self.status(healthy=True, hint=None)), "healthy")
+
+    def test_an_outdated_script_is_named_with_its_remedy(self) -> None:
+        hint = "bk hooks install --agent claude --root <path>"
+        self.assertEqual(
+            self.label(self.status(healthy=True, hint=hint)),
+            f"healthy; session_status outdated, run {hint}",
+        )
+
+    def test_it_joins_the_reasons_when_the_vault_needs_attention(self) -> None:
+        status = self.status(healthy=False, hint="bk hooks install --agent claude")
+        status["lint_errors"] = 2
+        self.assertEqual(
+            self.label(status),
+            "needs attention: 2 lint errors; "
+            "session_status outdated, run bk hooks install --agent claude",
+        )
+
+
 class RendererUnitTests(unittest.TestCase):
     """Each per-command renderer against the exact shape its service method
     returns -- confirmed by reading health.py, retrieval.py, filing.py,
@@ -1178,6 +1448,35 @@ class RendererUnitTests(unittest.TestCase):
         self.assertIn("1 error(s)", text)
         self.assertIn("1 warning(s)", text)
         self.assertIn("raw.content_modified", text)
+
+    def test_every_judgment_renderer_says_how_much_was_withheld(self) -> None:
+        """A model answered from part of the vault; the output has to say so,
+        as a count and nothing that names what was withheld."""
+
+        cases = [
+            (cli._render_ask, {"answer": "x", "citations": [], "uncertainty": ""}),
+            (cli._render_digest, {"digest": "x", "actions": [], "resurfaced": "", "path": "o.md"}),
+            (cli._render_resurface, {"markdown": "x", "page": "wiki/index.md", "path": "o.md"}),
+            (cli._render_lint, {"ok": True, "findings": [], "semantic_report": {"findings": []}}),
+            (
+                cli._render_lint,
+                {
+                    "ok": False,
+                    "findings": [
+                        {"code": "c", "severity": "error", "message": "m", "path": "p"}
+                    ],
+                    "semantic_report": {"findings": []},
+                },
+            ),
+        ]
+        for fn, value in cases:
+            with self.subTest(renderer=fn.__name__, findings=bool(value.get("findings"))):
+                text = self.render(fn, {**value, "withheld_sources": 2})
+                self.assertIn("2 source(s) withheld from the model by privacy policy", text)
+                self.assertNotIn(
+                    "withheld", self.render(fn, {**value, "withheld_sources": 0})
+                )
+                self.assertNotIn("withheld", self.render(fn, value))
 
     def test_proposals_lists_id_branch_and_status(self) -> None:
         text = self.render(

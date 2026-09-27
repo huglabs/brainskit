@@ -16,13 +16,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from test_engine import policy
 
-from brainskit.application.health import redirected_git_hooks_path
+from brainskit.application.install import redirected_git_hooks_path
 from brainskit.application.services import BrainskitService
+from brainskit.domain.model import PolicyError
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces import cli, console
 
@@ -579,6 +582,89 @@ class EnforcementRowsDistinguishAdvisoryTest(unittest.TestCase):
             with self.subTest(layer=spec[0]):
                 (row,) = self.rows(spec)
                 self.assertIn("d", console.strip_ansi(row[1]))
+
+
+class SemanticLintWithholdsNeverIngestEvidenceTest(unittest.TestCase):
+    """`bk lint --semantic` narrows what reaches the model; it does not refuse.
+
+    TC4, the twin of U1 in `Jobs`: semantic lint read its evidence as `human`
+    and handed every contributing branch to the router, so one never-ingest
+    page in recall refused the whole lint. The real router runs here, so its
+    refusal stays the last defence and anything that slipped through would
+    fail these tests rather than reach the recording driver.
+    """
+
+    PRIVATE_TEXT = "Contradictions unsupported claims in the zebra-omega salary ledger."
+    PRIVATE_TITLE = "Salary ledger"
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str, *, model: str, output_schema: Any = None) -> str:
+            self.prompts.append(prompt)
+            return json.dumps({"findings": []})
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.vault = FileVault.initialize(Path(self.temporary.name), policy())
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = self.seed.capture(None, text=self.PRIVATE_TEXT, title=self.PRIVATE_TITLE)
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = self.seed.file(self.private_hash, "10-work")["source"]["path"]
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def capture_public(self, text: str) -> None:
+        public = self.seed.capture(None, text=text, title="Public notes")
+        self.seed.file(public["source"]["content_hash"], "20-research")
+
+    def lint(self) -> tuple[dict[str, Any], _Recorder]:
+        driver = self._Recorder()
+        router = PolicyJudgmentRouter(self.vault.config(), JobSpecs())
+        service = BrainskitService(
+            self.vault, self.index, judgment=router, jobs=JobSpecs(), graph=MarkdownGraph()
+        )
+        with mock.patch("brainskit.infrastructure.llm._create_driver", return_value=driver):
+            return service.lint(semantic=True), driver
+
+    def assert_nothing_private(self, text: str) -> None:
+        for disclosure in (
+            "zebra-omega",
+            self.PRIVATE_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "10-work",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def test_lint_judges_the_permissible_pages_and_counts_the_rest(self) -> None:
+        self.capture_public("Contradictions and unsupported claims about release cadence.")
+        result, driver = self.lint()
+        self.assertEqual(result["semantic_report"], {"findings": []})
+        self.assertEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("release cadence", driver.prompts[0])
+        self.assert_nothing_private(driver.prompts[0])
+        self.assert_nothing_private(json.dumps(result["semantic_report"]))
+
+    def test_only_never_ingest_pages_is_an_actionable_refusal(self) -> None:
+        with self.assertRaises(PolicyError) as caught:
+            self.lint()
+        self.assertEqual(caught.exception.code, "policy_denied")
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("bk search", details["hint"])
+        self.assert_nothing_private(
+            json.dumps({"message": str(caught.exception), "details": details})
+        )
+
+    def test_mechanical_lint_carries_no_withheld_count(self) -> None:
+        """Nothing is sent to a model, so there is nothing to have withheld."""
+
+        self.assertNotIn("withheld_sources", self.seed.lint())
 
 
 if __name__ == "__main__":

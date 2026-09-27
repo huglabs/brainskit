@@ -9,9 +9,9 @@ boundary.
 Three properties carry it:
 
 - **The import is a boundary, not a copy.** Prose nodes are dropped, dangling
-  edges are dropped, and the vault is excluded from its own graph. Trusting the
-  caller to have passed `--code-only` would make that a property of a command
-  line instead of a property of the vault.
+  edges are dropped, and the vault is excluded from its own graph. There is no
+  `--code-only` flag to trust the caller with: that would make the boundary a
+  property of a command line instead of a property of the vault.
 - **Freshness is content, not time.** The graph records the hash of every file
   it indexed, and `status` re-reads them. A stored git revision would miss
   uncommitted edits; mtime would break on `git checkout`.
@@ -160,7 +160,13 @@ class ImportBoundaryTest(CodeGraphFixture):
             self.service.code_import(
                 {"nodes": [node("d", "R", "README.md", 1, "document")], "links": []}
             )
-        self.assertIn("code-only", caught.exception.details["hint"])
+        # `--code-only` is the flag the module docstring says deliberately does
+        # not exist; a hint naming it was a dead end. The hint must name
+        # something the operator can actually run.
+        hint = caught.exception.details["hint"]
+        self.assertNotIn("--code-only", hint)
+        self.assertIn("bk code build", hint)
+        self.assertEqual(caught.exception.details["dropped_non_code_nodes"], 1)
 
     def test_deduplicates_repeated_edges(self) -> None:
         payload = self.payload()
@@ -893,3 +899,53 @@ class BuildTest(CodeBuildFixture):
             {(e["source"], e["target"], e["type"]) for e in imported_graph["edges"]},
             {(e["source"], e["target"], e["type"]) for e in built_graph["edges"]},
         )
+
+
+@unittest.skipUnless(_HAS_CODE_EXTRA, "requires the `code` extra (tree-sitter + grammars)")
+class VaultIsTheCodeRootTest(unittest.TestCase):
+    """A vault outside any repository, so `code_root` falls back to the vault.
+
+    The vault's own prefix inside the code root is then empty, and an empty
+    prefix once meant "exclude nothing": `bk hooks install` wrote its scripts,
+    bootstrapped the graph, and the graph held nothing but those scripts.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        vault = FileVault.initialize(Path(self.temporary.name) / "vault", policy())
+        self.vault = vault
+        self.service = BrainskitService(
+            vault,
+            SqliteFtsIndex(vault.index_path),
+            graph=MarkdownGraph(),
+            extractor=GraphifyExtractor(),
+        )
+        self.service.install_agent("claude")
+        self.assertEqual(self.vault.code_root().resolve(), self.vault.root.resolve())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_excludes_the_vault_s_own_files_when_the_vault_is_the_code_root(self) -> None:
+        root = self.vault.root
+        (root / "tool.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+        for owned in ("raw/_inbox/note.py", "wiki/page.py", "graph/built.py", ".brain/x.py"):
+            (root / owned).parent.mkdir(parents=True, exist_ok=True)
+            (root / owned).write_text("def owned():\n    return 0\n", encoding="utf-8")
+
+        self.service.code_build()
+
+        graph = json.loads((root / CODE_PROJECTION).read_text("utf-8"))
+        self.assertEqual({node["path"] for node in graph["nodes"]}, {"tool.py"})
+        # Excluded on purpose is not unexplained: the vault's files must not
+        # leave the graph reported as `partial`.
+        self.assertEqual(self.service.code_status()["state"], "fresh")
+
+    def test_a_vault_with_nothing_but_itself_is_refused_with_a_next_step(self) -> None:
+        with self.assertRaises(ValidationError) as caught:
+            self.service.code_build()
+        details = caught.exception.details
+        self.assertNotIn("--code-only", details["hint"])
+        self.assertIn("code_root", details["hint"])
+        self.assertIn("bk code build", details["hint"])
+        self.assertEqual(details["code_root"], str(self.vault.code_root()))

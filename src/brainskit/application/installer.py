@@ -40,7 +40,6 @@ from brainskit.application.gate import (
     INSTRUCTION_END,
     INSTRUCTION_START,
 )
-from brainskit.application.health import redirected_git_hooks_path
 from brainskit.application.install import (
     BRAND,
     COMMIT_LINT,
@@ -49,6 +48,7 @@ from brainskit.application.install import (
     INSTRUCTIONS,
     AgentHook,
     agent_install,
+    redirected_git_hooks_path,
 )
 from brainskit.application.ports import VaultPort
 from brainskit.domain.model import NotConfiguredError, ValidationError
@@ -159,7 +159,7 @@ def _agent_template(name: str, vault: Path) -> str:
     return resource.read_text(encoding="utf-8").replace("{{vault}}", str(vault))
 
 
-def _hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
+def render_hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
     """Render a shipped hook script with the vault and workspace baked in.
 
     Both paths are shell-quoted, not interpolated raw: real paths carry spaces
@@ -170,6 +170,10 @@ def _hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
     and the hooks live with the project, not with the vault. A script that
     looked for them beside the vault would report a live enforcement layer as
     OFF for every vault nested inside the project it guards.
+
+    Public because `Health` asks it what an install would write *now* and
+    compares the copy on disk against that, rather than keeping a second idea
+    of what a current hook looks like.
     """
     resource = files("brainskit").joinpath("templates", "agents", f"{name}.sh")
     if not resource.is_file():
@@ -276,6 +280,35 @@ COMMIT_LINT_OFF = (
     "written outside the apply gate is only reported when somebody runs bk lint."
 )
 
+#: The one-line hook every release before 0.8.0 wrote. It quoted the vault with
+#: `json.dumps`, which sh does not read as JSON: the escape JSON writes for a
+#: non-ASCII character stayed literal, so such a vault was never found and every
+#: commit failed, and `$` and backticks inside the double quotes were still
+#: expanded. It carries no sentinel, so this exact shape is how an install
+#: recognises it as its own.
+_LEGACY_PRE_COMMIT = re.compile(r'#!/bin/sh\nexec bk --vault "[^\n]*" lint --changed')
+
+
+def render_pre_commit(vault: Path) -> str:
+    """The git pre-commit hook an install writes for `vault`.
+
+    Public for the reason `render_hook_script` is: `Health` compares the copy on
+    disk against what an install would write now.
+    """
+    return (
+        "#!/bin/sh\n"
+        f"{HOOK_SENTINEL} — written by `bk hooks install`.\n"
+        f"exec bk --vault {shlex.quote(str(vault))} lint --changed\n"
+    )
+
+
+def is_generated_pre_commit(content: str) -> bool:
+    """Whether a pre-commit hook was written by brainskit, now or before 0.8.0."""
+    return (
+        HOOK_SENTINEL in content
+        or _LEGACY_PRE_COMMIT.fullmatch(content.strip()) is not None
+    )
+
 
 def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
     """Install the lint hook when the workspace is a git repository.
@@ -323,18 +356,20 @@ def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, An
             "consequence": COMMIT_LINT_OFF,
         }
     hook = git_dir / "hooks" / "pre-commit"
-    content = f"#!/bin/sh\nexec bk --vault {json.dumps(str(vault))} lint --changed\n"
+    content = render_pre_commit(vault)
     if hook.exists() and not force:
-        if hook.read_text(encoding="utf-8") == content:
+        existing = hook.read_text(encoding="utf-8")
+        if existing == content:
             return {"path": str(hook), "state": "current"}
-        return {
-            "path": str(hook),
-            "state": "skipped",
-            "reason": "a pre-commit hook already exists",
-            "hint": "Merge brainskit lint into it, or re-run with --force",
-            "enforcement": "off",
-            "consequence": COMMIT_LINT_OFF,
-        }
+        if not is_generated_pre_commit(existing):
+            return {
+                "path": str(hook),
+                "state": "skipped",
+                "reason": "a pre-commit hook already exists",
+                "hint": "Merge brainskit lint into it, or re-run with --force",
+                "enforcement": "off",
+                "consequence": COMMIT_LINT_OFF,
+            }
     updated = hook.exists()
     hook.parent.mkdir(parents=True, exist_ok=True)
     hook.write_text(content, encoding="utf-8")
@@ -350,8 +385,8 @@ def _write_hook_script(
     The sentinel comment is what makes a rewrite safe: a script carrying it is
     ours to replace, and a script without it belongs to the operator.
     """
-    target = root / ".claude" / "hooks" / hook.script
-    content = _hook_script(hook.template, vault, root)
+    target = root / hook.path
+    content = render_hook_script(hook.template, vault, root)
     existed = target.is_file()
     if existed:
         existing = target.read_text(encoding="utf-8")
@@ -399,6 +434,25 @@ def _hook_script_names(template: str) -> frozenset[str]:
     )
 
 
+def hook_command(script: Path | str) -> str:
+    """The settings.json command that runs `script`.
+
+    Claude Code hands the command to a shell, so a workspace path with a space
+    would split into arguments -- the gate then exits 127, which Claude Code
+    does not treat as a denial -- and one with `$(...)` would run it.
+    """
+    return shlex.quote(str(script))
+
+
+def command_script(command: str) -> str:
+    """The script a registered command runs, unquoting one `hook_command` wrote."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return command
+    return tokens[0] if len(tokens) == 1 else command
+
+
 def _is_stale_hook_command(command: Any, template: str, current: str) -> bool:
     """Whether `command` is a brainskit `template` hook at some path other than `current`.
 
@@ -415,7 +469,7 @@ def _is_stale_hook_command(command: Any, template: str, current: str) -> bool:
     """
     if not isinstance(command, str) or command == current:
         return False
-    return Path(command).name in _hook_script_names(template)
+    return Path(command_script(command)).name in _hook_script_names(template)
 
 
 def _retire_legacy_hook_scripts(
@@ -636,7 +690,7 @@ def _install_claude_hook(
         outcome = _write_hook_script(root, vault, hook, force=force)
         scripts[hook.template] = outcome
         if outcome["state"] != "skipped":
-            registrable.append((hook, str(outcome["path"])))
+            registrable.append((hook, hook_command(outcome["path"])))
     # Registration first, so a former brand's command is gone from settings.json
     # before its script leaves the disk. The reverse order has a window — and, if
     # the unlink fails, a lasting state — where a registered hook points at a
@@ -685,7 +739,10 @@ def _enforcement_summary(result: dict[str, Any]) -> dict[str, Any]:
         }
         for entry in install.hooks:
             script = hook["scripts"][entry.template]
-            active = script["state"] != "skipped" and script["path"] in registered
+            active = (
+                script["state"] != "skipped"
+                and hook_command(script["path"]) in registered
+            )
             outcome = script if script["state"] == "skipped" else settings
             layers.append(
                 _enforcement_layer(
@@ -757,7 +814,7 @@ def _workspace_advisory(vault: Path, workspace: Path) -> dict[str, Any] | None:
                     "The vault is not a project root, so an agent opened on "
                     f"{parent} will never load what was just installed here."
                 ),
-                "hint": f"Reinstall with --root {parent}",
+                "hint": f"Reinstall with --root {shlex.quote(str(parent))}",
             }
     return None
 

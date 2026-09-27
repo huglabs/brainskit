@@ -33,6 +33,13 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   every node and edge exists, so a link cannot pull a redacted node back in
   through its neighbour. A redacted source contributes nothing: not its body,
   not its filename, not its branch.
+- **Installation fact** — an absolute local path: the vault root, the home
+  directory, the workspace, the code root, the interpreter. Inside the
+  boundary: a `cloud` consumer is never told one on a consumer-scoped
+  response, and the key is omitted rather than blanked; `local` and `human`
+  keep it. Decided by `Consumer.sees_installation`, applied by
+  `PrivacyBoundary.installation_facts(**facts)`. Vault-relative paths are
+  evidence identifiers, not installation facts. See ADR 0009.
 
 ## Freshness
 
@@ -76,6 +83,15 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   and the third instance of the one `ConstantsHaveOneOwnerTest` was written for.
   An agent with no hooks reports no `write_gate` layer rather than an inactive
   one: "there is no guard here" and "the guard fell off" are different claims.
+- **outdated** — an installed, brainskit-generated hook script that differs
+  from what the installer would render for that workspace now. Judged against
+  `installer.render_hook_script`, the one renderer both the writer and `Health`
+  call, so "current" cannot mean two things. An outdated `write_gate` is not the
+  gate this version specifies, so the vault is not `gated`; an outdated
+  `session_status` still runs and only warns, because a stale summary
+  misreports the vault without letting a write through. The remedy is the
+  layer's `hint`, which names `--root` when the workspace is not the vault — an
+  installation fact, so `cloud` gets it with the path replaced (ADR 0009).
 - **adapter** — `.brain/agent-<agent>.json`, the only thing on disk that records
   an install. It carries the resolved workspace (which is not always the vault)
   and the gate's deny rules, so `installed_agents` reading the directory is the

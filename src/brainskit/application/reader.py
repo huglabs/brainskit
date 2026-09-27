@@ -11,8 +11,9 @@ current endpoints.
 
 from __future__ import annotations
 
+import shlex
 from collections import defaultdict
-from pathlib import PurePosixPath
+from pathlib import PurePath, PurePosixPath
 from typing import Any
 
 from brainskit.application.filing import Filing
@@ -20,19 +21,42 @@ from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health, enforcement_ok
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import for_consumer
+from brainskit.application.privacy import PrivacyBoundary, for_consumer
 from brainskit.application.projections import Projections
 from brainskit.domain.model import NotFoundError, PolicyError, ValidationError
 from brainskit.domain.privacy import record_branch
 
 
-def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
+def _hint_without_paths(hint: str) -> str:
+    """`hint` with every absolute path argument replaced by `<path>`.
+
+    A reinstall hint names the workspace with `--root` when it is not the
+    vault, and that is an installation fact (ADR 0009). The command stays
+    useful without it: the reader learns what to run and that a root belongs
+    there, not where this machine keeps it.
+    """
+
+    try:
+        tokens = shlex.split(hint)
+    except ValueError:
+        return "bk hooks install"
+    return " ".join(
+        "<path>" if PurePath(token).is_absolute() or token.startswith("~") else token
+        for token in tokens
+    )
+
+
+def _reportable_enforcement(
+    enforcement: dict[str, Any], boundary: PrivacyBoundary
+) -> dict[str, Any]:
     """The enforcement report with the machine-specific fields dropped.
 
     Enforcement is not evidence, so the consumer filter has nothing to say about
-    it: a hook is installed or it is not, identically for whoever asks, and this
-    surface already reports `vault` and `index` on the same footing. What is
-    withheld here is withheld for minimality rather than for privacy. `detail`
+    whether a layer is on: a hook is installed or it is not, identically for
+    whoever asks. Where it lives is another matter -- an installation fact,
+    inside the boundary since ADR 0009 -- and the `vault` key beside this one is
+    withheld from `cloud` for that reason. What is dropped here is dropped for
+    every consumer, for minimality as much as for privacy. `detail`
     interpolates the workspace root and the redirected hooks directory, and
     `script` is an absolute path added for `bk doctor`, which opens the file;
     the viewer only has to name the layer that is off. A hook path names a local
@@ -43,19 +67,32 @@ def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
     vault is installed for more than one, and without it two identically named
     rows would render as one layer reported twice. It names an agent, not a
     machine.
+
+    `outdated` and its `hint` are kept too: a stale session-status script still
+    runs and misreports the vault, and dropping them here meant the viewer never
+    said so. The hint is the one field that can carry an installation fact, so
+    it goes through the boundary -- whole for `local` and `human`, path-free for
+    `cloud`.
     """
 
+    layers = []
+    for layer in enforcement.get("layers", []):
+        reported = {
+            key: layer[key]
+            for key in ("layer", "mechanism", "active", "advisory", "agent", "outdated")
+            if key in layer
+        }
+        if "hint" in layer:
+            hint = str(layer["hint"])
+            reported["hint"] = boundary.installation_facts(hint=hint).get(
+                "hint", _hint_without_paths(hint)
+            )
+        layers.append(reported)
     return {
         "gated": enforcement.get("gated", False),
         "inactive": list(enforcement.get("inactive", [])),
-        "layers": [
-            {
-                key: layer[key]
-                for key in ("layer", "mechanism", "active", "advisory", "agent")
-                if key in layer
-            }
-            for layer in enforcement.get("layers", [])
-        ],
+        "outdated": list(enforcement.get("outdated", [])),
+        "layers": layers,
     }
 
 
@@ -104,9 +141,9 @@ class Reader:
             raw_counts[record_branch(record)] += 1
         freshness = self.ledger.snapshot()
         index_state = self.index.stats()
-        enforcement = _reportable_enforcement(self.health.enforcement())
+        enforcement = _reportable_enforcement(self.health.enforcement(), boundary)
         return {
-            "vault": str(self.vault.root),
+            **boundary.installation_facts(vault=str(self.vault.root)),
             "sources": len(visible_records),
             "pending": sum(
                 record.status == "pending" for record in visible_records.values()

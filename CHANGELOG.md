@@ -25,8 +25,85 @@ artifact was built from is the durable record of what shipped.
   dash-leading tokens after `search`/`context`/`ask` are hoisted behind `--`
   before argparse sees them.
 
+### Changed
+
+- **`--json`'s `ok` now means the command succeeded, and agrees with the exit
+  status** ([#10](https://github.com/huglabs/brainskit/issues/10)). `_emit`
+  wrote `"ok": true` as a literal, so `bk lint` with an error and `bk vaults
+  sync` with a failed vault printed `{"ok": true, "result": {…}}` and exited 1.
+  The envelope's `ok` is now `false` whenever the exit is non-zero, with
+  `result` still carrying the findings or the per-vault outcomes. A
+  `bk update --yes` whose upgrade command fails now reports `ok: false` and
+  **exits 1 (it exited 0)**; `state: "unavailable"` — pypi.org unreachable —
+  is unchanged, `ok: true` and exit 0. The MCP `lint` tool reports
+  `isError: true` when lint finds an error. All three read one rule,
+  `succeeded()` in `interfaces/errors.py`; every other command is a report
+  whose answer is its `state` and keeps `ok: true`. Scripts that read `result`
+  only when `ok` is true must read it whenever `result` is present.
+- **A `cloud` consumer is no longer told where the vault lives**
+  ([#12](https://github.com/huglabs/brainskit/issues/12)). Installation facts —
+  absolute local paths — are now inside the privacy boundary
+  ([ADR 0009](docs/knowledge/decisions/architecture/0009-installation-facts-inside-the-privacy-boundary.md)).
+  `/api/status` omits the `vault` key at `--consumer cloud` rather than
+  substituting a label; `local` and `human` are unchanged. Clients that read
+  `vault` from a cloud-scoped status must treat it as optional. The inventory
+  found one more reachable site: `bk code communities --consumer cloud` checked
+  for `networkx` before the boundary, so its install hint, which names local
+  interpreter paths, reached a cloud caller. It now refuses first.
+- **Judgment jobs say when privacy policy narrowed what the model read.**
+  `bk ask`, `bk resurface`, `bk digest` and `bk lint --semantic` report
+  `withheld_sources` in their JSON — a count, never a name, branch or hash — and
+  print "N source(s) withheld from the model by privacy policy" when it is
+  above zero. The web viewer shows the same line under an ask answer.
+
 ### Fixed
 
+- **The Claude Code SessionStart hook counted lint errors as 0** once
+  `bk lint --json` began reporting `ok: false`: it read `result` only from an
+  `ok` document. It now reads any document that carries a `result`.
+  **Re-run `bk hooks install --agent claude`** (no `--force` needed — the
+  managed script is rewritten in place) to refresh an installed copy;
+  `bk status` and `bk doctor` check that the script is installed and
+  registered, not what it says, so they report a stale copy as active.
+- **The release gate now proves both artefacts reached PyPI**
+  ([#7](https://github.com/huglabs/brainskit/issues/7)). The visibility check
+  matched `*"brainskit-$version"*` anywhere in the simple index, so a `v0.6`
+  tag was satisfied by the existing `brainskit-0.6.0-py3-none-any.whl`, and one
+  matching file was enough for a wheel-only or sdist-only upload to go green.
+  `scripts/check-pypi-visibility.sh` requires `brainskit-$V-py3-none-any.whl`
+  and `brainskit-$V.tar.gz` each, anchored as the link text of the index
+  (`>…<`). It runs in its own `visible` job after `publish` — `publish` holds
+  `id-token: write` and still runs no project code — and `github-release` now
+  waits on `visible`. A new first step refuses a PEP 440 local version
+  (`0.8.0+huglabs.1`) on tag push and `workflow_dispatch` alike, so a private
+  build never looks releasable.
+- **`bk code build` no longer graphs the vault itself when the vault is the
+  code root** ([#8](https://github.com/huglabs/brainskit/issues/8)) — a vault
+  outside any repository, or one configured with `code_root: ""`. The
+  exclusion was a path-prefix test, the prefix is empty in exactly that case,
+  and an empty prefix excluded nothing, so `bk init`'s unattended bootstrap
+  build indexed the vault's own files, the hook scripts it had just installed
+  among them. The vault's
+  own directories (`raw/`, `wiki/`, `views/`, `graph/`, `output/`, `.brain/`)
+  are now excluded by name there, and the installed hook scripts by exact path
+  wherever the vault sits. Excluded files count as covered, so `bk code status`
+  does not call the graph `partial` for them. A vault with nothing but itself
+  is refused with `code_root`, why that root was chosen, and the next step:
+  set `code_root` in `.brain/config.json`, then run `bk code build`.
+- **Refusal hints no longer name `--code-only`**
+  ([#11](https://github.com/huglabs/brainskit/issues/11)), a flag no command
+  accepts. `bk code import` of a graph with no code nodes now says only
+  `file_type: "code"` nodes are kept and points at `bk code build`.
+- **`bk forget --force` is no longer undone by the `bk reconcile` that
+  `bk lint` recommends next** ([#9](https://github.com/huglabs/brainskit/issues/9)).
+  `--force` leaves the raw file on disk by definition, and `reconcile`
+  re-registered any hash it did not find. `bk forget` now records a tombstone,
+  keyed by content hash, under `"forgotten"` in `.brain/registry.json`:
+  `reconcile` skips it and reports a `forgotten` count, `bk watch` no longer
+  recaptures it (counted under `forgotten` too), `bk lint` no longer reports it
+  as untracked, and an explicit `bk capture` of the same content clears it.
+  Every other registry writer — an apply, `file` — carries the tombstones over.
+  The key is omitted while empty, so an existing registry is unchanged.
 - **Symlink shadowing under parallel extraction:** a file plus a symlink to
   it raced through the process pool, and the symlink sometimes took the
   credit — the real file contributed nothing while the graph pointed at an
@@ -41,6 +118,57 @@ artifact was built from is the durable record of what shipped.
 - **The unexplained-files gap is persisted** in the code-graph artefact and
   reported by `bk code status` as `partial` with a count, instead of expiring
   with the build output that mentioned it once.
+- **`bk ask` no longer refuses a whole question because search recall brushed
+  a `never-ingest` source** ([#14](https://github.com/huglabs/brainskit/issues/14)).
+  `ask`, `resurface` and `lint --semantic` read their context as the default
+  `human` consumer and relied on the judgment router to refuse any
+  `never-ingest` branch in it — which refused too much (one private hit sank an
+  unrelated question) and too little (a wiki page whose provenance does not
+  resolve yields no branch, so it reached the model). They now read under the
+  `local` boundary after link expansion, so `never-ingest` sources, the pages
+  compiled from them and pages of unresolvable provenance are withheld from the
+  model instead of blocking the call. When every match is withheld the job
+  refuses with `policy_denied` and a hint (`bk search` for ask and resurface,
+  `bk lint` without `--semantic` for lint) instead of calling a model. The
+  router's own refusals are unchanged and remain the last defence — including
+  `local-only` evidence on a cloud-routed `ask`, which still refuses.
+- **`bk digest` no longer tells the model about material its route may not
+  see.** The route is chosen as before — from the `local`-visible recent
+  sources — but is now asked of the router itself (`route_for`, which `run`
+  goes through), and the prompt's status, freshness ledger and filing proposals
+  are held to that route's boundary: `local` for Ollama, `cloud` otherwise.
+  Branch names it may not see, freshness entries for pages compiled from
+  withheld or unresolvable sources, and proposals for such sources are dropped;
+  on a cloud route the vault's absolute path and hook script paths go too
+  (ADR 0009). `withheld_sources` counts the dropped sources, pages and
+  proposals together.
+- **`bk doctor --json`'s `healthy` no longer depends on the optional `code`
+  extra** ([#13](https://github.com/huglabs/brainskit/issues/13),
+  [#24](https://github.com/huglabs/brainskit/issues/24)). It was `false` on
+  every default install, and on the recommended `[code]` extra too, which
+  carries 13 of the 29 grammars. Absent grammars are now a choice; only a
+  broken install counts — a partly installed `[code]` (named in
+  `code.grammars_broken`) or a grammar outside its pinned version. New fields:
+  `code.grammars_state` (`absent`/`complete`/`partial`), `code.extras_complete`
+  (the extras fully installed), and `code.graph_without_grammars` when a vault
+  uses a code graph this machine cannot rebuild — reported, not counted. The
+  install command suggests the smallest useful step: the missing grammars of a
+  partial `[code]`, else `brainskit[code]`, else `brainskit[code-all]`. The
+  text report reads `13/29 (code extra complete)`.
+- **`bk status` and `bk doctor` now detect hook scripts older than this
+  version installs.** A brainskit-generated script is compared with what
+  `bk hooks install` would write now; a stale one is `outdated: true` with a
+  `bk hooks install --agent <agent> [--root …]` hint and is listed in
+  `enforcement.outdated`. An outdated write gate counts as not gated and not
+  healthy; an outdated session-status script is a warning. This closes the gap
+  the SessionStart entry above describes. `/api/status` and the web viewer
+  header report it too (for `cloud`, absolute paths in the hint become
+  `<path>`, ADR 0009), and the SessionStart summary names outdated hooks with
+  the refresh command.
+- **`bk doctor` no longer reports `healthy` for a write gate the agent does
+  not run.** A script that refused the probe but is unregistered or outdated
+  now fails the check, and doctor draws the advisory `instructions` layer as
+  `bk status` does — it used to show a fourth green tick.
 
 - `providers.<name>.reasoning` on the OpenAI-compatible driver, forwarded
   verbatim to the provider. Absent by default, so a model that reasons keeps

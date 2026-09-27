@@ -12,10 +12,10 @@ switches to machine-readable output.
 | `capture [SOURCE] [--text T] [--title T]` | Capture a file, URL or literal text |
 | `status` | Vault health and counts |
 | `doctor` | Health, plus a live probe of the installed write gate |
-| `reconcile` | Heal registry paths after manual moves; drop orphaned freshness |
+| `reconcile` | Heal registry paths after manual moves; register untracked files in `raw/`, except forgotten ones; drop orphaned freshness |
 | `reindex` | Rebuild the disposable FTS5 index |
 | `file` | Move a raw source to a branch |
-| `forget ITEM [--force]` | Drop one source record whose raw file is gone from the registry |
+| `forget ITEM [--force]` | Drop one source record from the registry. Refused while its raw file is on disk unless `--force`; either way it leaves a tombstone, so `reconcile` and `watch` do not register that content again until an explicit `capture` does |
 | `lint [--changed]` | Validate registry and wiki contracts |
 | `search QUERY [--limit N] [--consumer C]` | FTS5 BM25 search |
 | `context QUERY [--limit N] [--max-chars N] [--consumer C]` | Bounded evidence bundle |
@@ -41,7 +41,7 @@ switches to machine-readable output.
 | Command | Purpose |
 |---|---|
 | `ingest [ITEM] [--all]` | Propose a branch, then a schema-valid apply proposal |
-| `ask QUERY` | Answer from compiled vault evidence |
+| `ask QUERY` | Answer from compiled vault evidence; `never-ingest` matches are withheld from the model and counted in `withheld_sources` ([privacy](./privacy.md#judgment-inherits-the-strictest-policy)) |
 | `digest` | Generate the configured digest |
 | `resurface` | Surface one durable insight |
 | `lint --semantic` | Add the `lint-semantic` judgment pass to the structural report |
@@ -79,3 +79,4 @@ operator* when reached directly and *fix your request* through
 ---
 <!-- doc-tracking -->
 - Created: 2026-08-13 15:41
+- Updated: 2026-09-27

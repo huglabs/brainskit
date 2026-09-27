@@ -50,6 +50,7 @@ from brainskit.application.pages import (
 from brainskit.application.ports import SearchIndexPort, VaultPort
 from brainskit.domain.model import (
     BrainskitError,
+    ForgottenSourceError,
     NotConfiguredError,
     SourceRecord,
     ValidationError,
@@ -80,7 +81,12 @@ class Ingestion:
         self.ledger = ledger
 
     def capture(
-        self, source: str | None, *, text: str | None = None, title: str | None = None
+        self,
+        source: str | None,
+        *,
+        text: str | None = None,
+        title: str | None = None,
+        revive: bool = True,
     ) -> dict[str, Any]:
         if text is not None:
             record, created = self.vault.capture_text(
@@ -91,7 +97,7 @@ class Ingestion:
             body = f"# {url_title}\n\n{source}\n"
             record, created = self.vault.capture_text(body, url_title, ".md")
         elif source:
-            record, created = self.vault.capture_file(Path(source))
+            record, created = self.vault.capture_file(Path(source), revive=revive)
         else:
             raise ValidationError("capture requires a source path, URL, or --text")
         self.index.upsert_raw(self.vault, record)
@@ -150,6 +156,7 @@ class Ingestion:
         created = 0
         duplicates = 0
         ignored = 0
+        forgotten = 0
         failures: list[dict[str, str]] = [
             {
                 "path": str(root),
@@ -165,15 +172,18 @@ class Ingestion:
                 if candidate is None:
                     continue
                 try:
-                    result = self.capture(str(candidate))
+                    result = self.capture(str(candidate), revive=False)
                     created += int(result["created"])
                     duplicates += int(not result["created"])
+                except ForgottenSourceError:
+                    forgotten += 1
                 except (BrainskitError, OSError) as exc:
                     failures.append({"path": str(candidate), "error": str(exc)})
         return {
             "created": created,
             "duplicates": duplicates,
             "ignored": ignored,
+            "forgotten": forgotten,
             "failures": failures,
         }
 

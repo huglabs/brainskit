@@ -741,6 +741,26 @@ class WatchIgnoreTest(unittest.TestCase):
         self.assertNotIn("note.md", names)
         self.assertIn("index.js", names)
 
+    def test_a_watch_does_not_recapture_a_forgotten_source(self) -> None:
+        # The watched folder still holds the original, so without a tombstone
+        # the next unattended sweep captured it again. Only an explicit
+        # `bk capture` is a deliberate re-add.
+        service = self.service("vault")
+        service.watch_once()
+        readme = next(
+            record
+            for record in service.vault.registry().values()
+            if record.original_name == "README.md"
+        )
+        service.forget(readme.content_hash, force=True)
+
+        result = service.watch_once()
+
+        self.assertEqual(self.captured(service), ["note.md"])
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["forgotten"], 1)
+        self.assertEqual(result["failures"], [])
+
     def test_the_vault_is_never_a_source_of_itself(self) -> None:
         # A watch pointed at a parent of the vault would otherwise re-capture
         # raw/ into itself on every tick.
@@ -1537,6 +1557,118 @@ class ReaderStatusMatchesCanonicalTest(ServiceFixture):
         local = self.service.reader_status(consumer="local")
         self.assertEqual(local["lint_errors"], 1)
         self.assertFalse(local["healthy"])
+
+
+class InstallationFactsStayInsideTheBoundaryTest(ServiceFixture):
+    """ADR 0009: where the vault lives is inside the privacy boundary.
+
+    `reader_status` returned `"vault": str(self.vault.root)` to every consumer
+    while filtering every other key on the same response, so a `cloud` caller
+    was told this machine's layout -- the same class of fact as a filename or a
+    branch name, which the boundary already withholds. Every consumer-scoped
+    read is scanned here, not just the one that leaked, so the next response to
+    grow a path key fails this instead of shipping.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        public = self.capture_into("30-public", text="Nota publica.", title="publica")
+        self.public_page = self.upsert_page("publica", "Publica", "Publica. ", public)
+        self.capture_into("20-research", text="Nota local.", title="local")
+        self.markers = {
+            str(self.root),
+            str(self.vault.root),
+            str(Path.home()),
+        }
+
+    def cloud_responses(self) -> dict[str, Any]:
+        service = self.service
+        return {
+            "reader_status": service.reader_status(consumer="cloud"),
+            "browse_sources": service.browse_sources(consumer="cloud"),
+            "browse_pages": service.browse_pages(consumer="cloud"),
+            "timeline": service.timeline(consumer="cloud"),
+            "read_resource": service.read_resource(
+                f"page:{self.public_page}", consumer="cloud"
+            ),
+            "proposals_for_consumer": service.proposals_for_consumer(
+                consumer="cloud"
+            ),
+            "graph_data": service.graph_data(consumer="cloud"),
+            "enrich_list": service.enrich_list(consumer="cloud"),
+            "integration_status": service.integration_status(consumer="cloud"),
+            "search": service.search("publica", consumer="cloud"),
+            "context": service.context("publica", consumer="cloud"),
+        }
+
+    def test_no_cloud_response_names_an_absolute_local_path(self) -> None:
+        for name, response in self.cloud_responses().items():
+            with self.subTest(response=name):
+                blob = json.dumps(response, ensure_ascii=False)
+                for marker in self.markers:
+                    self.assertNotIn(marker, blob)
+
+    def test_the_key_is_omitted_rather_than_blanked(self) -> None:
+        """Absent, like a redacted source: nothing a client has to test for."""
+
+        status = self.service.reader_status(consumer="cloud")
+        self.assertNotIn("vault", status)
+        self.assertEqual(status["consumer"], "cloud")
+        self.assertEqual(status["sources"], 1)
+
+    def test_local_and_human_still_see_where_the_vault_lives(self) -> None:
+        for consumer in ("local", "human"):
+            with self.subTest(consumer=consumer):
+                status = self.service.reader_status(consumer=consumer)
+                self.assertEqual(status["vault"], str(self.vault.root))
+
+
+class OutdatedHookReachesTheViewerTest(unittest.TestCase):
+    """`/api/status` carries an outdated hook, and its hint, under ADR 0009.
+
+    `_reportable_enforcement` kept a fixed set of keys, so the `outdated` rows
+    `Health` now reports never reached the viewer: a stale session-status script
+    misreported the vault and nothing on that surface said so. The vault is
+    nested in a project here so the hint carries `--root <workspace>`, the one
+    enforcement field that can name a local path.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.project = Path(self.temporary.name).resolve()
+        vault = FileVault.initialize(self.project / "docs" / "brain", policy())
+        self.service = BrainskitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+        self.service.install_agent("claude", root=str(self.project))
+        script = self.project / ".claude" / "hooks" / "brainskit-status.sh"
+        script.write_text(
+            script.read_text(encoding="utf-8") + "# from an older brainskit\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def session_status(self, consumer: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        enforcement = self.service.reader_status(consumer=consumer)["enforcement"]
+        layer = {item["layer"]: item for item in enforcement["layers"]}
+        return enforcement, layer["session_status"]
+
+    def test_local_sees_the_outdated_layer_and_the_exact_command(self) -> None:
+        enforcement, layer = self.session_status("local")
+        self.assertEqual(enforcement["outdated"], ["session_status"])
+        self.assertTrue(layer["outdated"])
+        self.assertIn(f"--root {self.project}", layer["hint"])
+
+    def test_cloud_sees_the_outdated_layer_but_no_path(self) -> None:
+        enforcement, layer = self.session_status("cloud")
+        self.assertEqual(enforcement["outdated"], ["session_status"])
+        self.assertTrue(layer["outdated"])
+        self.assertEqual(layer["hint"], "bk hooks install --agent claude --root <path>")
+        blob = json.dumps(enforcement, ensure_ascii=False)
+        for marker in (str(self.project), str(Path.home())):
+            self.assertNotIn(marker, blob)
 
 
 if __name__ == "__main__":

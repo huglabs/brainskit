@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -13,16 +14,19 @@ from contextlib import redirect_stderr
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from brainskit.application import jobs as jobs_module
 from brainskit.application.jobs import MAX_HISTORY_CHARS, MAX_HISTORY_EXCHANGES
 from brainskit.application.ports import ApplyPlan
 from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     ConflictError,
+    NotConfiguredError,
     PolicyError,
     ValidationError,
     VaultConfig,
@@ -31,7 +35,11 @@ from brainskit.domain.model import (
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.integrations import NativeIntegrations
-from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
+from brainskit.infrastructure.llm import (
+    LOCAL_PROVIDERS,
+    JobSpecs,
+    PolicyJudgmentRouter,
+)
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces.mcp import (
     MCP_PROTOCOL_VERSION,
@@ -100,6 +108,21 @@ class FakeJudgment:
         values = self.responses[job]
         value = values.pop(0) if len(values) > 1 else values[0]
         return value if isinstance(value, str) else json.dumps(value)
+
+
+class RoutedFakeJudgment(FakeJudgment):
+    """A fake that answers canned output but routes like the real router.
+
+    `route_for` is the router's own, so a test asserting on the reported
+    provider/model pins the one owner of that decision, not a copy of it.
+    """
+
+    def __init__(self, responses: dict[str, list[dict | str]], config: VaultConfig):
+        super().__init__(responses)
+        self.router = PolicyJudgmentRouter(config, JobSpecs())
+
+    def route_for(self, *, job, branches):
+        return self.router.route_for(job=job, branches=branches)
 
 
 class EngineTest(unittest.TestCase):
@@ -233,6 +256,64 @@ class EngineTest(unittest.TestCase):
         self.assertIn(content_hash, self.vault.registry())
 
         self.service.forget(content_hash, force=True)
+        self.assertNotIn(content_hash, self.vault.registry())
+
+    def test_forget_force_is_not_undone_by_reconcile(self) -> None:
+        # `--force` leaves the raw file on disk by definition, and reconcile
+        # walks raw/ re-registering every hash it does not know. Without a
+        # tombstone the documented next step brought the source straight back.
+        captured = self.service.capture(None, text="Drop me", title="Drop me")
+        content_hash = captured["source"]["content_hash"]
+        self.service.forget(content_hash, force=True)
+
+        result = self.service.reconcile()
+
+        self.assertNotIn(content_hash, self.vault.registry())
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(result["forgotten"], 1)
+        self.assertTrue((self.root / captured["source"]["path"]).is_file())
+        findings = {finding["code"] for finding in self.service.lint()["findings"]}
+        self.assertNotIn("registry.untracked_file", findings)
+
+    def test_a_forgotten_source_moved_on_disk_stays_forgotten(self) -> None:
+        captured = self.service.capture(None, text="Wander", title="Wander")
+        content_hash = captured["source"]["content_hash"]
+        self.service.forget(content_hash, force=True)
+        (self.root / captured["source"]["path"]).rename(self.root / "raw/20-research/moved.md")
+
+        self.service.reconcile()
+
+        self.assertNotIn(content_hash, self.vault.registry())
+        findings = {finding["code"] for finding in self.service.lint()["findings"]}
+        self.assertNotIn("registry.untracked_file", findings)
+
+    def test_an_explicit_capture_re_adds_forgotten_content(self) -> None:
+        captured = self.service.capture(None, text="Come back", title="Come back")
+        content_hash = captured["source"]["content_hash"]
+        self.service.forget(content_hash, force=True)
+
+        again = self.service.capture(None, text="Come back", title="Come back")
+
+        self.assertTrue(again["created"])
+        self.assertIn(content_hash, self.vault.registry())
+        (self.root / again["source"]["path"]).unlink()
+        self.service.forget(content_hash)
+        self.service.capture(None, text="Come back", title="Come back")
+        self.service.reconcile()
+        self.assertIn(content_hash, self.vault.registry())
+
+    def test_an_unrelated_registry_write_keeps_the_tombstone(self) -> None:
+        captured = self.service.capture(None, text="Stay gone", title="Stay gone")
+        content_hash = captured["source"]["content_hash"]
+        self.service.forget(content_hash, force=True)
+
+        self.service.capture(None, text="Something else", title="Else")
+        self.service.file(
+            self.service.capture(None, text="Filed", title="Filed")["source"]["content_hash"],
+            "20-research",
+        )
+        self.service.reconcile()
+
         self.assertNotIn(content_hash, self.vault.registry())
 
     def test_forget_reports_pages_still_citing_it(self) -> None:
@@ -1272,6 +1353,40 @@ class EngineTest(unittest.TestCase):
             "let short=unc.length<=40;"
             "escText(b,short?'uncertainty '+unc:'uncertainty')",
             WEB_VIEWER_HTML,
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "requires node to run the viewer JS")
+    def test_web_viewer_ask_answer_says_how_many_sources_were_withheld(self) -> None:
+        # U1: an answer built without some evidence has to say so, or it reads
+        # as complete. Count only -- a withheld source contributes nothing
+        # else, not its name and not its branch. The real function runs here
+        # against a stub DOM, so the assertion is about what renders, not
+        # about a substring of the source that could survive a broken branch.
+        source = re.search(r"\nfunction chatAnswerCard\(r\)\{.*?\n", WEB_VIEWER_HTML)
+        escape = re.search(r"\nfunction escText\(el,value\)\{.*?\n", WEB_VIEWER_HTML)
+        self.assertIsNotNone(source)
+        self.assertIsNotNone(escape)
+        # The viewer only shows what `sendChat` copies onto the stored turn.
+        self.assertIn("withheld_sources:Number(r.withheld_sources)||0", WEB_VIEWER_HTML)
+        harness = (
+            "function el(){return {children:[],className:'',textContent:'',"
+            "innerHTML:'',append(...c){this.children.push(...c)}}}\n"
+            "const document={createElement:el};const mdToHtml=s=>s;\n"
+            f"{escape.group(0)}{source.group(0)}"
+            "const lines=n=>chatAnswerCard({answer:'a',withheld_sources:n})"
+            ".children[1].children.filter(c=>c.className==='chat-withheld')"
+            ".map(c=>c.textContent);\n"
+            "console.log(JSON.stringify([lines(0),lines(1),lines(3),lines(undefined)]));"
+        )
+        completed = subprocess.run(
+            ["node", "-e", harness], capture_output=True, text=True, check=True
+        )
+        none, one, three, absent = json.loads(completed.stdout)
+        self.assertEqual(none, [])
+        self.assertEqual(absent, [])
+        self.assertEqual(one, ["1 source withheld from the model by privacy policy"])
+        self.assertEqual(
+            three, ["3 sources withheld from the model by privacy policy"]
         )
 
     def test_web_viewer_collection_filters_are_derived_from_loaded_data(self) -> None:
@@ -2538,7 +2653,7 @@ class AskConversationHistoryTest(unittest.TestCase):
     def test_ask_result_names_the_answering_provider_and_model(self) -> None:
         # Read from the same `job_models.query` mapping the router resolves,
         # not hardcoded: the engine policy routes query to ollama/test.
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         result = service.ask("e sobre o code graph?")
         self.assertEqual(result["provider"], "ollama")
@@ -2555,7 +2670,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             vault = FileVault.initialize(Path(scratch), raw)
             index = SqliteFtsIndex(vault.index_path)
-            fake = FakeJudgment({"query": [self._answer()]})
+            fake = RoutedFakeJudgment({"query": [self._answer()]}, vault.config())
             service = BrainskitService(
                 vault, index, judgment=fake, jobs=JobSpecs(), graph=MarkdownGraph()
             )
@@ -2567,6 +2682,426 @@ class AskConversationHistoryTest(unittest.TestCase):
         self.assertEqual(result["model"], "local-model")
 
 
+class _RecordingDriver:
+    def __init__(self, response: dict) -> None:
+        self.response = response
+        self.prompts: list[str] = []
+
+    def complete(self, prompt: str, *, model: str, output_schema=None) -> str:
+        self.prompts.append(prompt)
+        return json.dumps(self.response)
+
+
+class JudgmentWithholdsNeverIngestEvidenceTest(unittest.TestCase):
+    """A `never-ingest` match narrows what reaches the model; it does not
+    refuse the question (#14).
+
+    `ask` used to read its evidence as the unrestricted `human` consumer and
+    hand every contributing branch to the router, which refused the whole
+    call when BM25 recall brushed one never-ingest source -- on a question
+    that had nothing to do with it. The real router runs here, so its refusal
+    stays the last line of defence and any evidence that slipped through
+    would fail these tests rather than reach the recording driver.
+    """
+
+    PRIVATE_TEXT = "Platform team salary ledger zebra-omega figures."
+    PRIVATE_TITLE = "Salary ledger"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = self.seed.capture(
+            None, text=self.PRIVATE_TEXT, title=self.PRIVATE_TITLE
+        )
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = self.seed.file(self.private_hash, "10-work")["source"][
+            "path"
+        ]
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _capture_public(self, text: str, title: str) -> str:
+        public = self.seed.capture(None, text=text, title=title)
+        public_hash = public["source"]["content_hash"]
+        self.seed.file(public_hash, "20-research")
+        return str(public_hash)
+
+    def _run(self, response: dict, call):
+        driver = _RecordingDriver(response)
+        router = PolicyJudgmentRouter(self.vault.config(), JobSpecs())
+        service = BrainskitService(
+            self.vault, self.index, judgment=router, jobs=JobSpecs(), graph=MarkdownGraph()
+        )
+        with mock.patch(
+            "brainskit.infrastructure.llm._create_driver", return_value=driver
+        ):
+            return call(service), driver
+
+    def _assert_nothing_private(self, text: str) -> None:
+        for disclosure in (
+            "zebra-omega",
+            self.PRIVATE_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "10-work",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def _answer(self) -> dict:
+        return {"answer": "x", "citations": [], "uncertainty": ""}
+
+    def test_ask_answers_from_the_permissible_evidence_and_counts_the_rest(
+        self,
+    ) -> None:
+        self._capture_public("Platform team ships on Fridays.", "Platform cadence")
+        result, driver = self._run(
+            self._answer(), lambda service: service.ask("platform team")
+        )
+        self.assertEqual(result["answer"], "x")
+        self.assertEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("Fridays", driver.prompts[0])
+        self._assert_nothing_private(driver.prompts[0])
+        self._assert_nothing_private(json.dumps(result, ensure_ascii=False))
+
+    def test_a_page_compiled_from_never_ingest_evidence_is_withheld_too(
+        self,
+    ) -> None:
+        # Privacy after expansion: the derived page is reachable both as a
+        # direct hit and as the public page's link neighbour, and neither
+        # route may carry it to the model.
+        public_hash = self._capture_public(
+            "Platform team ships on Fridays.", "Platform cadence"
+        )
+        self.seed.apply(
+            {
+                "operations": [
+                    {
+                        "action": "upsert",
+                        "kind": "concept",
+                        "slug": "platform-cadence",
+                        "title": "Platform cadence",
+                        "aliases": [],
+                        "source_hashes": [public_hash],
+                        "body": (
+                            "Platform team ships on Fridays, see [[team-pay]]."
+                            f"[^source:{public_hash}]"
+                        ),
+                        "links": ["team-pay"],
+                    },
+                    {
+                        "action": "upsert",
+                        "kind": "concept",
+                        "slug": "team-pay",
+                        "title": "Team pay",
+                        "aliases": [],
+                        "source_hashes": [self.private_hash],
+                        "body": (
+                            "Platform team pay is zebra-omega."
+                            f"[^source:{self.private_hash}]"
+                        ),
+                        "links": [],
+                    },
+                ]
+            }
+        )
+        result, driver = self._run(
+            self._answer(), lambda service: service.ask("platform team")
+        )
+        self.assertGreaterEqual(result["withheld_sources"], 2)
+        self.assertEqual(len(driver.prompts), 1)
+        self._assert_nothing_private(driver.prompts[0])
+        # The public page's own `[[team-pay]]` link is its authored content;
+        # what must not arrive is the restricted page itself.
+        self.assertNotIn("concepts/team-pay.md", driver.prompts[0])
+        self.assertNotIn("Team pay", driver.prompts[0])
+
+    def test_only_never_ingest_matches_is_an_actionable_refusal(self) -> None:
+        with self.assertRaises(PolicyError) as caught:
+            self._run(self._answer(), lambda service: service.ask("salary ledger"))
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("bk search", details["hint"])
+        self._assert_nothing_private(
+            json.dumps(
+                {"message": str(caught.exception), "details": details},
+                ensure_ascii=False,
+            )
+        )
+
+    def test_a_question_nothing_matches_still_reaches_the_model(self) -> None:
+        # Refusing is reserved for "everything relevant was withheld"; an
+        # unanswerable question is the model's to say so.
+        result, driver = self._run(
+            self._answer(), lambda service: service.ask("kubernetes autoscaling")
+        )
+        self.assertEqual(result["withheld_sources"], 0)
+        self.assertEqual(len(driver.prompts), 1)
+
+    def test_resurface_narrows_the_same_way(self) -> None:
+        private = self.seed.capture(
+            None, text="Salary ledger durable insight zebra-omega.", title="Pay"
+        )
+        self.seed.file(private["source"]["content_hash"], "10-work")
+        self._capture_public(
+            "Durable insight worth revisiting: ship small.", "Ship small"
+        )
+        result, driver = self._run(
+            {"markdown": "x", "page": "wiki/index.md", "question": "q"},
+            lambda service: service.jobs_runner.resurface(),
+        )
+        self.assertGreaterEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("ship small", driver.prompts[0])
+        self.assertNotIn("zebra-omega", driver.prompts[0])
+
+    def test_digest_metadata_names_nothing_the_boundary_withholds(self) -> None:
+        # The digest already filtered its source list, then handed the model
+        # `bk status` (branch names) and the freshness ledger (page paths and
+        # their source hashes) unfiltered.
+        public_hash = self._capture_public(
+            "Platform team ships on Fridays.", "Platform cadence"
+        )
+        self.seed.apply(
+            {
+                "operations": [
+                    {
+                        "action": "upsert",
+                        "kind": "concept",
+                        "slug": "platform-cadence",
+                        "title": "Platform cadence",
+                        "aliases": [],
+                        "source_hashes": [public_hash],
+                        "body": f"Ships on Fridays.[^source:{public_hash}]",
+                        "links": [],
+                    },
+                    {
+                        "action": "upsert",
+                        "kind": "concept",
+                        "slug": "team-pay",
+                        "title": "Team pay",
+                        "aliases": [],
+                        "source_hashes": [self.private_hash],
+                        "body": f"Pay is zebra-omega.[^source:{self.private_hash}]",
+                        "links": [],
+                    },
+                ]
+            }
+        )
+        result, driver = self._run(
+            {"markdown": "x", "actions": [], "resurfaced": ""},
+            lambda service: service.digest(),
+        )
+        self.assertEqual(len(driver.prompts), 1)
+        prompt = driver.prompts[0]
+        self._assert_nothing_private(prompt)
+        self.assertNotIn("team-pay", prompt)
+        self.assertIn("20-research", prompt)
+        self.assertIn("wiki/concepts/platform-cadence.md", prompt)
+        self.assertEqual(result["withheld_sources"], 2)
+        # A local route may be told where the vault lives (ADR 0009).
+        self.assertIn(str(self.vault.root), prompt)
+
+    def test_a_cloud_routed_digest_names_no_local_only_branch_or_local_path(
+        self,
+    ) -> None:
+        # The route is chosen from the recent sources, exactly as before, so
+        # a cloud route needs a local-only source outside the 50 most recent.
+        # Its branch, and the page compiled from it, still reached the cloud
+        # model through `bk status` and the freshness ledger, along with the
+        # vault's absolute path and the hook script paths.
+        raw = policy()
+        raw["inbox_policy"]["privacy"] = "cloud"
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"]["digest"] = {"provider": "openai", "model": "test"}
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            vault = FileVault.initialize(root, raw)
+            index = SqliteFtsIndex(vault.index_path)
+            seed = BrainskitService(vault, index, graph=MarkdownGraph())
+            research = seed.capture(None, text="Lab notebook entry.", title="Lab")
+            research_hash = research["source"]["content_hash"]
+            seed.file(research_hash, "20-research")
+            seed.apply(
+                {
+                    "operations": [
+                        {
+                            "action": "upsert",
+                            "kind": "concept",
+                            "slug": "lab-notebook",
+                            "title": "Lab notebook",
+                            "aliases": [],
+                            "source_hashes": [research_hash],
+                            "body": f"Entry.[^source:{research_hash}]",
+                            "links": [],
+                        }
+                    ]
+                }
+            )
+            for number in range(50):
+                seed.capture(None, text=f"Public note {number}.", title=f"n{number}")
+            driver = _RecordingDriver({"markdown": "x", "actions": [], "resurfaced": ""})
+            service = BrainskitService(
+                vault,
+                index,
+                judgment=PolicyJudgmentRouter(vault.config(), JobSpecs()),
+                jobs=JobSpecs(),
+                graph=MarkdownGraph(),
+            )
+            with mock.patch(
+                "brainskit.infrastructure.llm._create_driver", return_value=driver
+            ):
+                result = service.digest()
+        prompt = driver.prompts[0]
+        for disclosure in (
+            "20-research",
+            "lab-notebook",
+            research_hash,
+            str(root),
+            str(root.resolve()),
+            "/.claude/hooks/",
+        ):
+            self.assertNotIn(disclosure, prompt)
+        self.assertIn("n49.md", prompt)
+        self.assertIn("brainskit-gate.sh is not installed", prompt)
+        self.assertGreaterEqual(result["withheld_sources"], 1)
+
+    def test_digest_drops_review_reasons_and_proposals_naming_withheld_sources(
+        self,
+    ) -> None:
+        from brainskit.application.jobs import _freshness_within, _proposals_within
+        from brainskit.application.privacy import for_consumer
+
+        public_hash = self._capture_public("Ships on Fridays.", "Cadence")
+        boundary = for_consumer("local", self.vault)
+        freshness, withheld_pages = _freshness_within(
+            boundary,
+            {
+                "pages": {
+                    "wiki/index.md": {"review_reason": None},
+                    "wiki/log.md": {
+                        "review_reason": f"related source:{self.private_hash}"
+                    },
+                }
+            },
+        )
+        self.assertEqual(list(freshness["pages"]), ["wiki/index.md"])
+        self.assertEqual(withheld_pages, 1)
+        proposals, withheld_proposals = _proposals_within(
+            boundary,
+            {
+                "count": 2,
+                "proposals": [
+                    {"source_hash": public_hash, "destination_branch": "20-research"},
+                    {"source_hash": self.private_hash, "destination_branch": "10-work"},
+                ],
+            },
+        )
+        self.assertEqual(proposals["count"], 1)
+        self.assertEqual(withheld_proposals, 1)
+        self.assertNotIn(self.private_hash, json.dumps(proposals))
+
+
+class DigestBoundaryFollowsTheRouterTest(unittest.TestCase):
+    """The boundary `digest` filters under is the router's route, not a copy.
+
+    `digest` decides what may enter its prompt before the prompt exists, from
+    `PolicyJudgmentRouter.route_for` -- the method `run` itself routes through.
+    These pin the two to each other: whatever provider the driver is actually
+    created for, the metadata was filtered for that provider's side of the
+    machine boundary.
+    """
+
+    DIGEST: ClassVar[dict] = {"markdown": "x", "actions": [], "resurfaced": ""}
+
+    def _config(self, *, inbox: str, digest: dict) -> dict:
+        raw = policy()
+        raw["inbox_policy"]["privacy"] = inbox
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"]["digest"] = digest
+        return raw
+
+    def _digest(self, raw: dict, *, routed: bool = True):
+        consumers: list[str] = []
+        providers: list[str] = []
+        real_for_consumer = jobs_module.for_consumer
+
+        def spy_for_consumer(consumer, vault):
+            consumers.append(str(consumer))
+            return real_for_consumer(consumer, vault)
+
+        def spy_create_driver(name, config):
+            providers.append(name)
+            return _RecordingDriver(self.DIGEST)
+
+        with tempfile.TemporaryDirectory() as scratch:
+            vault = FileVault.initialize(Path(scratch), raw)
+            index = SqliteFtsIndex(vault.index_path)
+            judgment = (
+                PolicyJudgmentRouter(vault.config(), JobSpecs())
+                if routed
+                else FakeJudgment({"digest": [self.DIGEST]})
+            )
+            service = BrainskitService(
+                vault, index, judgment=judgment, jobs=JobSpecs(), graph=MarkdownGraph()
+            )
+            service.capture(None, text="A note.", title="Note")
+            with (
+                mock.patch.object(jobs_module, "for_consumer", spy_for_consumer),
+                mock.patch(
+                    "brainskit.infrastructure.llm._create_driver", spy_create_driver
+                ),
+            ):
+                service.digest()
+        chosen = "cloud" if "cloud" in consumers else "local"
+        return chosen, providers
+
+    def test_the_chosen_boundary_matches_the_provider_the_router_calls(self) -> None:
+        keyed = {
+            "local-only": {"provider": "ollama", "model": "m"},
+            "cloud": {"provider": "openai", "model": "m"},
+        }
+        cases = {
+            "ollama": ("local-only", {"provider": "ollama", "model": "m"}),
+            "cloud provider": ("cloud", {"provider": "openai", "model": "m"}),
+            "ollama for cloud content": ("cloud", {"provider": "ollama", "model": "m"}),
+            "keyed, local-only content": ("local-only", keyed),
+            "keyed, cloud content": ("cloud", keyed),
+        }
+        for name, (inbox, digest) in cases.items():
+            with self.subTest(case=name):
+                chosen, providers = self._digest(
+                    self._config(inbox=inbox, digest=digest)
+                )
+                self.assertEqual(len(providers), 1)
+                self.assertEqual(
+                    chosen == "local", providers[0] in LOCAL_PROVIDERS
+                )
+
+    def test_a_port_that_cannot_route_is_treated_as_cloud(self) -> None:
+        chosen, _ = self._digest(
+            self._config(inbox="local-only", digest={"provider": "ollama", "model": "m"}),
+            routed=False,
+        )
+        self.assertEqual(chosen, "cloud")
+
+    def test_an_unroutable_digest_refuses_before_any_prompt_exists(self) -> None:
+        raw = self._config(inbox="cloud", digest={"provider": "ollama", "model": "m"})
+        del raw["job_models"]["digest"]
+        with self.assertRaises(NotConfiguredError):
+            self._digest(raw)
+
+
 class WebAskHistoryTest(unittest.TestCase):
     """`/api/ask` validates conversation history strictly at the boundary."""
 
@@ -2574,8 +3109,9 @@ class WebAskHistoryTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
-        self.fake = FakeJudgment(
-            {"query": [{"answer": "resposta", "citations": [], "uncertainty": ""}]}
+        self.fake = RoutedFakeJudgment(
+            {"query": [{"answer": "resposta", "citations": [], "uncertainty": ""}]},
+            self.vault.config(),
         )
         self.service = BrainskitService(
             self.vault,

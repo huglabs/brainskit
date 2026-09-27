@@ -27,6 +27,7 @@ from brainskit.interfaces.errors import (
     jsonrpc_error_data,
     present,
     refusal_envelope,
+    succeeded,
 )
 
 #: MCP is a machine surface, and this is the scope it reads under wherever no
@@ -459,7 +460,7 @@ def _handle(
                     }
                 ],
                 "structuredContent": value,
-                "isError": False,
+                "isError": not succeeded(name, None, value),
             },
         )
     if method == "resources/list":

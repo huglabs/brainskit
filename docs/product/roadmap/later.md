@@ -33,7 +33,7 @@ citation yet.
 | ID | Intent | Issue |
 |----|--------|-------|
 | T1 | `bk init`'s "Next" block lists three commands that all fail from where it leaves you | [#23](https://github.com/huglabs/brainskit/issues/23) |
-| T2 | The recommended `[code]` extra still lands on grammars 13/29 and `healthy: false` | [#24](https://github.com/huglabs/brainskit/issues/24) |
+| T2 | The recommended `[code]` extra still lands on grammars 13/29 and `healthy: false`. **Fixed on `release-0.8.0`, pending release**, by the same change as P4 ([`next.md`](next.md)): 13/29 is what the extra carries, so the report now reads `13/29 (code extra complete)`, and `healthy` no longer depends on the extra | [#24](https://github.com/huglabs/brainskit/issues/24) |
 | T3 | The no-graph hint names `bk code import`, but the docs — and a fresh user — need `bk code build` | [#25](https://github.com/huglabs/brainskit/issues/25) |
 | T4 | `bk init`'s header reports 4 ollama models; the picker offers 3 | [#26](https://github.com/huglabs/brainskit/issues/26) |
 | T5 | `output/` layout: `resurface/` is undocumented, `reports/` is never written | [#27](https://github.com/huglabs/brainskit/issues/27) |
@@ -109,3 +109,4 @@ paths.
 - Updated: 2026-08-13 15:51
 - Updated: 2026-08-13 17:06
 - Updated: 2026-08-13 17:07
+- Updated: 2026-09-27

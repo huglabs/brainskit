@@ -31,7 +31,7 @@ from test_projections import policy
 
 from brainskit.application.codegraph import CODE_PROJECTION
 from brainskit.application.services import BrainskitService
-from brainskit.domain.model import ValidationError
+from brainskit.domain.model import RefusalError, ValidationError
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.vault import FileVault
@@ -337,16 +337,26 @@ class MissingNetworkxTest(AnalysisFixture):
         self._reset_analysis_cache()
         self.assertEqual(result["summary"], "no changes")
 
-    def test_the_refusal_is_checked_before_the_privacy_boundary(self) -> None:
-        # Either order would be defensible; what matters is that a caller
-        # sees one clear reason rather than whichever guard happened to run
-        # first looking arbitrary. Missing-dependency is checked first here.
+    def test_the_privacy_boundary_is_checked_before_the_dependency(self) -> None:
+        """ADR 0009 picks the order this test once called arbitrary.
+
+        Missing-dependency used to be checked first, and its error carries an
+        install command naming the `uv` and interpreter paths -- installation
+        facts, which a `cloud` consumer is never told. The refusal runs first,
+        as it does for every other code-graph read.
+        """
+
+        from brainskit.interfaces.errors import error_envelope
+
         self._reset_analysis_cache()
         with self._blocked():
             with self.assertRaises(ValidationError) as caught:
                 self.service.code_communities(consumer="cloud")
         self._reset_analysis_cache()
-        self.assertIn("brainskit[code]", caught.exception.details["needs"])
+        self.assertIsInstance(caught.exception, RefusalError)
+        blob = json.dumps(error_envelope(caught.exception), ensure_ascii=False)
+        for marker in (str(Path.home()), sys.executable, sys.prefix):
+            self.assertNotIn(marker, blob)
 
 
 class VendoredAnalysisImportTest(unittest.TestCase):

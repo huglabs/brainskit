@@ -105,6 +105,16 @@ class RefusalError(ValidationError):
     code = "refused"
 
 
+class ForgottenSourceError(RefusalError):
+    """An unattended capture met content an operator deliberately forgot.
+
+    Only a `bk watch` sweep asks for this refusal; an explicit `bk capture` is
+    the deliberate re-add and clears the tombstone instead. Shares `refused`
+    rather than adding a code of its own, because the one caller catches it and
+    counts it -- it never reaches a surface.
+    """
+
+
 class ModelResponseError(ValidationError):
     """A provider's *output* failed validation, not anything the caller sent.
 
@@ -214,6 +224,11 @@ LEGACY_WIKI_DIRECTORIES: dict[str, str] = {
     for kind in PageKind
     if f"{kind.value}s" != PAGE_DIRECTORIES[kind]
 }
+
+#: Every top-level directory a vault owns. A scan of a tree the vault sits at
+#: the root of -- `bk code build` on a vault outside any repository -- has
+#: nothing but these names to tell the vault's files from the project's.
+VAULT_DIRECTORIES: tuple[str, ...] = ("raw", "wiki", "views", "graph", "output", ".brain")
 
 
 def _guard_page_directories() -> None:

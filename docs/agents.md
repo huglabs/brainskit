@@ -57,7 +57,33 @@ file is ever created. When the hook fails open it explains itself on stderr, and
 that sentence is repeated back as `hook_said` because it names the missing piece
 better than an exit code can. `doctor` reports `healthy: false` for every state
 except `enforcing` and `absent` — an installed gate that does not guard is worse
-than none, because everything else goes on reporting success.
+than none, because everything else goes on reporting success. `enforcing` also
+needs `status` to agree that the gate is live (`gated: true`). The probe runs the
+script directly, so it can pass for a script the agent never runs, or for an
+outdated copy.
+
+`healthy` does not depend on the optional `[code]` extra. A default install with
+no tree-sitter grammar can report `healthy: true`, so CI can gate on it. Only a
+*broken* grammar install counts against it. See
+[the code graph](code-graph.md#what-needs-the-extra).
+
+### Outdated hook scripts
+
+Every hook script the installer writes carries a `# brainskit:generated` marker.
+`bk status` and `bk doctor` compare each marked script against what
+`bk hooks install` would write now, using the installer's own renderer. A copy
+left by an older brainskit is reported with `outdated: true` on its layer, in
+`enforcement.outdated`, and with the fix in `hint`: `bk hooks install --agent
+<agent>`, plus `--root` when the install recorded a workspace other than the
+vault.
+
+| Layer | When outdated | Why |
+|---|---|---|
+| `write_gate` | `active: false`, so `gated: false` and `healthy: false` | a stale gate may enforce rules that have since changed |
+| `session_status` | stays active, reported as a warning; `healthy` is unaffected | it is observability: it can misreport the vault, but it lets no write through |
+
+A script without the marker belongs to you. It is not judged, and a reinstall
+leaves it in place unless you pass `--force`.
 
 A repository whose `core.hooksPath` points somewhere other than `.git/hooks` —
 which is what Husky sets, and what any repository may set globally — gets no
@@ -139,3 +165,8 @@ once rather than per file inside them.
 
 The vault's own directory is always excluded, so a source folder that contains
 the vault cannot re-capture `raw/` into itself.
+
+Nor does it bring back a source you `bk forget`: the forget leaves a tombstone
+keyed by content hash, a sweep that meets that content again counts it under
+`forgotten` instead of capturing it, and only an explicit `bk capture` re-adds
+it.

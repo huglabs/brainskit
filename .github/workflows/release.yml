@@ -36,6 +36,22 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # A PEP 440 local version (`0.8.0+huglabs.1`) names a private build. PyPI
+      # refuses it anyway, but only after the whole gate has run and the upload
+      # has been attempted; refused here, before anything is installed, and on
+      # workflow_dispatch too, so a private tree never looks releasable.
+      - name: "[project].version is publishable"
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          case "$version" in
+            *+*)
+              echo "[project].version $version is a local version; it names a private" >&2
+              echo "build and must never be published through this workflow" >&2
+              exit 1
+              ;;
+          esac
+          echo "brainskit $version is publishable"
+
       # The tag is the durable record of which tree produced a version, so a
       # tag that disagrees with the metadata would make that record a lie.
       - name: the tag matches [project].version
@@ -88,36 +104,30 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-      # A release step that cannot fail is not a gate. `v0.5.0` failed three
-      # times on `invalid-publisher` -- PyPI had no Trusted Publisher matching
-      # this workflow's OIDC claim -- and the only way to find that out was to
-      # notice, weeks later, that the README's install line did not work.
-      #
-      # So the job now asserts the thing it exists to cause: the version is
-      # resolvable on PyPI afterwards. Retried, because the index is eventually
-      # consistent and a fresh upload takes a few seconds to appear.
+  # A release step that cannot fail is not a gate. `v0.5.0` failed three times
+  # on `invalid-publisher` -- PyPI had no Trusted Publisher matching this
+  # workflow's OIDC claim -- and the only way to find that out was to notice,
+  # weeks later, that the README's install line did not work.
+  #
+  # So the release now asserts the thing `publish` exists to cause: the wheel
+  # and the sdist for exactly this version are on PyPI afterwards. It is its own
+  # job, not a step of `publish`, because the check is a repository script and
+  # `publish` holds `id-token: write` on the promise that it runs no project
+  # code. `github-release` waits on it, as it waited on the step it replaces.
+  visible:
+    name: on pypi
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - name: the version is actually on PyPI
         run: |
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null || echo "${GITHUB_REF_NAME#v}")"
-          for attempt in 1 2 3 4 5 6; do
-            body="$(curl -fsSL "https://pypi.org/simple/brainskit/" || true)"
-            case "$body" in
-              *"brainskit-$version"*)
-                echo "brainskit $version is on PyPI"
-                exit 0
-                ;;
-            esac
-            echo "attempt $attempt: $version not visible yet; waiting"
-            sleep 10
-          done
-          echo "brainskit $version is not on PyPI after publishing" >&2
-          echo "the upload step reported no error, which is how a silent" >&2
-          echo "no-op ships as a green release" >&2
-          exit 1
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          ./scripts/check-pypi-visibility.sh "$version"
 
   github-release:
     name: github release
-    needs: publish
+    needs: visible
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import IO, Any, NamedTuple
 
 from brainskit import __version__
-from brainskit.application.install import INSTRUCTIONS
+from brainskit.application.install import INSTRUCTIONS, WRITE_GATE
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     BrainskitError,
@@ -1349,26 +1349,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             # The gate answers with an exit code, and its denial text is prose
             # for a model rather than the ok/result envelope.
             return _emit_gate(result, json_mode=args.json)
+        ok = errors.succeeded(
+            args.command, getattr(args, f"{args.command}_command", None), result
+        )
         if result is not None:
             _emit(
                 result,
                 args.command,
                 code_command=getattr(args, "code_command", None),
+                ok=ok,
                 json_mode=args.json,
             )
-        if args.command == "lint" and isinstance(result, dict) and not result["ok"]:
-            return 1
-        if (
-            args.command == "vaults"
-            and args.vaults_command == "sync"
-            and isinstance(result, dict)
-            and result["failed"]
-        ):
-            # A failure inside the loop is reported, not raised, so the status
-            # is the only thing a scheduler can branch on. Skipped vaults are
-            # not failures: declining an integration is the policy working.
-            return 1
-        return 0
+        return 0 if ok else 1
     except BrainskitError as exc:
         # One branch, not two. `policy_denied` is the only code that carries a
         # different status, and the table in `interfaces/errors.py` is where it
@@ -1911,7 +1903,7 @@ def _watch(
         result = service.watch_once()
         if once:
             return result
-        _emit(result, "watch", json_mode=json_mode)
+        _emit(result, "watch", ok=errors.succeeded("watch", None, result), json_mode=json_mode)
         time.sleep(interval)
 
 
@@ -2567,13 +2559,25 @@ def _status_headline(value: dict[str, Any]) -> str:
     faults: list[str] = []
     if value["lint_errors"]:
         faults.append(f"{value['lint_errors']} lint error(s)")
+    layers = (value.get("enforcement") or {}).get("layers") or []
     inactive = [
         str(layer["layer"])
-        for layer in (value.get("enforcement") or {}).get("layers") or []
-        if not layer.get("active") and not layer.get("advisory")
+        for layer in layers
+        if not layer.get("active")
+        and not layer.get("advisory")
+        and not layer.get("outdated")
     ]
     if inactive:
         faults.append(f"enforcement off: {', '.join(inactive)}")
+    # A stale gate is off for `healthy`, but "off" would send the operator
+    # looking for a missing file when the fix is a reinstall.
+    stale = [
+        str(layer["layer"])
+        for layer in layers
+        if not layer.get("active") and layer.get("outdated")
+    ]
+    if stale:
+        faults.append(f"enforcement outdated: {', '.join(stale)}")
     return "; ".join(faults) or "not healthy; see the rows below"
 
 
@@ -2606,9 +2610,35 @@ def _enforcement_rows(layers: Sequence[dict[str, Any]]) -> list[list[str]]:
                     console.style(f"{symbol} {detail}", console.MUTED),
                 ]
             )
+        elif layer["active"] and layer.get("outdated"):
+            # Still runs, so not a cross; out of date, so not a tick either.
+            rows.append([name, console.style(f"! {detail}", console.WARN)])
         else:
             rows.append([name, console.status_line(bool(layer["active"]), detail)])
     return rows
+
+
+def _enforcement_section(layers: Sequence[dict[str, Any]]) -> list[str]:
+    """The enforcement table, and the command that refreshes a stale hook.
+
+    Shared by `bk status` and `bk doctor` so the two draw the same layers the
+    same way; doctor's own copy drew the advisory layer as a fourth green tick
+    after `_enforcement_rows` had stopped doing so.
+    """
+
+    if not layers:
+        return []
+    parts = [
+        "",
+        console.rule("enforcement"),
+        console.table(["layer", "status"], _enforcement_rows(layers)),
+    ]
+    hints = dict.fromkeys(
+        str(layer["hint"]) for layer in layers if layer.get("outdated") and layer.get("hint")
+    )
+    for hint in hints:
+        parts.append(console.style(f"  refresh outdated hook scripts: {hint}", console.WARN))
+    return parts
 
 
 def _render_status(value: dict[str, Any]) -> str:
@@ -2662,13 +2692,7 @@ def _render_status(value: dict[str, Any]) -> str:
             console.rule("projections"),
             console.table(["artifact", "state", "generated_at"], rows),
         ]
-    layers = (value.get("enforcement") or {}).get("layers") or []
-    if layers:
-        parts += [
-            "",
-            console.rule("enforcement"),
-            console.table(["layer", "status"], _enforcement_rows(layers)),
-        ]
+    parts += _enforcement_section((value.get("enforcement") or {}).get("layers") or [])
     return "\n".join(parts)
 
 
@@ -2707,10 +2731,32 @@ def _render_context(value: dict[str, Any]) -> str:
     return "\n".join(blocks)
 
 
+def _withheld_note(value: dict[str, Any]) -> list[str]:
+    """How much evidence privacy policy kept from the model, as a count only.
+
+    A model that answered from part of the vault has to say so, or the answer
+    reads as covering everything. Never a name, branch or hash: each of those
+    is disclosure in its own right.
+    """
+
+    withheld = int(value.get("withheld_sources") or 0)
+    if withheld <= 0:
+        return []
+    return [
+        "",
+        console.style(
+            f"{withheld} source(s) withheld from the model by privacy policy",
+            console.MUTED,
+        ),
+    ]
+
+
 def _render_lint(value: dict[str, Any]) -> str:
     findings = value.get("findings") or []
     if not findings:
-        return console.status_line(True, "no lint findings")
+        return "\n".join(
+            [console.status_line(True, "no lint findings"), *_withheld_note(value)]
+        )
     errors = sum(finding["severity"] == "error" for finding in findings)
     warnings = len(findings) - errors
     summary = ", ".join(
@@ -2734,7 +2780,14 @@ def _render_lint(value: dict[str, Any]) -> str:
         ]
         for finding in findings
     ]
-    return "\n".join([header, "", console.table(["severity", "code", "path", "message"], rows)])
+    return "\n".join(
+        [
+            header,
+            "",
+            console.table(["severity", "code", "path", "message"], rows),
+            *_withheld_note(value),
+        ]
+    )
 
 
 def _render_proposals(value: dict[str, Any]) -> str:
@@ -2867,6 +2920,7 @@ def _render_ask(value: dict[str, Any]) -> str:
         parts.append("\n".join(f"{console.BULLET} {c}" for c in citations))
     if value.get("uncertainty"):
         parts += ["", console.style(f"uncertainty: {value['uncertainty']}", console.WARN)]
+    parts += _withheld_note(value)
     if value.get("saved_to"):
         parts += ["", console.style(f"Saved to {value['saved_to']}", console.MUTED)]
     return "\n".join(parts)
@@ -2880,6 +2934,7 @@ def _render_digest(value: dict[str, Any]) -> str:
         parts.append("\n".join(f"{console.BULLET} {a}" for a in actions))
     if value.get("resurfaced"):
         parts += ["", console.style(f"resurfaced: {value['resurfaced']}", console.MUTED)]
+    parts += _withheld_note(value)
     parts += ["", console.style(f"Saved to {value['path']}", console.MUTED)]
     return "\n".join(parts)
 
@@ -2888,6 +2943,7 @@ def _render_resurface(value: dict[str, Any]) -> str:
     parts = [console.rule(value.get("page", "resurfaced")), value["markdown"]]
     if value.get("question"):
         parts += ["", console.style(f"question: {value['question']}", console.MUTED)]
+    parts += _withheld_note(value)
     parts += ["", console.style(f"Saved to {value['path']}", console.MUTED)]
     return "\n".join(parts)
 
@@ -3040,31 +3096,76 @@ def _render_code_diff(value: dict[str, Any]) -> str:
 def _doctor_headline(value: dict[str, Any]) -> str:
     """The same rule `_status_headline` follows, for the same reason.
 
-    `bk doctor`'s `healthy` has two inputs -- every grammar present, *and* the
-    write-gate probe landing on a state compatible with an installation. The
-    headline restated only the first, so a machine with every grammar installed
-    and a gate that fails open printed `0 language(s) cannot be parsed` under a
-    red cross: a cross above a zero that never mentions the gate, on exactly the
-    run whose whole purpose is to exercise it.
+    `bk doctor`'s `healthy` has two inputs -- no broken grammar install, *and*
+    a write gate that both refused the probe and is the one the agent runs. The
+    headline once restated only the first, so a machine with every grammar
+    installed and a gate that fails open printed `0 language(s) cannot be
+    parsed` under a red cross: a cross above a zero that never mentions the
+    gate, on exactly the run whose whole purpose is to exercise it.
     """
 
-    if value.get("healthy"):
-        return "installation complete"
-    faults: list[str] = []
     code = value.get("code") or {}
-    missing = code.get("grammars_missing") or []
-    if missing:
-        faults.append(f"{len(missing)} language(s) cannot be parsed")
+    enforcement = value.get("enforcement") or {}
+    if value.get("healthy"):
+        # Healthy, and still honest about what it chose not to have: an absent
+        # `code` extra is not a fault, but it is not a code graph either.
+        notes = ["installation complete"]
+        if code.get("grammars_state") == "absent":
+            notes.append("code extra not installed (optional)")
+        if code.get("graph_without_grammars"):
+            notes.append("the code graph cannot be rebuilt here")
+        stale = [
+            str(layer["layer"])
+            for layer in enforcement.get("layers") or []
+            if layer.get("outdated")
+        ]
+        if stale:
+            notes.append(f"outdated: {', '.join(stale)}")
+        return "; ".join(notes)
+    faults: list[str] = []
+    broken = code.get("grammars_broken") or []
+    if broken:
+        faults.append(
+            f"{len(broken)} language(s) cannot be parsed (the code extra is partly installed)"
+        )
     outdated = code.get("grammars_outdated") or []
     if outdated:
         faults.append(
             f"{len(outdated)} grammar(s) older than the pinned version"
         )
-    probe = (value.get("enforcement") or {}).get("write_gate_probe") or {}
+    probe = enforcement.get("write_gate_probe") or {}
     state = probe.get("state")
     if state not in {"enforcing", "absent", None}:
         faults.append(f"write gate {state}")
+    elif state == "enforcing" and not enforcement.get("gated", True):
+        # The script refuses a write when run by hand; the agent is not
+        # running it, or not this version of it.
+        gate: dict[str, Any] = next(
+            (
+                layer
+                for layer in enforcement.get("layers") or []
+                if layer.get("layer") == WRITE_GATE and layer.get("script")
+            ),
+            {},
+        )
+        faults.append(
+            "write gate outdated" if gate.get("outdated") else "write gate inactive"
+        )
     return "; ".join(faults) or "installation incomplete; see the sections below"
+
+
+def _grammar_extent(code: dict[str, Any]) -> str:
+    """What the grammar count amounts to, so `13/29` stops reading as a fault."""
+
+    state = code.get("grammars_state")
+    if state == "absent":
+        return " (code extra not installed; optional)"
+    if state == "partial":
+        return " (code extra partly installed)"
+    extras = code.get("extras_complete") or []
+    if extras:
+        return f" ({extras[-1]} extra complete)"
+    return ""
 
 
 def _render_doctor(value: dict[str, Any]) -> str:
@@ -3073,6 +3174,7 @@ def _render_doctor(value: dict[str, Any]) -> str:
     known = code.get("grammars_known", 0)
     installed = code.get("grammars_installed", 0)
     missing = code.get("grammars_missing") or []
+    broken = code.get("grammars_broken") or []
     parts = [
         console.status_line(bool(value.get("healthy")), _doctor_headline(value)),
         "",
@@ -3080,7 +3182,7 @@ def _render_doctor(value: dict[str, Any]) -> str:
             [
                 ("install method", str(environment.get("label", "?"))),
                 ("interpreter", str(environment.get("executable", "?"))),
-                ("grammars", f"{installed}/{known}"),
+                ("grammars", f"{installed}/{known}{_grammar_extent(code)}"),
                 # The two facts the incident turned on: which directory a build
                 # scans, and why it is that one.
                 ("code root", str(code.get("root", "?"))),
@@ -3089,11 +3191,24 @@ def _render_doctor(value: dict[str, Any]) -> str:
             ]
         ),
     ]
-    if missing:
+    if broken:
         parts += ["", console.rule("missing grammars")]
-        parts.append(console.style("  " + ", ".join(missing), console.WARN))
+        parts.append(console.style("  " + ", ".join(broken), console.WARN))
         if code.get("install"):
             parts += ["", console.style("  " + str(code["install"]), console.MUTED)]
+    elif missing and code.get("install"):
+        # Optional and absent: the command, muted, not a list of twenty-nine
+        # names drawn in the colour of a fault.
+        parts += [
+            "",
+            console.style(
+                f"  {len(missing)} optional grammar(s) not installed: {code['install']}",
+                console.MUTED,
+            ),
+        ]
+    graph_note = code.get("graph_without_grammars")
+    if graph_note:
+        parts += ["", console.style(f"  ! {graph_note.get('detail', '')}", console.WARN)]
     outdated = code.get("grammars_outdated") or []
     if outdated:
         # Present but out of range: the wheel imports, so nothing above flags
@@ -3116,18 +3231,7 @@ def _render_doctor(value: dict[str, Any]) -> str:
         if code.get("upgrade"):
             parts += ["", console.style("  " + str(code["upgrade"]), console.MUTED)]
     enforcement = value.get("enforcement") or {}
-    layers = enforcement.get("layers") or []
-    if layers:
-        parts += ["", console.rule("enforcement")]
-        parts.append(
-            console.table(
-                ["layer", "state"],
-                [
-                    [layer["layer"], console.status_line(layer["active"], layer.get("detail", ""))]
-                    for layer in layers
-                ],
-            )
-        )
+    parts += _enforcement_section(enforcement.get("layers") or [])
     probe = enforcement.get("write_gate_probe")
     if probe:
         # Rendered apart from the table above: that table says what is
@@ -3294,10 +3398,15 @@ def _render(value: Any, command: str, *, code_command: str | None = None) -> str
 
 
 def _emit(
-    value: Any, command: str, *, code_command: str | None = None, json_mode: bool
+    value: Any,
+    command: str,
+    *,
+    code_command: str | None = None,
+    ok: bool,
+    json_mode: bool,
 ) -> None:
     if json_mode:
-        print(json.dumps({"ok": True, "result": value}, ensure_ascii=False))
+        print(json.dumps({"ok": ok, "result": value}, ensure_ascii=False))
         return
     print(_render(value, command, code_command=code_command))
 

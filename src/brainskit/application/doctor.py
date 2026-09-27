@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from brainskit.application.codegraph import CODE_PROJECTION
 from brainskit.application.install import WRITE_GATE
 from brainskit.application.ports import EnvironmentPort, VaultPort
 
@@ -65,6 +66,47 @@ def _run_gate_hook(script: Path, target: Path) -> tuple[int | None, str]:
     return done.returncode, done.stderr.strip()
 
 
+#: The extra whose grammars pip installs as one unit, and the one the docs
+#: recommend. `code-all` adds grammars `bk code build` also offers to install
+#: one at a time, so a subset of those is a choice rather than a broken install.
+_CODE_EXTRA = "code"
+_ALL_EXTRA = "code-all"
+
+
+def _declared_requirements() -> list[tuple[str, str, str, str | None]]:
+    """This distribution's requirements as (name, bracketed extras, specifiers, extra).
+
+    `tree-sitter-python>=0.23,<0.26; extra == "code"` is a name, any version
+    specifiers, and the extra that pulls it in; `brainskit[code]; extra ==
+    "code-all"` is how one extra includes another. An unresolvable
+    self-distribution (an exotic install without dist-info) yields nothing, and
+    every reader below degrades to "cannot judge" rather than to a fault.
+    """
+
+    try:
+        requires = importlib.metadata.requires(_SELF_DISTRIBUTION) or []
+    except Exception:
+        return []
+    parsed: list[tuple[str, str, str, str | None]] = []
+    for requirement in requires:
+        head, _, marker = requirement.partition(";")
+        match = re.match(
+            r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?\s*(.*)$", head.strip()
+        )
+        if match is None:
+            continue
+        extra = re.search(r"extra\s*==\s*[\"']([^\"']+)[\"']", marker)
+        parsed.append(
+            (
+                match.group(1).lower(),
+                match.group(2) or "",
+                match.group(3).strip(),
+                extra.group(1) if extra else None,
+            )
+        )
+    return parsed
+
+
 def _grammar_requirements() -> dict[str, str]:
     """The version pins brainskit declares for each grammar, from its metadata.
 
@@ -74,29 +116,85 @@ def _grammar_requirements() -> dict[str, str]:
     first time a pin moved. `importlib.metadata` is stdlib, so the layering
     rule (no `infrastructure` imports below `application`) is untouched.
 
-    An unresolvable self-distribution (an exotic install without dist-info)
-    yields an empty mapping: the update check degrades to absent, never to a
-    false "outdated".
+    An unresolvable self-distribution yields an empty mapping: the update check
+    degrades to absent, never to a false "outdated".
     """
 
-    try:
-        requires = importlib.metadata.requires(_SELF_DISTRIBUTION) or []
-    except Exception:
-        return {}
     pins: dict[str, list[str]] = {}
-    for requirement in requires:
-        # `tree-sitter-python>=0.23,<0.26; extra == "code"` — name, then any
-        # version specifiers, then an environment marker we can ignore: every
-        # grammar requirement in the metadata arrives through an extra.
-        head = requirement.split(";", 1)[0].strip()
-        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)$", head)
-        if match is None:
-            continue
-        name, specifiers = match.group(1), match.group(2).strip()
+    for name, _, specifiers, _ in _declared_requirements():
         if not name.startswith("tree-sitter") or not specifiers:
             continue
-        pins.setdefault(name.lower(), []).append(specifiers)
+        pins.setdefault(name, []).append(specifiers)
     return {name: ",".join(parts) for name, parts in sorted(pins.items())}
+
+
+def _grammar_extras() -> dict[str, frozenset[str]]:
+    """Each extra's grammar distributions, with included extras folded in.
+
+    `code-all` declares `brainskit[code]` rather than repeating its grammars,
+    so the closure is taken here; otherwise "is `code-all` complete" would be
+    answered over the sixteen grammars it names and not the twenty-nine it
+    installs.
+    """
+
+    direct: dict[str, set[str]] = {}
+    includes: dict[str, set[str]] = {}
+    for name, bracketed, _, extra in _declared_requirements():
+        if extra is None:
+            continue
+        if name == _SELF_DISTRIBUTION:
+            includes.setdefault(extra, set()).update(
+                part.strip() for part in bracketed.split(",") if part.strip()
+            )
+        elif name.startswith("tree-sitter-"):
+            direct.setdefault(extra, set()).add(name)
+
+    def closure(extra: str, seen: frozenset[str] = frozenset()) -> set[str]:
+        members = set(direct.get(extra, set()))
+        for included in includes.get(extra, set()) - seen - {extra}:
+            members |= closure(included, seen | {extra})
+        return members
+
+    extras = set(direct) | set(includes)
+    return {
+        extra: frozenset(members)
+        for extra in sorted(extras)
+        if (members := closure(extra))
+    }
+
+
+def grammar_install_state(grammars: Mapping[str, bool]) -> dict[str, Any]:
+    """Whether the grammars present are a choice or a broken install.
+
+    `code` is an optional extra, so no grammar at all is `absent`: an operator
+    who never asked for the code graph has nothing wrong with their machine,
+    and folding that into `healthy` made the field a constant on every default
+    install (#13). The `code-all` grammars beyond `code` are individually
+    optional too -- `bk code build` itself offers to install just the ones a
+    scan needs -- so `[code]` complete with none of them is `complete` (#24).
+
+    What *is* a fault is `partial`: some of the `code` extra's grammars present
+    and some not. pip installs that extra as one unit, so a subset is an
+    interrupted or hand-assembled install, and `bk code build` over it succeeds
+    while a language contributes nothing. `broken` names exactly the grammars
+    whose absence is that fault, and nothing that is merely optional.
+    """
+
+    known = {str(name).lower() for name in grammars}
+    installed = {str(name).lower() for name, present in grammars.items() if present}
+    extras = _grammar_extras()
+    unit = extras.get(_CODE_EXTRA, frozenset()) & known
+    if not installed:
+        state, broken = "absent", []
+    else:
+        broken = sorted(unit - installed)
+        state = "partial" if broken else "complete"
+    complete = [
+        extra
+        for extra, members in extras.items()
+        if (members & known) and (members & known) <= installed
+    ]
+    return {"state": state, "broken": broken, "extras_complete": complete}
 
 
 def _version_key(version: str) -> tuple[int, ...]:
@@ -322,17 +420,60 @@ def doctor_report(
 
     root, reason = vault.code_root_reason()
     missing = [name for name, installed in grammars.items() if not installed]
+    verdict = grammar_install_state(grammars)
+    broken = verdict["broken"]
     probe = probe_write_gate(vault, enforcement["layers"])
     enforcement["write_gate_probe"] = probe
     # The update half of the grammar check: a distribution may be present and
     # still violate the pin brainskit declares, which fails later, per file,
-    # at extraction time. Same report as missing, because it is the same
-    # "this language will let you down" fact.
-    updates = grammar_update_check(grammar_versions, environment=environment)
+    # at extraction time. Same report as a broken install, because it is the
+    # same "this language will let you down" fact. Optional grammars that are
+    # simply absent are left out, or a default install would carry an upgrade
+    # command for twenty-nine packages it never asked for.
+    updates = grammar_update_check(
+        {
+            name: info
+            for name, info in (grammar_versions or {}).items()
+            if grammars.get(name) or str(name).lower() in broken
+        },
+        environment=environment,
+    )
     outdated = [
         str(entry.get("distribution", ""))
         for entry in (updates.get("grammars_outdated") or [])
     ]
+    code: dict[str, Any] = {
+        "root": str(root),
+        "why_this_root": reason,
+        "scan_limit": vault.config().code_scan_limit,
+        "grammars_installed": sum(grammars.values()),
+        "grammars_known": len(grammars),
+        "grammars_missing": missing,
+        "grammars_state": verdict["state"],
+        "grammars_broken": broken,
+        "extras_complete": verdict["extras_complete"],
+        "grammars_outdated": outdated,
+        **updates,
+    }
+    if missing and environment.installable:
+        # The smallest command that moves this install forward: the grammars a
+        # partial `code` lacks, else the extra itself, else the optional rest.
+        if broken:
+            packages = broken
+        elif verdict["state"] == "absent":
+            packages = [f"{_SELF_DISTRIBUTION}[{_CODE_EXTRA}]"]
+        else:
+            packages = [f"{_SELF_DISTRIBUTION}[{_ALL_EXTRA}]"]
+        code["install"] = environment.install_hint(packages)
+    graph_note = _code_graph_without_grammars(vault, verdict["state"])
+    if graph_note is not None:
+        code["graph_without_grammars"] = graph_note
+    # The probe ran the script directly, which proves the script refuses a
+    # write; `gated` is what says the agent will actually run it -- registered
+    # under its event, and the script this version installs rather than an
+    # older copy that may enforce older rules. Both, or nobody has shown that a
+    # write to wiki/ is refused.
+    gate_live = probe["state"] == "absent" or bool(enforcement.get("gated"))
     return {
         "vault": str(vault.root),
         "environment": {
@@ -341,21 +482,7 @@ def doctor_report(
             "executable": environment.executable,
             "installable": environment.installable,
         },
-        "code": {
-            "root": str(root),
-            "why_this_root": reason,
-            "scan_limit": vault.config().code_scan_limit,
-            "grammars_installed": sum(grammars.values()),
-            "grammars_known": len(grammars),
-            "grammars_missing": missing,
-            "grammars_outdated": outdated,
-            **updates,
-            **(
-                {"install": environment.install_hint(missing)}
-                if missing and environment.installable
-                else {}
-            ),
-        },
+        "code": code,
         "enforcement": enforcement,
         # An allowlist, not a denylist: only two states are compatible with a
         # healthy installation -- the gate refused what it must ("enforcing"),
@@ -365,11 +492,43 @@ def doctor_report(
         # an installed gate that does not guard is worse than none: every other
         # layer keeps reporting success while writes go around it.
         #
-        # An out-of-range grammar counts against health for the same reason a
-        # missing one does: both are ways a build silently loses a language.
+        # Grammars count only when they are broken, never when they are absent:
+        # the extra is optional, and a field that is False on every default
+        # install is a constant a CI gate cannot use -- it hid the gate fault it
+        # was meant to report (#13). A partial `code` extra and an out-of-range
+        # grammar do count, because both are ways a build that reports success
+        # silently loses a language. A code graph this machine cannot rebuild
+        # is reported beside them but is not one: `bk code build` refuses loudly
+        # with the install command, and the stored graph still answers.
         "healthy": (
-            not missing
+            not broken
             and not outdated
             and probe["state"] in {"enforcing", "absent"}
+            and gate_live
+        ),
+    }
+
+
+def _code_graph_without_grammars(vault: VaultPort, state: str) -> dict[str, Any] | None:
+    """A code graph this vault uses, on a machine with no grammar to rebuild it.
+
+    Built (`graph/code.json` exists) or configured (`code_root` is set) says the
+    operator chose the code graph, so here the absent extra stops being a
+    choice made on their behalf. Reported, not counted against `healthy`: see
+    the verdict in `doctor_report`.
+    """
+
+    if state != "absent":
+        return None
+    built = (vault.root / CODE_PROJECTION).is_file()
+    configured = vault.config().code_root is not None
+    if not (built or configured):
+        return None
+    return {
+        "built": built,
+        "configured": configured,
+        "detail": (
+            "this vault uses a code graph, but no tree-sitter grammar is "
+            "installed, so `bk code build` cannot refresh it here"
         ),
     }

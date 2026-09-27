@@ -27,7 +27,7 @@ from unittest.mock import patch
 
 from test_code_graph import _HAS_CODE_EXTRA
 
-from brainskit.application import installer
+from brainskit.application import doctor, installer
 from brainskit.application.gate import (
     HOOK_SENTINEL,
     INSTRUCTION_END,
@@ -40,7 +40,7 @@ from brainskit.infrastructure.extractor import GraphifyExtractor
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.vault import FileVault
-from brainskit.interfaces import cli
+from brainskit.interfaces import cli, console
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -173,7 +173,7 @@ class HookScriptTest(VaultCase):
         # every write it exists to govern.
         awkward = self.root / "Protótipos e 'coisas'"
         awkward.mkdir()
-        rendered = installer._hook_script("brainskit-gate", awkward)
+        rendered = installer.render_hook_script("brainskit-gate", awkward)
         line = next(
             item for item in rendered.splitlines() if item.startswith("VAULT=")
         )
@@ -236,7 +236,7 @@ class HookScriptTest(VaultCase):
 
     def test_a_missing_script_template_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
-            installer._hook_script("does-not-exist", self.root)
+            installer.render_hook_script("does-not-exist", self.root)
 
 
 class SettingsRegistrationTest(VaultCase):
@@ -1390,18 +1390,42 @@ class DoctorHeadlineSaysWhyTest(unittest.TestCase):
         self.assertIn("over_blocking", self.headline(**self.probe("over_blocking")))
 
     def test_missing_grammars_are_still_counted(self) -> None:
-        """Control: the case the old headline got right must keep working."""
+        """Control: a broken install is still named, and counted."""
 
         self.assertEqual(
-            "2 language(s) cannot be parsed",
+            "2 language(s) cannot be parsed (the code extra is partly installed)",
             self.headline(
                 code={
                     "grammars_missing": ["go", "rust"],
+                    "grammars_broken": ["go", "rust"],
+                    "grammars_state": "partial",
                     "grammars_known": 5,
                     "grammars_installed": 3,
                 }
             ),
         )
+
+    def test_optional_grammars_that_are_absent_are_not_a_fault(self) -> None:
+        """#13: absent is a choice, so it must not be offered as the reason."""
+
+        headline = self.headline(
+            code={
+                "grammars_missing": ["go", "rust"],
+                "grammars_broken": [],
+                "grammars_state": "absent",
+                "grammars_known": 5,
+                "grammars_installed": 0,
+            }
+        )
+        self.assertNotIn("cannot be parsed", headline)
+
+    def test_a_healthy_install_without_the_extra_says_it_chose_not_to(self) -> None:
+        headline = self.headline(
+            healthy=True,
+            code={"grammars_state": "absent", "grammars_missing": ["go"]},
+        )
+        self.assertTrue(headline.startswith("installation complete"))
+        self.assertIn("code extra not installed", headline)
 
     def test_an_absent_gate_is_not_a_fault(self) -> None:
         """A vault with no agent installed is a choice, not a broken machine --
@@ -1411,6 +1435,211 @@ class DoctorHeadlineSaysWhyTest(unittest.TestCase):
 
     def test_an_unrecognised_reason_points_at_the_sections(self) -> None:
         self.assertIn("see the sections below", self.headline())
+
+
+class DoctorGrammarVerdictTest(ShellHookCase):
+    """`healthy` judges a broken grammar install, never an absent one (#13, #24).
+
+    The `code` extra is optional, so on a default install every grammar is
+    missing -- and `healthy` was False there whatever the gate did, a constant
+    that hid the fault the field exists to report. The recommended `[code]`
+    extra landed on 13/29 and the same False. A *partial* `[code]` is still a
+    fault: pip installs it as one unit, and a build over a subset succeeds while
+    a language contributes nothing.
+    """
+
+    def inventory(self, installed: set[str]) -> dict[str, bool]:
+        every = doctor._grammar_extras()[doctor._ALL_EXTRA]
+        return {name: name in installed for name in sorted(every)}
+
+    def code_extra(self) -> set[str]:
+        return set(doctor._grammar_extras()[doctor._CODE_EXTRA])
+
+    def doctor(
+        self,
+        installed: set[str],
+        *,
+        versions: dict[str, Any] | None = None,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        environment = dict(os.environ)
+        environment["PATH"] = (
+            path if path is not None else f"{self.bin}{os.pathsep}{os.environ['PATH']}"
+        )
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            cli, "grammar_inventory", return_value=self.inventory(installed)
+        ), patch.object(cli, "grammar_audit", return_value=versions or {}):
+            return cli._doctor(self.service)
+
+    def test_a_default_install_is_healthy_when_its_gate_is(self) -> None:
+        report = self.doctor(set())
+        self.assertEqual(report["enforcement"]["write_gate_probe"]["state"], "enforcing")
+        self.assertEqual(report["code"]["grammars_state"], "absent")
+        self.assertEqual(report["code"]["grammars_broken"], [])
+        self.assertEqual(len(report["code"]["grammars_missing"]), 29)
+        self.assertTrue(report["healthy"])
+        # An offer, not a repair: the extra, and no upgrade of 29 packages.
+        self.assertNotIn("upgrade", report["code"])
+        self.assertIn("brainskit[code]", report["code"].get("install", "brainskit[code]"))
+        self.assertIn("code extra not installed", cli._doctor_headline(report))
+
+    def test_a_default_install_still_reports_a_gate_that_fails_open(self) -> None:
+        """What the constant hid: the gate fault is the only one left to name."""
+
+        report = self.doctor(set(), path="/usr/bin:/bin")
+        self.assertFalse(report["healthy"])
+        headline = cli._doctor_headline(report)
+        self.assertIn("write gate not_enforcing", headline)
+        self.assertNotIn("cannot be parsed", headline)
+
+    def test_the_recommended_code_extra_is_complete(self) -> None:
+        """#24: `[code]` without the optional `code-all` grammars is healthy."""
+
+        report = self.doctor(self.code_extra())
+        self.assertEqual(report["code"]["grammars_installed"], 13)
+        self.assertEqual(report["code"]["grammars_state"], "complete")
+        self.assertEqual(report["code"]["extras_complete"], ["code"])
+        self.assertTrue(report["healthy"])
+        self.assertIn("code extra complete", cli._render_doctor(report))
+
+    def test_a_partial_code_extra_is_a_fault(self) -> None:
+        report = self.doctor(self.code_extra() - {"tree-sitter-go"})
+        self.assertEqual(report["code"]["grammars_state"], "partial")
+        self.assertEqual(report["code"]["grammars_broken"], ["tree-sitter-go"])
+        self.assertFalse(report["healthy"])
+        self.assertIn("1 language(s) cannot be parsed", cli._doctor_headline(report))
+        # The repair names what is broken, not the optional rest.
+        install = report["code"].get("install", "tree-sitter-go")
+        self.assertIn("tree-sitter-go", install)
+        self.assertNotIn("tree-sitter-sql", install)
+
+    def test_an_optional_grammar_beside_the_code_extra_is_not_partial(self) -> None:
+        """`bk code build` offers single `code-all` grammars; taking one is no fault."""
+
+        report = self.doctor(self.code_extra() | {"tree-sitter-sql"})
+        self.assertEqual(report["code"]["grammars_state"], "complete")
+        self.assertTrue(report["healthy"])
+
+    def test_an_outdated_grammar_still_counts(self) -> None:
+        """Control: present but outside its pin fails per file at extraction."""
+
+        report = self.doctor(
+            self.code_extra(),
+            versions={"tree-sitter-python": {"installed": True, "version": "0.22.0"}},
+        )
+        self.assertEqual(
+            [entry["distribution"] for entry in report["code"]["grammars_outdated"]],
+            ["tree-sitter-python"],
+        )
+        self.assertFalse(report["healthy"])
+
+    def test_a_code_graph_without_any_grammar_is_reported_not_failed(self) -> None:
+        graph = self.root / "graph" / "code.json"
+        graph.parent.mkdir(parents=True, exist_ok=True)
+        graph.write_text("{}", encoding="utf-8")
+        report = self.doctor(set())
+        note = report["code"]["graph_without_grammars"]
+        self.assertTrue(note["built"])
+        self.assertTrue(report["healthy"])
+        self.assertIn("cannot be rebuilt", cli._doctor_headline(report))
+
+    def test_no_code_graph_means_no_graph_note(self) -> None:
+        self.assertNotIn("graph_without_grammars", self.doctor(set())["code"])
+
+
+class OutdatedHookScriptTest(ShellHookCase):
+    """A generated hook older than this version's template is reported as such.
+
+    `status` and `doctor` checked that a script exists and is registered, so a
+    copy written by an older brainskit read `active` indefinitely -- and 0.8.0's
+    session-status template now reads lint results the old one dropped, so the
+    old copy under-reports lint errors with nothing saying so.
+    """
+
+    def layers(self) -> dict[str, dict[str, Any]]:
+        enforcement = self.service.status()["enforcement"]
+        return {layer["layer"]: layer for layer in enforcement["layers"]}
+
+    def age(self, name: str) -> None:
+        """Make the installed copy differ from the template, marker kept."""
+
+        script = self.script(name)
+        script.write_text(
+            script.read_text(encoding="utf-8") + "# from an older brainskit\n",
+            encoding="utf-8",
+        )
+
+    def doctor(self) -> dict[str, Any]:
+        environment = dict(os.environ)
+        environment["PATH"] = f"{self.bin}{os.pathsep}{os.environ['PATH']}"
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            cli, "grammar_inventory", return_value={}
+        ), patch.object(cli, "grammar_audit", return_value={}):
+            return cli._doctor(self.service)
+
+    def test_a_fresh_install_is_current(self) -> None:
+        enforcement = self.service.status()["enforcement"]
+        self.assertEqual(enforcement["outdated"], [])
+        self.assertTrue(enforcement["gated"])
+        for layer in enforcement["layers"]:
+            with self.subTest(layer=layer["layer"]):
+                self.assertNotIn("outdated", layer)
+
+    def test_an_outdated_status_script_warns_without_failing_health(self) -> None:
+        self.age("brainskit-status")
+        status = self.service.status()
+        layer = {item["layer"]: item for item in status["enforcement"]["layers"]}[
+            "session_status"
+        ]
+        self.assertTrue(layer["outdated"])
+        self.assertTrue(layer["active"], "observability still runs; it warns")
+        self.assertEqual(layer["hint"], "bk hooks install --agent claude")
+        self.assertEqual(status["enforcement"]["outdated"], ["session_status"])
+        self.assertTrue(status["enforcement"]["gated"])
+        self.assertNotIn("session_status", status["enforcement"]["inactive"])
+        rendered = console.strip_ansi(cli._render_status(status))
+        self.assertIn("older than the one this version installs", rendered)
+        self.assertIn("refresh outdated hook scripts: bk hooks install --agent claude", rendered)
+
+        report = self.doctor()
+        self.assertTrue(report["healthy"])
+        self.assertEqual(report["enforcement"]["outdated"], ["session_status"])
+        self.assertIn("outdated: session_status", cli._doctor_headline(report))
+
+    def test_an_outdated_gate_is_not_gated_and_not_healthy(self) -> None:
+        self.age("brainskit-gate")
+        status = self.service.status()
+        enforcement = status["enforcement"]
+        layer = {item["layer"]: item for item in enforcement["layers"]}["write_gate"]
+        self.assertTrue(layer["outdated"])
+        self.assertFalse(layer["active"])
+        self.assertIn("may enforce old rules", layer["detail"])
+        self.assertFalse(enforcement["gated"])
+        self.assertIn("write_gate", enforcement["inactive"])
+        self.assertFalse(status["healthy"])
+        self.assertIn("enforcement outdated: write_gate", cli._status_headline(status))
+
+        report = self.doctor()
+        # The old script still refuses the probe; that is not the question.
+        self.assertEqual(report["enforcement"]["write_gate_probe"]["state"], "enforcing")
+        self.assertFalse(report["healthy"])
+        self.assertIn("write gate outdated", cli._doctor_headline(report))
+
+    def test_reinstalling_makes_every_script_current(self) -> None:
+        self.age("brainskit-gate")
+        self.age("brainskit-status")
+        self.install()
+        enforcement = self.service.status()["enforcement"]
+        self.assertEqual(enforcement["outdated"], [])
+        self.assertTrue(enforcement["gated"])
+
+    def test_a_script_the_operator_owns_is_not_judged(self) -> None:
+        script = self.script("brainskit-status")
+        script.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
+        script.chmod(0o755)
+        self.assertNotIn("outdated", self.layers()["session_status"])
+        self.install()
+        self.assertEqual(script.read_text(encoding="utf-8"), "#!/bin/sh\necho mine\n")
 
 
 class StatusScriptTest(ShellHookCase):
@@ -1442,6 +1671,38 @@ class StatusScriptTest(ShellHookCase):
         self.assertIn("write gate active", done.stdout)
         self.assertIn("commit lint OFF", done.stdout)
         self.assertIn("not a git repository", done.stdout)
+        self.assertNotIn("hooks outdated", done.stdout)
+
+    def test_it_names_an_outdated_hook_with_the_fix(self) -> None:
+        """The session is where an agent learns what it walked into, so a stale
+        gate or summary is said there too, with the command that refreshes it."""
+
+        gate = self.script("brainskit-gate")
+        gate.write_text(gate.read_text(encoding="utf-8") + "# older\n", encoding="utf-8")
+        done = self.drive(
+            "brainskit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}"
+        )
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(
+            "hooks outdated: write gate - refresh with: bk hooks install --agent claude",
+            done.stdout,
+        )
+        self.assertIn("write gate OFF", done.stdout)
+
+    def test_lint_errors_are_counted_even_though_lint_reports_a_failure(self) -> None:
+        # `bk lint --json` answers `{"ok": false, "result": {...}}` when it
+        # finds an error (issue #10). A reader that trusted only `ok` read
+        # that as "no result" and printed `lint 0 errors` -- silent in exactly
+        # the case this row exists for.
+        captured = self.service.capture(None, text="Immutable", title="Immutable")
+        (self.root / captured["source"]["path"]).write_text("Mutated", encoding="utf-8")
+
+        done = self.drive(
+            "brainskit-status", path=f"{self.real_bk()}{os.pathsep}{os.environ['PATH']}"
+        )
+
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("lint 1 errors", done.stdout)
 
     def test_a_vault_it_cannot_reach_is_announced_rather_than_ignored(self) -> None:
         # The failure this guards against: a hook that exits 0 in silence stays
@@ -1496,7 +1757,7 @@ class PackagingTest(unittest.TestCase):
     def test_the_hook_scripts_resolve_through_importlib_resources(self) -> None:
         for name in ("brainskit-gate", "brainskit-status"):
             with self.subTest(script=name):
-                self.assertIn(HOOK_SENTINEL, installer._hook_script(name, Path("/tmp")))
+                self.assertIn(HOOK_SENTINEL, installer.render_hook_script(name, Path("/tmp")))
 
     def test_shell_templates_are_declared_as_package_data(self) -> None:
         import tomllib
@@ -1572,6 +1833,26 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
             line for line in script.splitlines() if line.startswith("VAULT=")
         ]
         self.assertEqual(assigned, [f"VAULT={shlex.quote(str(self.root))}"])
+
+    def test_an_outdated_script_is_judged_against_the_recorded_workspace(self) -> None:
+        """Current is what an install into *that* workspace writes, and the
+        remedy has to reinstall there, not beside the vault."""
+
+        self.install(root=str(self.project))
+        layers = {
+            layer["layer"]: layer for layer in self.service.status()["enforcement"]["layers"]
+        }
+        self.assertNotIn("outdated", layers["session_status"])
+
+        script = self.project / ".claude" / "hooks" / "brainskit-status.sh"
+        script.write_text(script.read_text(encoding="utf-8") + "# older\n", encoding="utf-8")
+        layers = {
+            layer["layer"]: layer for layer in self.service.status()["enforcement"]["layers"]
+        }
+        self.assertEqual(
+            layers["session_status"]["hint"],
+            f"bk hooks install --agent claude --root {shlex.quote(str(self.project))}",
+        )
 
     def test_the_status_hook_looks_for_git_in_the_workspace(self) -> None:
         """The commit-lint layer lives in the workspace's repository.
@@ -1652,7 +1933,7 @@ class NestedVaultWorkspaceTest(unittest.TestCase):
         hook = self.project / ".git" / "hooks" / "pre-commit"
         self.assertTrue(hook.is_file())
         # It must lint the vault, which is not the repository it lives in.
-        self.assertIn(json.dumps(str(self.root)), hook.read_text(encoding="utf-8"))
+        self.assertIn(shlex.quote(str(self.root)), hook.read_text(encoding="utf-8"))
 
 
 class RedirectedHooksPathInstallTest(VaultCase):
@@ -1733,6 +2014,175 @@ class RedirectedHooksPathInstallTest(VaultCase):
         }
         self.assertIn("write_gate", active)
         self.assertIn("session_status", active)
+
+
+class AwkwardPathHookTest(unittest.TestCase):
+    """Every generated hook still runs when the vault path is hostile to sh.
+
+    Before 0.8.0 the pre-commit hook quoted the vault with `json.dumps`: sh read
+    the JSON escape for `ç` literally, `bk` found no vault and exited 2, and
+    every commit in a repository under `Operação/` was blocked. Inside those
+    double quotes `$HOME` and `$(...)` were still expanded, so a path could run
+    a command. settings.json registered the hook scripts unquoted, and Claude
+    Code runs that command through a shell too.
+    """
+
+    def setUp(self) -> None:
+        self.bk = Path(sys.executable).parent / "bk"
+        if not self.bk.is_file():
+            self.skipTest("no bk console script beside the interpreter")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        awkward = self.base / "Operação dir $HOME `touch tick` $(touch marker)"
+        awkward.mkdir()
+        self.vault = FileVault.initialize(awkward, policy())
+        self.root = self.vault.root
+        self.service = BrainskitService(
+            self.vault, SqliteFtsIndex(self.vault.index_path), graph=MarkdownGraph()
+        )
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True)
+        self.hook = self.root / ".git" / "hooks" / "pre-commit"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def install(self) -> dict[str, Any]:
+        with redirect_stderr(StringIO()):
+            return cli._install_hooks(self.service, "claude", skip_code_build=True)
+
+    def environment(self) -> dict[str, str]:
+        return {**os.environ, "PATH": f"{self.bk.parent}{os.pathsep}{os.environ['PATH']}"}
+
+    def assert_nothing_expanded(self, *directories: Path) -> None:
+        for directory in (self.base, self.root, *directories):
+            for name in ("marker", "tick"):
+                self.assertFalse(
+                    (directory / name).exists(), f"{name} created in {directory}"
+                )
+
+    def commit_layer(self) -> dict[str, Any]:
+        for layer in self.service.status()["enforcement"]["layers"]:
+            if layer["layer"] == "commit_lint":
+                return layer
+        raise AssertionError("no commit_lint layer reported")
+
+    def test_the_pre_commit_hook_lints_this_vault_and_expands_nothing(self) -> None:
+        self.install()
+        done = subprocess.run(
+            [str(self.hook)],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("Not a brainskit vault", done.stdout + done.stderr)
+        self.assert_nothing_expanded()
+
+    def test_the_pre_commit_hook_carries_the_generated_marker(self) -> None:
+        self.install()
+        content = self.hook.read_text(encoding="utf-8")
+        self.assertIn(HOOK_SENTINEL, content)
+        self.assertEqual(content, installer.render_pre_commit(self.root))
+        exec_line = content.splitlines()[-1]
+        self.assertEqual(shlex.split(exec_line)[3], str(self.root))
+
+    def test_a_pre_0_8_hook_is_upgraded_without_force(self) -> None:
+        self.hook.write_text(
+            f"#!/bin/sh\nexec bk --vault {json.dumps(str(self.root))} lint --changed\n\n",
+            encoding="utf-8",
+        )
+        result = self.install()
+        self.assertEqual(result["pre_commit"]["state"], "updated")
+        self.assertEqual(
+            self.hook.read_text(encoding="utf-8"), installer.render_pre_commit(self.root)
+        )
+        self.assertNotIn("commit_lint", result["enforcement"]["inactive"])
+
+    def test_a_pre_0_8_hook_is_reported_outdated_until_reinstalled(self) -> None:
+        self.install()
+        self.assertNotIn("outdated", self.commit_layer())
+        self.hook.write_text(
+            f"#!/bin/sh\nexec bk --vault {json.dumps(str(self.root))} lint --changed\n",
+            encoding="utf-8",
+        )
+        layer = self.commit_layer()
+        self.assertTrue(layer["outdated"])
+        self.assertEqual(layer["hint"], "bk hooks install --agent claude")
+        self.install()
+        self.assertNotIn("outdated", self.commit_layer())
+
+    def test_a_hook_the_operator_wrote_is_neither_judged_nor_replaced(self) -> None:
+        mine = "#!/bin/sh\nexec bk lint --changed\n"
+        self.hook.write_text(mine, encoding="utf-8")
+        self.hook.chmod(0o755)
+        self.assertNotIn("outdated", self.commit_layer())
+        self.assertEqual(self.install()["pre_commit"]["state"], "skipped")
+        self.assertEqual(self.hook.read_text(encoding="utf-8"), mine)
+
+    def registered(self, event: str) -> list[str]:
+        settings = json.loads(
+            (self.root / ".claude" / "settings.json").read_text(encoding="utf-8")
+        )
+        return [
+            item["command"]
+            for entry in settings["hooks"][event]
+            for item in entry["hooks"]
+        ]
+
+    def test_the_registered_gate_command_survives_the_shell(self) -> None:
+        self.install()
+        [command] = self.registered("PreToolUse")
+        elsewhere = self.base / "session"
+        elsewhere.mkdir()
+        payload = json.dumps(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(self.root / "wiki" / "concepts" / "x.md")},
+            }
+        )
+        done = subprocess.run(
+            ["sh", "-c", command],
+            cwd=elsewhere,
+            input=payload,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=120,
+        )
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assert_nothing_expanded(elsewhere)
+
+    def test_an_unquoted_command_from_before_0_8_is_replaced_not_duplicated(
+        self,
+    ) -> None:
+        self.install()
+        settings_path = self.root / ".claude" / "settings.json"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        unquoted = str(self.root / ".claude" / "hooks" / "brainskit-gate.sh")
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = unquoted
+        settings_path.write_text(json.dumps(settings), encoding="utf-8")
+        result = self.install()
+        self.assertEqual(self.registered("PreToolUse"), [installer.hook_command(unquoted)])
+        self.assertIn(
+            unquoted,
+            [item["command"] for item in result["claude_hook"]["settings"]["pruned"]],
+        )
+
+    def test_reinstalling_leaves_the_quoted_settings_byte_identical(self) -> None:
+        self.install()
+        settings_path = self.root / ".claude" / "settings.json"
+        before = settings_path.read_bytes()
+        self.install()
+        self.assertEqual(settings_path.read_bytes(), before)
+
+    def test_status_sees_the_quoted_commands_as_registered(self) -> None:
+        self.install()
+        enforcement = self.service.status()["enforcement"]
+        self.assertTrue(enforcement["gated"])
+        self.assertEqual(enforcement["inactive"], [])
+        self.assertEqual(enforcement["outdated"], [])
 
 
 class StandaloneVaultWorkspaceTest(VaultCase):

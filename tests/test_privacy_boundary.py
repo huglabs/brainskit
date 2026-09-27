@@ -250,6 +250,19 @@ class BoundaryDecisionTest(BoundaryFixture):
         visible, _ = for_consumer("cloud", self.vault).split_records()
         self.assertEqual({self.cloud_hash}, set(visible))
 
+    def test_installation_facts_are_withheld_from_cloud_only(self) -> None:
+        """ADR 0009: where the vault lives is inside the boundary."""
+
+        root = str(self.vault.root)
+        expectations = {"human": {"vault": root}, "local": {"vault": root}, "cloud": {}}
+        for consumer, expected in expectations.items():
+            with self.subTest(consumer=consumer):
+                boundary = for_consumer(consumer, self.vault)
+                self.assertEqual(expected, boundary.installation_facts(vault=root))
+                self.assertIs(
+                    bool(expected), Consumer.parse(consumer).sees_installation()
+                )
+
 
 class EvidenceTest(BoundaryFixture):
     def test_evidence_privacy_short_circuits_on_a_registered_hash(self) -> None:
