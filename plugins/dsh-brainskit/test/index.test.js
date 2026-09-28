@@ -13,9 +13,12 @@ function execution(name, argumentsValue = {}) {
 
 test('default guard permits retrieval and append-only capture', () => {
   const guard = createMutationGuard()
-  assert.equal(guard(execution('mcp__brainskit__search')), undefined)
-  assert.equal(guard(execution('mcp__brainskit__context')), undefined)
+  assert.equal(guard(execution('mcp__brainskit__search', { consumer: 'local' })), undefined)
+  assert.equal(guard(execution('mcp__brainskit__context', { consumer: 'cloud' })), undefined)
   assert.equal(guard(execution('mcp__brainskit__capture')), undefined)
+  for (const name of ['status', 'lint', 'proposals', 'integration_status']) {
+    assert.equal(guard(execution(`mcp__brainskit__${name}`)), undefined)
+  }
   assert.equal(guard(execution('mcp__another-server__apply')), undefined)
 })
 
@@ -41,6 +44,34 @@ test('default guard denies durable and lifecycle mutations', () => {
     guard(execution('mcp__brainskit__ask', { save: false })),
     undefined,
   )
+  assert.equal(guard(execution('mcp__brainskit__ask', { question: 'q' })), undefined)
+})
+
+test('default guard reads save the way Brainskit does', () => {
+  const guard = createMutationGuard()
+  for (const save of ['true', 'false', 1, 'no', {}]) {
+    assert.match(
+      guard(execution('mcp__brainskit__ask', { save })),
+      /BRAINSKIT_ALLOW_MUTATIONS=1/,
+      `save: ${JSON.stringify(save)} must be denied`,
+    )
+  }
+})
+
+test('default guard denies tools it does not know and resurface', () => {
+  const guard = createMutationGuard()
+  for (const name of ['resurface', 'some_future_write']) {
+    assert.match(guard(execution(`mcp__brainskit__${name}`)), /BRAINSKIT_ALLOW_MUTATIONS=1/)
+  }
+})
+
+test('human consumer is denied with and without the mutation opt-in', () => {
+  for (const guard of [createMutationGuard(), createMutationGuard(true)]) {
+    for (const name of ['mcp__brainskit__search', 'mcp__brainskit__context']) {
+      assert.match(guard(execution(name, { consumer: 'human' })), /local or cloud/)
+      assert.match(guard(execution(name, {})), /local or cloud/)
+    }
+  }
 })
 
 test('explicit opt-in permits every Brainskit operation', () => {

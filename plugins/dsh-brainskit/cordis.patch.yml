@@ -11,7 +11,7 @@
         command: !!js process.env.BRAINSKIT_COMMAND || 'bk'
         args:
           - --vault
-          - !!js process.env.BRAINSKIT_VAULT || process.cwd() + '/.brainkit'
+          - !!js process.env.BRAINSKIT_VAULT || process.cwd() + '/.brainskit'
           - serve
           - --mcp
           - --transport

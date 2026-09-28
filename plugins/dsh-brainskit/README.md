@@ -28,7 +28,7 @@ privacy, providers and durable writes; DSH discovers the MCP tools under the
 - An initialized vault. From the project DSH will use:
 
   ```sh
-  bk init .brainkit
+  bk init .brainskit
   ```
 
 The bundle never installs Python or Brainskit from an npm lifecycle script.
@@ -44,7 +44,7 @@ cd brainskit
 dsh plugin --profile web add ./plugins/dsh-brainskit
 ```
 
-Run `dsh web` from the project that contains `.brainkit`. DSH starts and stops
+Run `dsh web` from the project that contains `.brainskit`. DSH starts and stops
 the stdio server; no API key or separate HTTP service is required.
 
 ## Configuration
@@ -54,7 +54,7 @@ Set variables before launching DSH:
 | Variable | Default | Purpose |
 |---|---|---|
 | `BRAINSKIT_COMMAND` | `bk` | Exact Brainskit executable path; useful for Windows or isolated installs. |
-| `BRAINSKIT_VAULT` | `<DSH cwd>/.brainkit` | Vault connected to this DSH process. |
+| `BRAINSKIT_VAULT` | `<DSH cwd>/.brainskit` | Vault connected to this DSH process. |
 | `BRAINSKIT_ALLOW_MUTATIONS` | unset | Set to `1` to allow wiki, filing and integration lifecycle mutations. |
 | `BRAINSKIT_FAIL_ON_STARTUP_ERROR` | unset | Set to `1` to make a missing executable, invalid vault or failed MCP handshake abort DSH startup. |
 
@@ -62,7 +62,7 @@ Example for PowerShell:
 
 ```powershell
 $env:BRAINSKIT_COMMAND = (Get-Command bk).Source
-$env:BRAINSKIT_VAULT = 'C:\path\to\project\.brainkit'
+$env:BRAINSKIT_VAULT = 'C:\path\to\project\.brainskit'
 dsh web
 ```
 
@@ -73,16 +73,24 @@ than embedding the secret in YAML. A local Ollama provider needs no API key.
 
 ## Default authority
 
-The default guard allows retrieval, health checks, append-only capture and
-non-saving questions. It denies:
+The default guard is an allow-list. It permits `search`, `context`, `capture`,
+non-saving `ask`, `status`, `lint`, `proposals` and `integration_status`, and
+denies every other Brainskit tool, including:
 
 - `apply`, `file`, `approve` and `reject`;
-- `ask` when `save: true`;
-- integration configuration, startup, shutdown and synchronization.
+- `ask` with any `save` value other than `false` (Brainskit reads it as a
+  Python truth value, so `"false"` would save);
+- `resurface`, which writes `output/resurface/` and a freshness annotation;
+- integration configuration, startup, shutdown and synchronization;
+- any tool a later Brainskit release adds, until this list names it.
 
 Set `BRAINSKIT_ALLOW_MUTATIONS=1` only when the DSH profile is intended to
 manage those operations. Brainskit's own apply and provenance gates remain
 active either way.
+
+Independently of that opt-in, `search` and `context` are denied unless they
+declare `consumer: local` or `consumer: cloud`. Every result is relayed through
+the model, so `human` is never the right boundary for this bridge.
 
 ## Verify
 

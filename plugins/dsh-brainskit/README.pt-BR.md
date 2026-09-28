@@ -28,7 +28,7 @@ descobre as ferramentas MCP no namespace `mcp__brainskit__*`.
 - Um vault inicializado. No projeto usado pelo DSH:
 
   ```sh
-  bk init .brainkit
+  bk init .brainskit
   ```
 
 O bundle nunca instala Python ou Brainskit por um script de ciclo de vida npm.
@@ -44,7 +44,7 @@ cd brainskit
 dsh plugin --profile web add ./plugins/dsh-brainskit
 ```
 
-Execute `dsh web` a partir do projeto que contém `.brainkit`. O DSH inicia e
+Execute `dsh web` a partir do projeto que contém `.brainskit`. O DSH inicia e
 encerra o servidor stdio; não é necessária chave de API nem serviço HTTP
 separado.
 
@@ -55,7 +55,7 @@ Defina as variáveis antes de iniciar o DSH:
 | Variável | Padrão | Finalidade |
 |---|---|---|
 | `BRAINSKIT_COMMAND` | `bk` | Caminho exato do executável Brainskit; útil no Windows ou em instalações isoladas. |
-| `BRAINSKIT_VAULT` | `<cwd do DSH>/.brainkit` | Vault conectado a este processo DSH. |
+| `BRAINSKIT_VAULT` | `<cwd do DSH>/.brainskit` | Vault conectado a este processo DSH. |
 | `BRAINSKIT_ALLOW_MUTATIONS` | não definida | Defina como `1` para permitir mutações de wiki, arquivamento e ciclo de vida das integrações. |
 | `BRAINSKIT_FAIL_ON_STARTUP_ERROR` | não definida | Defina como `1` para um executável ausente, vault inválido ou falha MCP interromper a inicialização do DSH. |
 
@@ -63,7 +63,7 @@ Exemplo em PowerShell:
 
 ```powershell
 $env:BRAINSKIT_COMMAND = (Get-Command bk).Source
-$env:BRAINSKIT_VAULT = 'C:\caminho\do\projeto\.brainkit'
+$env:BRAINSKIT_VAULT = 'C:\caminho\do\projeto\.brainskit'
 dsh web
 ```
 
@@ -75,16 +75,26 @@ local não precisa de chave de API.
 
 ## Autoridade padrão
 
-O guard padrão permite recuperação, verificações de saúde, captura somente por
-acréscimo e perguntas sem salvamento. Ele nega:
+O guard padrão é uma lista de permissão. Ele permite `search`, `context`,
+`capture`, `ask` sem salvamento, `status`, `lint`, `proposals` e
+`integration_status`, e nega todas as outras ferramentas do Brainskit,
+incluindo:
 
 - `apply`, `file`, `approve` e `reject`;
-- `ask` quando `save: true`;
-- configuração, inicialização, encerramento e sincronização de integrações.
+- `ask` com qualquer valor de `save` diferente de `false` (o Brainskit lê o
+  valor como verdade em Python, então `"false"` salvaria);
+- `resurface`, que escreve em `output/resurface/` e uma anotação de freshness;
+- configuração, inicialização, encerramento e sincronização de integrações;
+- qualquer ferramenta que uma versão futura do Brainskit adicionar, até que
+  esta lista a nomeie.
 
 Defina `BRAINSKIT_ALLOW_MUTATIONS=1` somente quando o profile DSH tiver a
 intenção de gerenciar essas operações. Os portões de aplicação e proveniência
 do próprio Brainskit permanecem ativos de qualquer forma.
+
+Independentemente dessa liberação, `search` e `context` são negados a menos que
+declarem `consumer: local` ou `consumer: cloud`. Todo resultado passa pelo
+modelo, então `human` nunca é a fronteira correta para esta ponte.
 
 ## Verificação
 
