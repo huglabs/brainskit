@@ -90,6 +90,36 @@ class VersionIsSingleSourcedTest(unittest.TestCase):
         )
 
 
+class InstallPinsFollowTheVersionTest(unittest.TestCase):
+    """The install lines a reader copies name the version being released.
+
+    The README's git-install line said `@v0.5.0` through two releases (#28);
+    the release checklist asks for the bump, and this makes forgetting it fail.
+    """
+
+    def pins(self, page: Path, pattern: str) -> list[str]:
+        found = re.findall(pattern, page.read_text(encoding="utf-8"))
+        self.assertGreater(len(found), 0, msg=f"{page.name} no longer carries an install pin")
+        return found
+
+    def test_the_readme_git_install_pins_the_version(self) -> None:
+        for name in ("README.md", "README.pt-BR.md"):
+            with self.subTest(page=name):
+                pins = self.pins(
+                    REPO_ROOT / name,
+                    r"git\+https://github\.com/huglabs/brainskit@v([^'\"\s]+)",
+                )
+                self.assertEqual(set(pins), {declared_version()})
+
+    def test_the_dsh_bundle_readme_pins_the_version(self) -> None:
+        pages = sorted((REPO_ROOT / DSH_BUNDLE).glob("README*.md"))
+        self.assertGreaterEqual(len(pages), 2, msg="the bundle READMEs moved")
+        for page in pages:
+            with self.subTest(page=page.name):
+                pins = self.pins(page, r"brainskit==([^\s`'\"]+)")
+                self.assertEqual(set(pins), {declared_version()})
+
+
 def _simple_index(*filenames: str) -> str:
     """A PyPI simple-index page: every filename is the anchor text of a link."""
 

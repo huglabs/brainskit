@@ -9,6 +9,31 @@ artifact was built from is the durable record of what shipped.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-28
+
+The field-audit follow-through. MCP servers now declare a privacy scope,
+`bk status` and `bk doctor` no longer call an enforcement layer healthy when
+the agent does not run it, and judgment jobs withhold evidence instead of
+refusing the whole question. This release also adds `bk update`, the
+`dsh-brainskit` bundle and vault locking on Windows. Four changes need
+something from you when you upgrade:
+
+- **MCP clients now default to the `cloud` scope.** An agent on this machine
+  that relied on the previous `local` reads must start the server with
+  `bk serve --mcp --consumer local`.
+- **Re-run `bk hooks install --agent <agent>`** (with `--root <project>` if the
+  vault is nested in a repository) to refresh the installed hook scripts, the
+  pre-commit hook and the skill. No `--force` is needed unless you edited the
+  skill. Until you do, `bk status` and `bk doctor` report the stale copies as
+  `outdated`.
+- **Views and graphs generated before 0.8.0 read `unverified`** (`stale: true`,
+  with a `views.stale` or `graph.stale` lint warning) until `bk views` or
+  `bk graph` runs once.
+- **`--json` envelopes report `ok: false` whenever the exit status is
+  non-zero**: `bk lint` with an error, `bk vaults sync` with a failed vault, or
+  a failed `bk update --yes`, which now exits 1. Scripts should read `result`
+  whenever it is present, not only when `ok` is true.
+
 ### Added
 
 - An installable `dsh-brainskit` bundle under `plugins/dsh-brainskit`. It
@@ -1003,7 +1028,8 @@ First tagged release: the M0–M3 local walking skeleton.
 - Delivery gated on the shipped wheel — built from the sdist, installed in a
   throwaway environment and driven through the real CLI contract.
 
-[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/huglabs/brainskit/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/huglabs/brainskit/releases/tag/v0.8.0
 [0.7.0]: https://github.com/huglabs/brainskit/releases/tag/v0.7.0
 [0.6.2]: https://github.com/huglabs/brainskit/releases/tag/v0.6.2
 [0.6.1]: https://github.com/huglabs/brainskit/releases/tag/v0.6.1

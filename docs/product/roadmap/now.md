@@ -14,7 +14,7 @@ section is the record of what was done; this page is the record of what is open.
 
 Every row this page carried after `0.6.2` is fixed on branch `release-0.8.0`
 and waits only for the `0.8.0` tag, so none of it is listed here any more —
-`CHANGELOG.md`'s `[Unreleased]` section is the record of what was done:
+`CHANGELOG.md`'s `[0.8.0]` section is the record of what was done:
 
 - **R4** ([#7](https://github.com/huglabs/brainskit/issues/7)) — the
   PyPI-visibility guard requires the wheel and the sdist for exactly the tagged

@@ -67,7 +67,8 @@ anything.
 
 ```bash
 # 1. bump [project].version, the @v<version> git-install line in README.md and
-#    README.pt-BR.md, and add the CHANGELOG entry, then commit
+#    README.pt-BR.md, the brainskit==<version> pin in
+#    plugins/dsh-brainskit/README*.md, and add the CHANGELOG entry, then commit
 git commit -am 'Release 0.5.0'
 # 2. tag the exact commit the artifact will be built from
 git tag -a v0.5.0 -m 'brainskit 0.5.0'
