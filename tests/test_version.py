@@ -19,6 +19,7 @@ try:
 except ImportError:
     import _harness  # noqa: F401
 
+import json
 import os
 import re
 import shutil
@@ -34,7 +35,13 @@ import brainskit
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 RELEASE = REPO_ROOT / ".github" / "workflows" / "release.yml"
+CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 VISIBILITY = REPO_ROOT / "scripts" / "check-pypi-visibility.sh"
+VERIFY_WHEEL = "./scripts/verify-wheel.sh"
+FRESH_INSTALL = "./scripts/fresh-install-smoke.sh"
+HARNESS = "./scripts/enforcement-harness.sh"
+GUIDE = REPO_ROOT / "docs" / "getting-started.md"
+DSH_BUNDLE = "plugins/dsh-brainskit"
 
 
 def declared_version() -> str:
@@ -279,6 +286,196 @@ class LocalVersionIsRefusedTest(unittest.TestCase):
         self.assertNotRegex(step, r"(?m)^\s*if:", msg="must run on workflow_dispatch too")
         text = RELEASE.read_text()
         self.assertLess(text.index(self.STEP), text.index("uv sync"))
+
+
+def _job(workflow: Path, name: str) -> str:
+    """The text of one job under `jobs:`, read as text for the same reason as
+    `_release_step_run`: no YAML dependency, and the file CI runs is the one read."""
+
+    lines = workflow.read_text().splitlines()
+    start = lines.index(f"  {name}:")
+    body = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.strip() and len(line) - len(line.lstrip()) <= 2:
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _run_steps(job: str) -> list[str]:
+    return [
+        line.strip().removeprefix("- run: ")
+        for line in job.splitlines()
+        if line.strip().startswith("- run: ")
+    ]
+
+
+class ReleaseGatesAreWiredTest(unittest.TestCase):
+    """Tracks 1 and 2 of the four-track review gate every candidate wheel.
+
+    Track 4 (`verify-wheel.sh`) already did. The other two found the defects no
+    source reading produced, and ran exactly once, by hand.
+    """
+
+    def assert_gates_follow_the_build(self, job: str) -> None:
+        steps = _run_steps(job)
+        for script in (VERIFY_WHEEL, FRESH_INSTALL, HARNESS):
+            self.assertIn(script, steps, msg=f"{script} is not an unconditional run step")
+        self.assertLess(steps.index(VERIFY_WHEEL), steps.index(FRESH_INSTALL))
+        self.assertLess(steps.index(FRESH_INSTALL), steps.index(HARNESS))
+        self.assertNotIn("continue-on-error", job)
+
+    def test_ci_runs_both_gates_on_the_wheel_it_just_built(self) -> None:
+        self.assert_gates_follow_the_build(_job(CI, "wheel"))
+
+    def test_the_release_runs_both_gates_before_anything_can_upload(self) -> None:
+        job = _job(RELEASE, "verify")
+        self.assert_gates_follow_the_build(job)
+        self.assertLess(job.index(HARNESS), job.index("actions/upload-artifact"))
+
+    def test_publish_still_runs_no_project_code(self) -> None:
+        """`publish` holds `id-token: write` on that promise (release.yml header)."""
+
+        job = _job(RELEASE, "publish")
+        self.assertIn("id-token: write", job)
+        self.assertNotIn("run:", job)
+        self.assertNotIn("scripts/", job)
+
+    def test_the_gate_scripts_are_executable_and_parse(self) -> None:
+        for script in (FRESH_INSTALL, HARNESS):
+            path = REPO_ROOT / script
+            with self.subTest(script=script):
+                self.assertTrue(os.access(path, os.X_OK), msg="CI runs it as ./scripts/…")
+                result = subprocess.run(
+                    ["bash", "-n", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+
+class BundleTestsAreWiredTest(unittest.TestCase):
+    """CI runs the DSH bundle's tests exactly as its `package.json` defines them.
+
+    The bundle's guard is the boundary between a cloud model and a wider
+    consumer or a mutation, and it shipped with a suite no workflow ran.
+    """
+
+    PACKAGE = json.loads((REPO_ROOT / DSH_BUNDLE / "package.json").read_text(encoding="utf-8"))
+
+    def test_ci_runs_the_bundle_test_script_in_the_bundle(self) -> None:
+        job = _job(CI, "dsh-bundle")
+        self.assertIn("actions/setup-node", job)
+        self.assertIn(f"working-directory: {DSH_BUNDLE}", job)
+        self.assertIn("npm test", _run_steps(job), msg="not an unconditional run step")
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotRegex(job, r"(?m)^\s*if:")
+
+    def test_the_test_script_needs_nothing_installed(self) -> None:
+        """No install step in CI is only honest while there is nothing to install."""
+
+        self.assertEqual(self.PACKAGE["scripts"]["test"], "node --test")
+        for key in ("dependencies", "devDependencies", "optionalDependencies"):
+            self.assertNotIn(key, self.PACKAGE)
+
+    def test_ci_covers_each_node_major_the_bundle_declares(self) -> None:
+        declared = set(re.findall(r"(\d+)\.\d+\.\d+", self.PACKAGE["engines"]["node"]))
+        matrix = re.search(r"(?m)^\s*node: \[(.*)\]$", _job(CI, "dsh-bundle"))
+        self.assertIsNotNone(matrix)
+        assert matrix is not None
+        self.assertEqual(set(re.findall(r'"(\d+)"', matrix.group(1))), declared)
+
+
+def _guide_commands() -> list[str]:
+    """Every `bk` line in the guide's ```bash fences, extracted independently of
+    the script so the two extractions check each other."""
+
+    commands: list[str] = []
+    inside = False
+    for line in GUIDE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("```"):
+            inside = line.strip() == "```bash" and not inside
+            continue
+        if inside and line.strip().startswith("bk "):
+            commands.append(line.strip())
+    return commands
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("python3"), "needs bash and python3")
+class FreshInstallFollowsTheGuideTest(unittest.TestCase):
+    """`fresh-install-smoke.sh` runs what the guide says, not a private copy of it."""
+
+    def steps(self) -> list[str]:
+        result = subprocess.run(
+            [str(REPO_ROOT / FRESH_INSTALL), "--print-steps"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result.stdout.splitlines()
+
+    def test_every_bk_command_in_the_guide_is_a_step(self) -> None:
+        guide = _guide_commands()
+        self.assertGreaterEqual(len(guide), 4, msg="the guide's quickstart block is gone")
+        self.assertEqual(self.steps()[: len(guide)], guide)
+
+    def test_the_guide_creates_a_vault_non_interactively(self) -> None:
+        """Off a terminal `bk init` refuses; the gate can only follow the config path."""
+
+        self.assertTrue(
+            any(step.startswith("bk init ") and "--config" in step for step in self.steps())
+        )
+
+    def test_every_step_beyond_the_guide_is_documented_verbatim(self) -> None:
+        guide = set(_guide_commands())
+        extra = [step for step in self.steps() if step not in guide]
+        self.assertGreater(len(extra), 0, msg="the hooks install step is gone")
+        pages = [REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").glob("*.md"))]
+        corpus = "\n".join(page.read_text(encoding="utf-8") for page in pages)
+        for step in extra:
+            with self.subTest(step=step):
+                self.assertIn(step, corpus, msg="the gate runs a command no reader is told to")
+
+
+class EnforcementHarnessCoverageTest(unittest.TestCase):
+    """The layers Track 2 broke by hand stay broken by the harness.
+
+    Each break is named by the change it makes, so dropping one fails here
+    rather than quietly shrinking the gate.
+    """
+
+    SCRIPT = (REPO_ROOT / HARNESS).read_text(encoding="utf-8")
+
+    def test_an_intact_install_is_the_control_before_any_break(self) -> None:
+        control = self.SCRIPT.index("fresh_vault intact")
+        for other in re.findall(r"^fresh_vault (\S+)$", self.SCRIPT, flags=re.M):
+            if other != "intact":
+                self.assertLess(control, self.SCRIPT.index(f"fresh_vault {other}\n"))
+
+    def test_every_break_the_review_named_is_exercised(self) -> None:
+        breaks = {
+            "gate deleted, still registered": 'rm "$(gate_script)"',
+            "gate unregistered": 'settings["hooks"]["PreToolUse"] = []',
+            "gate not executable": 'chmod 0644 "$(gate_script)"',
+            "bk off PATH": "env PATH=/usr/bin:/bin",
+            "pre-commit names another vault": "text.replace(vault, other)",
+            "core.hooksPath redirected": "config core.hooksPath",
+            "status script outdated": '>>"$(status_script)"',
+            "gate script outdated": '>>"$(gate_script)"',
+        }
+        for label, change in breaks.items():
+            with self.subTest(label):
+                self.assertIn(change, self.SCRIPT)
+
+    def test_both_reporting_surfaces_are_asked(self) -> None:
+        self.assertIn("status --json", self.SCRIPT)
+        self.assertIn("doctor --json", self.SCRIPT)
+        self.assertGreaterEqual(self.SCRIPT.count("doctor_expect "), 7)
+        self.assertGreaterEqual(self.SCRIPT.count("status_expect "), 7)
 
 
 if __name__ == "__main__":  # pragma: no cover

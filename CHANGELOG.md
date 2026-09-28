@@ -34,6 +34,19 @@ artifact was built from is the durable record of what shipped.
 
 ### Changed
 
+- **MCP clients now default to the `cloud` scope — breaking.** `bk serve --mcp`
+  takes `--consumer cloud|local` (both transports; default `cloud`; `human` is
+  refused with `policy_denied`), and every tool and resource answers under it
+  ([ADR 0010](docs/knowledge/decisions/architecture/0010-mcp-declares-its-consumer.md)).
+  Before, MCP read as `local` where no consumer was named and `status`
+  returned the unfiltered operator report. Now `status` is the filtered
+  `/api/status` report (no `vault` key at `cloud`, never-ingest excluded at
+  `local`, no `projections`), `proposals` is consumer-scoped, `lint` withholds
+  findings on material outside the scope (`redacted_findings`), and a
+  `search`/`context` `consumer` wider than the server's is refused with
+  `policy_denied` rather than clamped. `tools/list` offers only the consumers
+  the server will answer. **To keep the previous behaviour for an agent on
+  this machine, start the server with `--consumer local`.**
 - **`--json`'s `ok` now means the command succeeded, and agrees with the exit
   status** ([#10](https://github.com/huglabs/brainskit/issues/10)). `_emit`
   wrote `"ok": true` as a literal, so `bk lint` with an error and `bk vaults
@@ -68,6 +81,33 @@ artifact was built from is the durable record of what shipped.
   ([#20](https://github.com/huglabs/brainskit/issues/20)); every in-process CLI
   call in the suite refuses a run that never reached the command under test
   ([#21](https://github.com/huglabs/brainskit/issues/21)).
+
+### Security
+
+- **MCP `capture` no longer copies any readable file into the vault.** A file
+  path is accepted only inside the vault's project (code root or an installed
+  workspace, symlinks resolved), outside the vault itself, and never a
+  credential file — `.env*` except `.env.example|.sample|.template|.dist`,
+  `*.pem`, `*.key`, SSH private keys, `.netrc`, `.npmrc`, `.pypirc`, anything
+  under `~/.ssh`, `~/.aws`, `~/.config/gcloud` or a `.git` directory. Refusals
+  are `policy_denied` with a `reason` and name neither the path nor the file's
+  content. Text and URLs are unchanged, and so is `bk capture <path>`.
+- **MCP `file` could declassify a source.** It resolved any source by hash
+  prefix and moved it to any branch, so a cloud client could move a
+  never-ingest source into a cloud branch and then search it. `file`,
+  `approve` and `reject` now resolve only what the server's consumer may see,
+  and answer `not_found` for the rest.
+- **MCP `ask`, `resurface` and `lint --semantic` no longer read local-only
+  evidence for a `cloud` server** when a local model is mapped; evidence is read
+  no wider than the server's consumer.
+- **MCP integration operations** (`integration_configure`, `_up`, `_down`,
+  `_sync`) no longer echo paths, container names or `*_env` names to a machine
+  consumer, and `integration_configure` refuses an `options.consumer` wider
+  than the server's.
+- **MCP flags are JSON booleans.** `save`, `semantic`, `enabled` and `managed`
+  were coerced with `bool()`, so `"false"` saved an answer; limits accepted
+  `true` and `"5"`. Anything but a JSON boolean (or integer) is now
+  `validation_error` naming the argument, before anything runs.
 
 ### Fixed
 

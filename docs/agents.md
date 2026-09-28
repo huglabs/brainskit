@@ -178,6 +178,22 @@ nothing else on disk remembers it and `bk status` has to look in the same place
 the installer wrote to. An adapter written before that field existed falls back
 to the vault, so an existing install keeps reporting exactly as it did.
 
+## Connecting an agent over MCP
+
+`bk serve --mcp` answers under the consumer it is started with, and defaults to
+`cloud`: an MCP client's answers may be forwarded to a hosted model, and the
+server cannot tell. For an agent that runs on this machine and should read
+local-only evidence, say so:
+
+```bash
+bk --vault ./my-vault serve --mcp --transport stdio --consumer local
+```
+
+`human` is refused over MCP. A `search` or `context` call may ask for a
+narrower consumer than the server's, never a wider one. Over MCP, `capture`
+accepts a file only inside the project and never a credential file such as
+`.env` or an SSH key — see [the privacy boundary](./privacy.md#an-mcp-server-declares-its-consumer).
+
 ## What a watch will not capture
 
 `bk watch` walks every configured source folder and captures what it finds, and

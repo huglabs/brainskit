@@ -18,6 +18,8 @@ from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     BrainskitError,
     NotConfiguredError,
+    PolicyError,
+    PrivacyMode,
     ValidationError,
 )
 from brainskit.domain.privacy import Consumer
@@ -30,12 +32,54 @@ from brainskit.interfaces.errors import (
     succeeded,
 )
 
-#: MCP is a machine surface, and this is the scope it reads under wherever no
-#: caller declared one: everything except never-ingest. `search` and `context`
-#: require the caller to declare instead, because their results are the ones
-#: that get forwarded somewhere this server cannot see. Spelled once, so the
-#: three methods that share the decision cannot come to share it unequally.
-MCP_CONSUMER = Consumer.LOCAL.value
+#: The server's declared consumer when the operator names none (ADR 0010). MCP
+#: hands its answers to a model, and nothing on this side of the pipe can see
+#: where that model runs, so the default is the one boundary that is safe to
+#: forward anywhere. `--consumer local` is the operator saying otherwise.
+MCP_DEFAULT_CONSUMER = Consumer.CLOUD
+
+
+def _narrows(requested: Consumer, ceiling: Consumer) -> bool:
+    """Whether `requested` sees nothing `ceiling` does not.
+
+    Derived from `Consumer.allows` rather than a rank table beside it, so the
+    lattice is stated once, in the domain.
+    """
+
+    return all(
+        ceiling.allows(mode) for mode in PrivacyMode if requested.allows(mode)
+    ) and (ceiling.sees_installation() or not requested.sees_installation())
+
+
+#: The consumers an MCP server may be declared as: everything within `local`.
+#: `human` is not among them -- it withholds nothing, never-ingest included,
+#: and a model-facing transport is never the reader it was meant for.
+MCP_CONSUMERS = tuple(
+    consumer for consumer in Consumer if _narrows(consumer, Consumer.LOCAL)
+)
+
+
+def server_consumer(value: str | Consumer | None) -> Consumer:
+    """The ceiling an MCP server answers under, or the refusal to serve at all."""
+
+    if value is None:
+        return MCP_DEFAULT_CONSUMER
+    parsed = Consumer.parse(value)
+    if parsed not in MCP_CONSUMERS:
+        raise PolicyError(
+            "MCP serves a model, and a model is never given the unrestricted "
+            "human scope",
+            details={
+                "consumer": parsed.value,
+                "allowed": [consumer.value for consumer in MCP_CONSUMERS],
+                "hint": (
+                    "Serve with --consumer local for an agent running on this "
+                    "machine, or --consumer cloud (the default) for anything "
+                    "that may forward results off it"
+                ),
+            },
+        )
+    return parsed
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SUPPORTED_VERSIONS = {MCP_PROTOCOL_VERSION}
@@ -71,16 +115,19 @@ class ProtocolVersionError(JsonRpcRequestError):
     code = "protocol_version_invalid"
 
 
-def run_stdio(service: BrainskitService) -> None:
+def run_stdio(
+    service: BrainskitService, *, consumer: str | Consumer | None = None
+) -> None:
     """Minimal MCP JSON-RPC stdio transport; stdout is protocol-only."""
 
+    ceiling = server_consumer(consumer)
     for line in sys.stdin:
         if not line.strip():
             continue
         request: dict[str, Any] | None = None
         try:
             request = json.loads(line)
-            response = _handle(service, request)
+            response = _handle(service, request, ceiling)
         except (json.JSONDecodeError, TypeError) as exc:
             response = _error(
                 request.get("id") if isinstance(request, dict) else None,
@@ -117,9 +164,11 @@ def run_http(
     allowed_origins: list[str] | None = None,
     tls_cert: str | None = None,
     tls_key: str | None = None,
+    consumer: str | Consumer | None = None,
 ) -> None:
     """Serve stateless MCP Streamable HTTP with pre-shared Bearer auth."""
 
+    ceiling = server_consumer(consumer)
     if not 1 <= port <= 65535:
         raise ValidationError("MCP HTTP port must be between 1 and 65535")
     token = os.environ.get(token_env) if token_env else None
@@ -142,6 +191,7 @@ def run_http(
     }
     server = BrainskitMcpHttpServer((host, port), BrainskitMcpHttpHandler)
     server.service = service
+    server.consumer = ceiling
     server.token = token
     server.allowed_origins = set(allowed_origins or defaults)
     if tls_cert and tls_key:
@@ -158,6 +208,7 @@ class BrainskitMcpHttpServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     service: BrainskitService
+    consumer: Consumer = MCP_DEFAULT_CONSUMER
     token: str
     allowed_origins: set[str]
 
@@ -224,7 +275,7 @@ class BrainskitMcpHttpHandler(BaseHTTPRequestHandler):
         status = HTTPStatus.OK
         try:
             self._validate_http_contract(request)
-            response = _handle(self.server.service, request)
+            response = _handle(self.server.service, request, self.server.consumer)
         except JsonRpcRequestError as exc:
             # The one family that is an HTTP failure as well as a JSON-RPC one:
             # the Streamable HTTP transport requires a hard 400 so a conforming
@@ -418,8 +469,11 @@ def _report_internal_error(context: str, exc: BaseException) -> None:
 
 
 def _handle(
-    service: BrainskitService, request: dict[str, Any]
+    service: BrainskitService,
+    request: dict[str, Any],
+    consumer: str | Consumer | None = None,
 ) -> dict[str, Any] | None:
+    ceiling = server_consumer(consumer)
     method = request.get("method")
     request_id = request.get("id")
     params = request.get("params") or {}
@@ -443,13 +497,18 @@ def _handle(
     if method == "ping":
         return _result(request_id, {})
     if method == "tools/list":
-        return _result(request_id, {"tools": _tool_definitions()})
+        return _result(request_id, {"tools": _tool_definitions(ceiling)})
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
         if not isinstance(name, str):
             raise ValidationError("MCP tool name must be a string")
-        value = _call_tool(service, name, arguments)
+        if not isinstance(arguments, dict):
+            raise ValidationError(
+                "MCP tool arguments must be a JSON object",
+                details={"tool": name, "received": _json_type(arguments)},
+            )
+        value = _call_tool(service, name, arguments, ceiling)
         return _result(
             request_id,
             {
@@ -466,7 +525,7 @@ def _handle(
     if method == "resources/list":
         readable_pages = sorted(
             str(node["path"])
-            for node in service.graph_data(consumer=MCP_CONSUMER)["nodes"]
+            for node in service.graph_data(consumer=ceiling.value)["nodes"]
             if str(node["id"]).startswith("page:")
         )
         return _result(
@@ -488,7 +547,7 @@ def _handle(
         if not uri.startswith(prefix):
             raise ValidationError("Unknown resource URI", details={"uri": uri})
         path = uri[len(prefix) :]
-        resource = service.read_resource(f"page:{path}", consumer=MCP_CONSUMER)
+        resource = service.read_resource(f"page:{path}", consumer=ceiling.value)
         return _result(
             request_id,
             {
@@ -505,58 +564,75 @@ def _handle(
 
 
 def _call_tool(
-    service: BrainskitService, name: str, arguments: dict[str, Any]
+    service: BrainskitService,
+    name: str,
+    arguments: dict[str, Any],
+    consumer: str | Consumer | None = None,
 ) -> dict[str, Any]:
+    ceiling = server_consumer(consumer)
+    scope = ceiling.value
     tools: dict[str, Callable[[], dict[str, Any]]] = {
         "capture": lambda: service.capture(
             arguments.get("source"),
             text=arguments.get("text"),
             title=arguments.get("title"),
+            confined=True,
         ),
         "search": lambda: service.search(
             str(arguments["query"]),
-            int(arguments.get("limit", 10)),
-            consumer=str(arguments["consumer"]),
+            _integer(arguments, "limit", 10),
+            consumer=_requested_consumer(arguments, ceiling),
         ),
         "context": lambda: service.context(
             str(arguments["query"]),
-            limit=int(arguments.get("limit", 8)),
-            max_chars=int(arguments.get("max_chars", 24_000)),
-            consumer=str(arguments["consumer"]),
+            limit=_integer(arguments, "limit", 8),
+            max_chars=_integer(arguments, "max_chars", 24_000),
+            consumer=_requested_consumer(arguments, ceiling),
         ),
         "apply": lambda: service.apply(arguments["proposal"]),
         "file": lambda: service.file(
-            str(arguments["item"]), str(arguments["branch"])
+            str(arguments["item"]), str(arguments["branch"]), consumer=scope
         ),
         "ask": lambda: service.ask(
-            str(arguments["question"]), save=bool(arguments.get("save", False))
+            str(arguments["question"]),
+            save=_flag(arguments, "save"),
+            consumer=scope,
         ),
-        "proposals": lambda: service.proposals(arguments.get("status")),
-        "approve": lambda: service.approve(str(arguments["proposal_id"])),
+        "proposals": lambda: service.proposals_for_consumer(
+            arguments.get("status"), consumer=scope
+        ),
+        "approve": lambda: service.approve(
+            str(arguments["proposal_id"]), consumer=scope
+        ),
         "reject": lambda: service.reject(
-            str(arguments["proposal_id"]), str(arguments.get("reason", ""))
+            str(arguments["proposal_id"]),
+            str(arguments.get("reason", "")),
+            consumer=scope,
         ),
-        "resurface": service.resurface,
-        "status": service.status,
+        "resurface": lambda: service.resurface(consumer=scope),
+        "status": lambda: service.reader_status(consumer=scope),
         "lint": lambda: service.lint(
-            semantic=bool(arguments.get("semantic", False))
+            semantic=_flag(arguments, "semantic"), consumer=scope
         ),
         "integration_configure": lambda: service.integration_configure(
             str(arguments["name"]),
-            enabled=arguments.get("enabled"),
-            managed=arguments.get("managed"),
-            options=dict(arguments.get("options", {})),
+            enabled=_optional_flag(arguments, "enabled"),
+            managed=_optional_flag(arguments, "managed"),
+            options=_integration_options(arguments, ceiling),
+            consumer=scope,
         ),
         "integration_status": lambda: service.integration_status(
             str(arguments["name"]) if arguments.get("name") else None,
-            consumer=MCP_CONSUMER,
+            consumer=scope,
         ),
-        "integration_up": lambda: service.integration_up(str(arguments["name"])),
+        "integration_up": lambda: service.integration_up(
+            str(arguments["name"]), consumer=scope
+        ),
         "integration_down": lambda: service.integration_down(
-            str(arguments["name"])
+            str(arguments["name"]), consumer=scope
         ),
         "integration_sync": lambda: service.integration_sync(
-            str(arguments["name"])
+            str(arguments["name"]), consumer=scope
         ),
     }
     operation = tools.get(str(name))
@@ -571,11 +647,129 @@ def _call_tool(
         ) from exc
 
 
-def _tool_definitions() -> list[dict[str, Any]]:
+def _requested_consumer(arguments: dict[str, Any], ceiling: Consumer) -> str:
+    """The caller's declared consumer, if it is within the server's.
+
+    Refused rather than clamped: a clamped `local` would come back as a cloud
+    answer the caller believes is local, and nothing in the result would say
+    evidence was missing for that reason rather than because none matched.
+    """
+
+    requested = Consumer.parse(str(arguments["consumer"]))
+    if not _narrows(requested, ceiling):
+        raise PolicyError(
+            "This MCP server answers no wider than its declared consumer",
+            details={
+                "requested": requested.value,
+                "server_consumer": ceiling.value,
+                "allowed": _allowed_under(ceiling),
+            },
+        )
+    return requested.value
+
+
+def _integration_options(
+    arguments: dict[str, Any], ceiling: Consumer
+) -> dict[str, Any]:
+    """Options for `integration_configure`, never naming a wider consumer.
+
+    An integration's `consumer` option is the boundary its sync or viewer
+    later serves under. Setting it over MCP is the one way a model could hand
+    itself a wider scope than the server was declared with, one step removed.
+    """
+
+    options = arguments.get("options", {})
+    if not isinstance(options, dict):
+        raise ValidationError(
+            "MCP tool argument must be a JSON object",
+            details={"argument": "options", "received": _json_type(options)},
+        )
+    if "consumer" in options:
+        requested = Consumer.parse(str(options["consumer"]))
+        if not _narrows(requested, ceiling):
+            raise PolicyError(
+                "An integration configured over MCP serves no wider than the "
+                "server's declared consumer",
+                details={
+                    "requested": requested.value,
+                    "server_consumer": ceiling.value,
+                    "allowed": _allowed_under(ceiling),
+                },
+            )
+    return dict(options)
+
+
+def _allowed_under(ceiling: Consumer) -> list[str]:
+    return [consumer.value for consumer in Consumer if _narrows(consumer, ceiling)]
+
+
+def _flag(arguments: dict[str, Any], name: str) -> bool:
+    """A boolean argument, absent meaning false.
+
+    `bool("false")` is `True`, so coercing here once turned a client that
+    serialised its flags as strings into one that saved every answer.
+    """
+
+    value = arguments.get(name, False)
+    if not isinstance(value, bool):
+        raise _not_a(name, "boolean", value)
+    return value
+
+
+def _optional_flag(arguments: dict[str, Any], name: str) -> bool | None:
+    """A boolean argument where absent means "leave it as it is"."""
+
+    if name not in arguments:
+        return None
+    value = arguments[name]
+    if not isinstance(value, bool):
+        raise _not_a(name, "boolean", value)
+    return value
+
+
+def _integer(arguments: dict[str, Any], name: str, default: int) -> int:
+    value = arguments.get(name, default)
+    # `bool` is an `int` subclass, and `true` is not a limit.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _not_a(name, "integer", value)
+    return int(value)
+
+
+def _not_a(name: str, expected: str, value: Any) -> ValidationError:
+    return ValidationError(
+        f"MCP tool argument must be a JSON {expected}",
+        details={"argument": name, "expected": expected, "received": _json_type(value)},
+    )
+
+
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def _tool_definitions(
+    consumer: str | Consumer | None = None,
+) -> list[dict[str, Any]]:
+    ceiling = server_consumer(consumer)
     return [
         _tool(
             "capture",
-            "Capture a file path, URL, or literal text into raw/_inbox.",
+            "Capture literal text or an http(s) URL into raw/_inbox. A file "
+            "path is accepted only inside this vault's project (its code root "
+            "or installed workspace, outside the vault itself) and never for a "
+            "credential file such as .env, a private key, or anything under "
+            "~/.ssh; send the content as text instead.",
             {
                 "source": {"type": "string"},
                 "text": {"type": "string"},
@@ -588,7 +782,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
             {
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "consumer": _consumer_schema(),
+                "consumer": _consumer_schema(ceiling),
             },
             ["query", "consumer"],
         ),
@@ -599,7 +793,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "query": {"type": "string"},
                 "limit": {"type": "integer"},
                 "max_chars": {"type": "integer"},
-                "consumer": _consumer_schema(),
+                "consumer": _consumer_schema(ceiling),
             },
             ["query", "consumer"],
         ),
@@ -657,7 +851,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "Resurface one durable insight through the configured provider.",
             {},
         ),
-        _tool("status", "Return vault health and counts.", {}),
+        _tool(
+            "status",
+            "Return vault health and counts, scoped to this server's declared "
+            "consumer.",
+            {},
+        ),
         _tool(
             "lint",
             "Validate registry, frontmatter, citations, and links.",
@@ -700,20 +899,22 @@ def _tool_definitions() -> list[dict[str, Any]]:
     ]
 
 
-def _consumer_schema() -> dict[str, Any]:
+def _consumer_schema(consumer: str | Consumer | None = None) -> dict[str, Any]:
+    ceiling = server_consumer(consumer)
     return {
         "type": "string",
-        "enum": [consumer.value for consumer in Consumer],
+        "enum": _allowed_under(ceiling),
         "description": (
             "Privacy boundary applied to the returned evidence. There is no "
             "default: declare the boundary of whoever will read the result. "
+            f"This server was started as '{ceiling.value}' and answers no "
+            "wider; a wider value is refused with policy_denied. "
             "'cloud' returns only branches marked cloud, so it is the only "
             "value safe to forward to a third-party model or service. "
             "'local' returns cloud and local-only branches and excludes "
             "never-ingest, so it is the right value for an agent running on "
-            "the operator's own machine. 'human' applies NO restriction at "
-            "all: it returns never-ingest content verbatim and is intended "
-            "only for a surface a person reads directly and does not relay."
+            "the operator's own machine. never-ingest content is never "
+            "served over MCP."
         ),
     }
 

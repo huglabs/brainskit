@@ -48,6 +48,7 @@ from brainskit.domain.model import (
     ScanSurvey,
     normalize_branch,
 )
+from brainskit.domain.privacy import Consumer
 
 INTEGRATION_TARGETS = ("obsidian", "neo4j", "postgres")
 EXPORT_SUFFIXES = {
@@ -59,6 +60,18 @@ EXPORT_SUFFIXES = {
     "llms-txt": "txt",
 }
 
+
+def _model_ceiling(consumer: str) -> str:
+    """The widest evidence a model may read on behalf of `consumer`.
+
+    `local` for the operator, as it always was: `human` withholds nothing, and
+    the judgment router refuses never-ingest outright. Anyone narrower keeps
+    their own boundary, so a model cannot read for a caller what that caller
+    could not read itself.
+    """
+
+    parsed = Consumer.parse(consumer)
+    return Consumer.LOCAL.value if parsed is Consumer.HUMAN else parsed.value
 
 
 class BrainskitService:
@@ -118,10 +131,17 @@ class BrainskitService:
         return check_write(self.vault.root, target, agent=agent).to_dict()
 
     def capture(
-        self, source: str | None, *, text: str | None = None, title: str | None = None
+        self,
+        source: str | None,
+        *,
+        text: str | None = None,
+        title: str | None = None,
+        confined: bool = False,
     ) -> dict[str, Any]:
         """Register one source and mark what it relates to. See `Ingestion`."""
-        return self.ingestion.capture(source, text=text, title=title)
+        return self.ingestion.capture(
+            source, text=text, title=title, confined=confined
+        )
 
     def watch_once(self) -> dict[str, Any]:
         """Sweep the configured source folders. See `Ingestion.watch_once`."""
@@ -142,8 +162,14 @@ class BrainskitService:
             "still_cited_by": self.ingestion.pages_citing(record.content_hash),
         }
 
-    def file(self, identifier: str, branch: str) -> dict[str, Any]:
-        record = self.vault.file_source(identifier, normalize_branch(branch))
+    def file(
+        self, identifier: str, branch: str, *, consumer: str = "human"
+    ) -> dict[str, Any]:
+        # Resolved inside the caller's boundary first: moving a source is how
+        # its privacy changes, so a caller who may not see a source may not
+        # move one into a branch they can read.
+        content_hash = self.reader.visible_source(identifier, consumer=consumer)
+        record = self.vault.file_source(content_hash, normalize_branch(branch))
         self.index.rebuild(self.vault)
         return {"source": record.to_dict()}
 
@@ -265,10 +291,11 @@ class BrainskitService:
         enabled: bool | None = None,
         managed: bool | None = None,
         options: dict[str, Any] | None = None,
+        consumer: str = "human",
     ) -> dict[str, Any]:
         """Store an integration's policy. See `Projections`."""
         return self.projections.integration_configure(
-            name, enabled=enabled, managed=managed, options=options
+            name, enabled=enabled, managed=managed, options=options, consumer=consumer
         )
 
     def integration_status(
@@ -277,17 +304,21 @@ class BrainskitService:
         """Durable policy plus live process state. See `Projections`."""
         return self.projections.integration_status(name, consumer=consumer)
 
-    def integration_up(self, name: str) -> dict[str, Any]:
+    def integration_up(self, name: str, *, consumer: str = "human") -> dict[str, Any]:
         """Start a managed integration. See `Projections`."""
-        return self.projections.integration_up(name)
+        return self.projections.integration_up(name, consumer=consumer)
 
-    def integration_down(self, name: str) -> dict[str, Any]:
+    def integration_down(
+        self, name: str, *, consumer: str = "human"
+    ) -> dict[str, Any]:
         """Stop a managed integration. See `Projections`."""
-        return self.projections.integration_down(name)
+        return self.projections.integration_down(name, consumer=consumer)
 
-    def integration_sync(self, name: str) -> dict[str, Any]:
+    def integration_sync(
+        self, name: str, *, consumer: str = "human"
+    ) -> dict[str, Any]:
         """Push the graph to an integration. See `Projections`."""
-        return self.projections.integration_sync(name)
+        return self.projections.integration_sync(name, consumer=consumer)
 
     def ask(
         self,
@@ -295,17 +326,20 @@ class BrainskitService:
         *,
         save: bool = False,
         history: list[dict[str, Any]] | None = None,
+        consumer: str = "human",
     ) -> dict[str, Any]:
         """Answer from compiled evidence. See `Jobs`."""
-        return self.jobs_runner.ask(question, save=save, history=history)
+        return self.jobs_runner.ask(
+            question, save=save, history=history, ceiling=_model_ceiling(consumer)
+        )
 
     def digest(self, since: str = "7d") -> dict[str, Any]:
         """Generate the configured digest. See `Jobs`."""
         return self.jobs_runner.digest(since)
 
-    def resurface(self) -> dict[str, Any]:
+    def resurface(self, *, consumer: str = "human") -> dict[str, Any]:
         """Surface one durable insight. See `Jobs`."""
-        return self.jobs_runner.resurface()
+        return self.jobs_runner.resurface(ceiling=_model_ceiling(consumer))
 
     def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
         """Vault status scoped to a consumer. See `Reader`."""
@@ -349,17 +383,24 @@ class BrainskitService:
         """The filing review queue. See `Filing`."""
         return self.filing.proposals(status)
 
-    def approve(self, proposal_id: str) -> dict[str, Any]:
+    def approve(self, proposal_id: str, *, consumer: str = "human") -> dict[str, Any]:
         """Execute a stored filing proposal. See `Filing`."""
+        self.reader.require_proposal(proposal_id, consumer=consumer)
         return self.filing.approve(proposal_id)
 
-    def reject(self, proposal_id: str, reason: str = "") -> dict[str, Any]:
+    def reject(
+        self, proposal_id: str, reason: str = "", *, consumer: str = "human"
+    ) -> dict[str, Any]:
         """Decline a stored filing proposal. See `Filing`."""
+        self.reader.require_proposal(proposal_id, consumer=consumer)
         return self.filing.reject(proposal_id, reason)
 
-    def lint(self, *, semantic: bool = False) -> dict[str, Any]:
+    def lint(self, *, semantic: bool = False, consumer: str = "human") -> dict[str, Any]:
         """Validate the vault's structural contracts. See `Health`."""
-        return self.health.lint(semantic=semantic)
+        result = self.health.lint(
+            semantic=semantic, ceiling=_model_ceiling(consumer)
+        )
+        return self.reader.lint_for_consumer(result, consumer=consumer)
 
     def status(self) -> dict[str, Any]:
         """Vault health, counts and enforcement state. See `Health`."""

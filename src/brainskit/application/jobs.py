@@ -239,7 +239,13 @@ class Jobs:
         self.ledger = ledger
 
     def _judgment_context(
-        self, job: str, query: str, *, next_step: str, **kwargs: Any
+        self,
+        job: str,
+        query: str,
+        *,
+        next_step: str,
+        ceiling: str = "local",
+        **kwargs: Any,
     ) -> tuple[dict[str, Any], int]:
         """Evidence the model on `job`'s route may read, and how much was withheld.
 
@@ -251,6 +257,10 @@ class Jobs:
         router routes the final bundle again inside `run`, and its refusal
         stays the last line of defence. The withheld side is a count only: its
         path would name the document and its branch.
+
+        `ceiling` narrows that first read for a caller who may not see `local`
+        itself -- an MCP server declared `cloud` (ADR 0010) -- so a local model
+        cannot read for that caller what the caller could not read.
         """
 
         def read(consumer: str) -> dict[str, Any]:
@@ -258,10 +268,14 @@ class Jobs:
                 query, consumer=consumer, include_apply_contract=False, **kwargs
             )
 
-        context = read("local")
+        context = read(ceiling)
         local_withheld = int(context["redacted"])
         branches = context_branches(context)
-        if self.judgment_runner.consumer_for(job=job, branches=branches) == "cloud":
+        if (
+            ceiling != "cloud"
+            and self.judgment_runner.consumer_for(job=job, branches=branches)
+            == "cloud"
+        ):
             context = read("cloud")
         withheld = int(context["redacted"])
         if withheld and not context["evidence"]:
@@ -296,6 +310,7 @@ class Jobs:
         *,
         save: bool = False,
         history: list[dict[str, Any]] | None = None,
+        ceiling: str = "local",
     ) -> dict[str, Any]:
         # `ask` only ever reads; the apply-proposal shape belongs to callers
         # about to write one (see `Retrieval.context`).
@@ -309,6 +324,7 @@ class Jobs:
             "query",
             question,
             next_step="Rephrase the question, or look for what the vault holds with bk search",
+            ceiling=ceiling,
         )
         branches = context_branches(context)
         response = self.judgment_runner.run(
@@ -422,7 +438,7 @@ class Jobs:
             "withheld_sources": withheld,
         }
 
-    def resurface(self) -> dict[str, Any]:
+    def resurface(self, *, ceiling: str = "local") -> dict[str, Any]:
         # `resurface` only ever reads (see `ask`, above, for why the apply
         # contract stays off).
         context, withheld = self._judgment_context(
@@ -432,6 +448,7 @@ class Jobs:
                 "Capture and apply sources first, or look for what the vault "
                 "holds with bk search"
             ),
+            ceiling=ceiling,
             limit=20,
         )
         result = self.judgment_runner.run(

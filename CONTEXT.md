@@ -40,6 +40,16 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   keep it. Decided by `Consumer.sees_installation`, applied by
   `PrivacyBoundary.installation_facts(**facts)`. Vault-relative paths are
   evidence identifiers, not installation facts. See ADR 0009.
+- **Server consumer** — the consumer an MCP server is declared as, with `bk
+  serve --mcp --consumer cloud|local`; `cloud` when none is named, and `human`
+  is refused. It is a ceiling: every tool and resource answers under it, and a
+  per-call `consumer` may only narrow it — a wider one is `policy_denied`, never
+  clamped. Validated once by `server_consumer`; "narrows" is derived from
+  `Consumer.allows`. See ADR 0010.
+- **Confined capture** — a capture a model asked for (MCP): text and URLs as
+  usual, a file only inside the code root or an installed workspace, outside
+  the vault, and never a credential-shaped file. `bk capture` is not confined.
+  The name list lives in `application/capture.py`. See ADR 0010.
 
 ## Freshness
 

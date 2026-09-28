@@ -31,7 +31,7 @@ switches to machine-readable output.
 | `integration configure\|status\|up\|down\|sync NAME` | Persistent integration lifecycle |
 | `vaults register\|list\|forget\|sync` | The vaults on this machine, synced into one shared store |
 | `web serve [--host H] [--port P] [--consumer C] [--token-env V]` | Foreground web viewer |
-| `serve --mcp [--transport stdio\|http] …` | MCP transports |
+| `serve --mcp [--transport stdio\|http] [--consumer cloud\|local] …` | MCP transports; every call answers under `--consumer` (default `cloud`, `human` refused) |
 | `watch [--once] [--interval S]` | Capture new files under the configured source folders — resolved against the vault — minus `ignore` |
 | `schedule` | Show configured habit job registrations |
 | `hooks install --agent claude\|codex\|gemini\|opencode [--force]` | Install the agent contract |

@@ -6,6 +6,9 @@
     - id: memory-brainskit
       name: '@deepseek-ai/dsh-mcp-client'
       config:
+        # Do not rename. The dsh-brainskit guard matches tools named
+        # mcp__brainskit__*; under another name it would match nothing and
+        # every Brainskit tool would run unguarded.
         serverName: brainskit
         transport: stdio
         command: !!js process.env.BRAINSKIT_COMMAND || 'bk'
@@ -16,11 +19,10 @@
           - --mcp
           - --transport
           - stdio
+          # The server's ceiling: every tool answers under it. DSH's default
+          # model is a cloud API, so local evidence is opt-in.
+          - --consumer
+          - !!js process.env.BRAINSKIT_CONSUMER || 'cloud'
         cwd: !!js process.cwd()
         toolCallTimeoutMs: 120000
         failOnStartupError: !!js process.env.BRAINSKIT_FAIL_ON_STARTUP_ERROR === '1'
-        reconnect:
-          enabled: true
-          initialDelayMs: 500
-          maxDelayMs: 30000
-          maxAttempts: 10

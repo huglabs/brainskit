@@ -139,7 +139,9 @@ does the same over the bytes the web viewer and MCP send.
 - **The MCP `status` tool** answers with `Health.status`, whose counts are not
   consumer-scoped at all. Its `vault` key is visible to the transport's `local`
   scope, which this ADR keeps; whether its counts should be filtered to `local`
-  is a separate question about counts, not paths.
+  is a separate question about counts, not paths. (Decided by ADR 0010: MCP
+  `status` now answers through `reader_status` under the server's declared
+  consumer, which defaults to `cloud`.)
 - **Operator-only CLI output** (`doctor`, `init`, `vaults`, `hooks install`)
   names paths because the person reading it is the one who owns them. Piping it
   to a third party is a choice this boundary cannot see.

@@ -83,6 +83,19 @@ def _sans_machine_layout(row: dict[str, Any]) -> dict[str, Any]:
     return scrubbed
 
 
+def _runtime_for(result: dict[str, Any], consumer: str) -> dict[str, Any]:
+    """An up/down/sync result as `consumer` may receive it.
+
+    These results are what `_record` stores as the integration's runtime
+    state, so they carry the same keys `integration_status` withholds from a
+    machine consumer, and are withheld here by the same rule.
+    """
+
+    if Consumer.parse(consumer) is Consumer.HUMAN:
+        return result
+    return _without_layout(result, _LAYOUT_RUNTIME_KEYS)
+
+
 class Projections:
     """Generated views and graph, plus every path evidence takes out."""
 
@@ -356,13 +369,19 @@ class Projections:
         enabled: bool | None = None,
         managed: bool | None = None,
         options: dict[str, Any] | None = None,
+        consumer: str = "human",
     ) -> dict[str, Any]:
-        return self._require_integrations().configure(
+        result = self._require_integrations().configure(
             name,
             enabled=enabled,
             managed=managed,
             options=options or {},
         )
+        if Consumer.parse(consumer) is Consumer.HUMAN:
+            return result
+        # The policy echoed back carries every stored option, not only the ones
+        # this caller sent -- the same layout `integration_status` withholds.
+        return {**result, "policy": _sans_machine_layout(result["policy"])}
 
     def integration_status(
         self, name: str | None = None, *, consumer: str = "human"
@@ -388,15 +407,22 @@ class Projections:
             "consumer": parsed.value,
         }
 
-    def integration_up(self, name: str) -> dict[str, Any]:
+    def integration_up(self, name: str, *, consumer: str = "human") -> dict[str, Any]:
         if name == "obsidian":
-            return self.integration_sync(name)
-        return self._require_integrations().up(name)
+            return self.integration_sync(name, consumer=consumer)
+        return _runtime_for(self._require_integrations().up(name), consumer)
 
-    def integration_down(self, name: str) -> dict[str, Any]:
-        return self._require_integrations().down(name)
+    def integration_down(
+        self, name: str, *, consumer: str = "human"
+    ) -> dict[str, Any]:
+        return _runtime_for(self._require_integrations().down(name), consumer)
 
-    def integration_sync(self, name: str) -> dict[str, Any]:
+    def integration_sync(
+        self, name: str, *, consumer: str = "human"
+    ) -> dict[str, Any]:
+        return _runtime_for(self._sync(name), consumer)
+
+    def _sync(self, name: str) -> dict[str, Any]:
         consumer = self._integration_consumer(name)
         graph = self.graph_data(consumer=consumer)
         if name == "obsidian":

@@ -7,7 +7,8 @@
 #
 # A published version is permanent, so this refuses to upload anything it has
 # not first built from the sdist, installed in a throwaway environment and
-# driven through the real CLI contract.
+# driven through the real CLI contract, the getting-started guide and the
+# enforcement harness.
 #
 # One-time setup, at https://pypi.org/manage/account/publishing/:
 #   owner huglabs · repository brainskit · workflow release.yml · environment pypi
@@ -80,6 +81,11 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest -q
       - run: ./scripts/verify-wheel.sh
+      # The same wheel, installed as a user would, before anything can upload
+      # it: a guide that no longer works, or an enforcement break that status
+      # or doctor fails to report, stops the release here.
+      - run: ./scripts/fresh-install-smoke.sh
+      - run: ./scripts/enforcement-harness.sh
 
       - uses: actions/upload-artifact@v7
         with:

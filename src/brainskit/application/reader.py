@@ -23,8 +23,13 @@ from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
 from brainskit.application.privacy import PrivacyBoundary, for_consumer
 from brainskit.application.projections import Projections
-from brainskit.domain.model import NotFoundError, PolicyError, ValidationError
-from brainskit.domain.privacy import record_branch
+from brainskit.domain.model import (
+    NotFoundError,
+    PolicyError,
+    SourceRecord,
+    ValidationError,
+)
+from brainskit.domain.privacy import Consumer, record_branch
 
 
 def _hint_without_paths(hint: str) -> str:
@@ -115,10 +120,11 @@ class Reader:
         self.projections = projections
         self.ledger = ledger
 
-    def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
-        boundary = for_consumer(consumer, self.vault)
-        if consumer == "human":
-            return self.health.status()
+    def _visible(
+        self, boundary: PrivacyBoundary, consumer: str
+    ) -> tuple[dict[str, SourceRecord], int, set[str]]:
+        """The sources and pages this consumer may see, and how many were not."""
+
         visible_records, redacted_sources = boundary.split_records()
         graph = self.projections.graph_data(consumer=consumer)
         visible_pages = {
@@ -126,16 +132,31 @@ class Reader:
             for node in graph["nodes"]
             if str(node["id"]).startswith("page:")
         }
-        visible_paths = {
-            *(record.path for record in visible_records.values()),
-            *visible_pages,
-        }
-        findings = self.health.lint()["findings"]
-        visible_findings = [
+        return visible_records, redacted_sources, visible_pages
+
+    def _visible_findings(
+        self,
+        findings: list[dict[str, Any]],
+        records: dict[str, SourceRecord],
+        pages: set[str],
+    ) -> list[dict[str, Any]]:
+        visible_paths = {*(record.path for record in records.values()), *pages}
+        return [
             finding
             for finding in findings
             if not finding.get("path") or finding["path"] in visible_paths
         ]
+
+    def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
+        boundary = for_consumer(consumer, self.vault)
+        if consumer == "human":
+            return self.health.status()
+        visible_records, redacted_sources, visible_pages = self._visible(
+            boundary, consumer
+        )
+        visible_findings = self._visible_findings(
+            self.health.lint()["findings"], visible_records, visible_pages
+        )
         raw_counts: dict[str, int] = defaultdict(int)
         for record in visible_records.values():
             raw_counts[record_branch(record)] += 1
@@ -335,6 +356,56 @@ class Reader:
             "privacy": privacy.value,
             "content": content,
         }
+
+    def lint_for_consumer(
+        self, result: dict[str, Any], *, consumer: str = "human"
+    ) -> dict[str, Any]:
+        """A lint result with the findings on material `consumer` may not see removed.
+
+        The same rule `reader_status` applies to its `lint_errors`: a finding
+        names a path, and a path names a document and its branch. `ok` is
+        recomputed from what is left, for the reason `healthy` is there --
+        restricted content must not decide a filtered consumer's answer.
+        """
+
+        boundary = for_consumer(consumer, self.vault)
+        if consumer == "human":
+            return result
+        records, _, pages = self._visible(boundary, consumer)
+        findings = self._visible_findings(result["findings"], records, pages)
+        return {
+            **result,
+            "ok": not any(finding["severity"] == "error" for finding in findings),
+            "findings": findings,
+            "consumer": consumer,
+            "redacted_findings": len(result["findings"]) - len(findings),
+        }
+
+    def visible_source(self, identifier: str, *, consumer: str = "human") -> str:
+        """The content hash `identifier` names among the sources `consumer` may see.
+
+        A source outside the boundary is not found rather than forbidden: a
+        hash prefix or a path is a guess, and answering "exists, but not for
+        you" would turn every guess into a probe.
+        """
+
+        boundary = for_consumer(consumer, self.vault)
+        records = (
+            boundary.records
+            if boundary.consumer is Consumer.HUMAN
+            else boundary.split_records()[0]
+        )
+        return self.filing._resolve_record(dict(records), identifier).content_hash
+
+    def require_proposal(self, proposal_id: str, *, consumer: str = "human") -> None:
+        """Refuse a proposal id whose source `consumer` may not see, as not found."""
+
+        visible = self.proposals_for_consumer(consumer=consumer)["proposals"]
+        if not any(proposal.get("proposal_id") == proposal_id for proposal in visible):
+            raise NotFoundError(
+                "Filing proposal was not found",
+                details={"proposal_id": proposal_id},
+            )
 
     def proposals_for_consumer(
         self, status: str | None = None, *, consumer: str = "human"

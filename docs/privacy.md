@@ -16,6 +16,35 @@ mandatory for machine callers precisely because the unrestricted value has to
 be a deliberate choice rather than a silent default. Privacy filtering also
 applies to graph-expanded search neighbors.
 
+## An MCP server declares its consumer
+
+MCP hands its answers to a model, and the server cannot see where that model
+runs. So the operator declares it when starting the server:
+
+```bash
+bk --vault ./my-vault serve --mcp --transport stdio                    # cloud
+bk --vault ./my-vault serve --mcp --transport stdio --consumer local   # an agent on this machine
+```
+
+`cloud` is the default and `human` is refused. The declared consumer is a
+ceiling on every tool and resource: `status` is the filtered `/api/status`
+report (no vault path at `cloud`), `proposals`, `lint` and resources drop what
+the ceiling may not see, and `ask`, `resurface` and `lint --semantic` read no
+wider than it even when a local model is mapped. `search` and `context` still
+require a `consumer` argument, and it may only narrow the server's; a wider one
+is refused with `policy_denied` rather than silently answered narrower. `file`,
+`approve` and `reject` cannot reach a source or proposal outside the ceiling —
+moving a source is how its privacy changes. See
+[ADR 0010](./knowledge/decisions/architecture/0010-mcp-declares-its-consumer.md).
+
+Over MCP, `capture` takes text and `http(s)` URLs as always, but a file path
+only inside the vault's project (its code root, or a workspace `bk hooks
+install --root` recorded), outside the vault itself, and never a credential
+file: `.env*` (templates such as `.env.example` excepted), `*.pem`, `*.key`,
+SSH private keys, `.netrc`, `.npmrc`, `.pypirc`, anything under `~/.ssh`,
+`~/.aws`, `~/.config/gcloud` or a `.git` directory. `bk capture <path>` is the
+operator's own command and is not restricted.
+
 ## Filtering runs after expansion, not before
 
 Filtering the direct hits first would let an outgoing link or a backlink pull a

@@ -27,7 +27,7 @@ Full instructions, including how to run `bk` from the working tree, are in
 
 ## The gate
 
-Run all four before opening a pull request. CI runs the same ones, in the same
+Run all six before opening a pull request. CI runs the same ones, in the same
 order:
 
 ```bash
@@ -35,12 +35,29 @@ uv run ruff check
 uv run mypy src
 uv run pytest
 ./scripts/verify-wheel.sh
+./scripts/fresh-install-smoke.sh
+./scripts/enforcement-harness.sh
 ```
 
 `verify-wheel.sh` builds the sdist, builds the wheel from it, installs that
 wheel in a throwaway environment and drives the real CLI. Packaged prompt
 specs, output schemas and templates cannot be verified from the source tree, so
 this is the only check that proves what actually ships.
+
+The last two install the wheel `verify-wheel.sh` left in `dist/` (or the path
+you pass them) with `uv tool install`, under a throwaway `HOME` and
+`XDG_CONFIG_HOME`, so they never touch your real configuration or vault
+registry. `fresh-install-smoke.sh` follows
+[`docs/getting-started.md`](./docs/getting-started.md) literally, reading its
+steps out of the guide's `bash` blocks, so a change that makes the guide wrong
+fails here; `--print-steps` shows what it will run. `enforcement-harness.sh`
+breaks each enforcement layer in its own throwaway vault and requires
+`bk status --json` and `bk doctor --json` to report the break. The release
+workflow runs both before anything can be uploaded.
+
+To try an edit to either script without building, point it at the working
+tree's `bk` with `BK_BIN_DIR=.venv/bin`. That run checks the script, not a
+wheel, and says so on its first line.
 
 The project is **lint-clean, not format-clean**: `ruff format` produces a large
 pre-existing diff and is not part of the gate. Do not reformat files you are not

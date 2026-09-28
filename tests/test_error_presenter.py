@@ -549,8 +549,12 @@ class ConsumerDefaultTest(unittest.TestCase):
 
         values = [consumer.value for consumer in Consumer]
         self.assertEqual(cli.CONSUMER_CHOICES, values)
-        self.assertEqual(mcp._consumer_schema()["enum"], values)
-        self.assertEqual(mcp.MCP_CONSUMER, Consumer.LOCAL.value)
+        self.assertEqual(
+            mcp._consumer_schema(Consumer.LOCAL)["enum"],
+            [value for value in values if value != Consumer.HUMAN.value],
+        )
+        self.assertEqual(mcp.MCP_DEFAULT_CONSUMER, Consumer.CLOUD)
+        self.assertEqual(mcp.MCP_CONSUMERS, (Consumer.LOCAL, Consumer.CLOUD))
         source = Path(cli.__file__).read_text(encoding="utf-8")
         self.assertNotIn('choices=["human", "local", "cloud"]', source)
         for module in (cli, mcp, web):

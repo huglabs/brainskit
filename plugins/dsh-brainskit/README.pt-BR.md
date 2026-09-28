@@ -4,24 +4,26 @@ Conecte um vault local do [Brainskit](https://github.com/huglabs/brainskit) ao
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) pelo cliente
 MCP oficial do DSH.
 
-O bundle inicia um processo filho `bk serve --mcp --transport stdio` junto com
-o ciclo de vida do plugin DSH. O Brainskit continua responsável pela
+O bundle inicia um processo filho `bk serve --mcp --transport stdio --consumer
+cloud` junto com o ciclo de vida do plugin DSH. O Brainskit continua responsável pela
 inicialização do vault, privacidade, provedores e gravações duráveis; o DSH
 descobre as ferramentas MCP no namespace `mcp__brainskit__*`.
 
 ## Pré-requisitos
 
 - DeepSeek Harness com Node.js `^22.19.0` ou `>=24.0.0`.
-- Python 3.11 ou mais recente e uma instalação fixada do Brainskit:
+- Python 3.11 ou mais recente e uma instalação fixada do Brainskit. O bundle
+  exige a 0.8.0 ou posterior: ele passa `bk serve --consumer`, que versões
+  anteriores não aceitam, e a 0.8.0 também traz a correção de locks portáveis
+  para Windows ([#39](https://github.com/huglabs/brainskit/pull/39)):
 
   ```sh
-  uv tool install brainskit==0.7.0
+  uv tool install brainskit==0.8.0
   ```
 
-  No Windows, use uma revisão que contenha a correção de locks portáveis do
-  [#39](https://github.com/huglabs/brainskit/pull/39), ou uma versão posterior:
+  Enquanto a 0.8.0 não estiver no PyPI, instale a partir do repositório:
 
-  ```powershell
+  ```sh
   uv tool install --force --from git+https://github.com/huglabs/brainskit.git brainskit
   ```
 
@@ -56,6 +58,7 @@ Defina as variáveis antes de iniciar o DSH:
 |---|---|---|
 | `BRAINSKIT_COMMAND` | `bk` | Caminho exato do executável Brainskit; útil no Windows ou em instalações isoladas. |
 | `BRAINSKIT_VAULT` | `<cwd do DSH>/.brainskit` | Vault conectado a este processo DSH. |
+| `BRAINSKIT_CONSUMER` | `cloud` | Teto de privacidade com que o servidor é iniciado. Use `local` somente quando o DSH roda um modelo nesta máquina; veja [Privacidade](#privacidade). |
 | `BRAINSKIT_ALLOW_MUTATIONS` | não definida | Defina como `1` para permitir mutações de wiki, arquivamento e ciclo de vida das integrações. |
 | `BRAINSKIT_FAIL_ON_STARTUP_ERROR` | não definida | Defina como `1` para um executável ausente, vault inválido ou falha MCP interromper a inicialização do DSH. |
 
@@ -67,11 +70,40 @@ $env:BRAINSKIT_VAULT = 'C:\caminho\do\projeto\.brainskit'
 dsh web
 ```
 
+> [!WARNING]
+> Mantenha o servidor MCP com o nome `brainskit`. O guard reconhece as
+> ferramentas do Brainskit apenas pelo prefixo `mcp__brainskit__` que o DSH
+> deriva de `serverName`; uma chamada de ferramenta no DSH não carrega nenhum
+> outro indício de qual servidor a registrou, então o guard não consegue
+> perceber uma renomeação. Se um override do profile renomear o servidor, o
+> guard não reconhece nada e todas as ferramentas do Brainskit, inclusive
+> `apply`, rodam sem proteção.
+
 O processo MCP herda variáveis comuns que não parecem segredos. O cliente MCP
 do DSH remove deliberadamente variáveis que parecem credenciais; se um
 provedor de nuvem do Brainskit precisar de uma, passe-a explicitamente em um
 override do profile em vez de gravar o segredo no YAML. Um provedor Ollama
 local não precisa de chave de API.
+
+## Privacidade
+
+O servidor é iniciado com `--consumer cloud`, e essa declaração é o seu teto:
+toda ferramenta responde sob ela, e um `consumer` por chamada só pode
+estreitá-la. O modelo padrão do DSH é a API em nuvem da DeepSeek, então todo
+resultado lido pelo modelo sai da máquina, e uma leitura `local` enviaria
+branches restritos à máquina local a um terceiro.
+
+Evidências em branches `local-only`, inclusive um inbox inicializado para
+Ollama, ficam invisíveis ao modelo nesse padrão. Isso é intencional.
+
+Defina `BRAINSKIT_CONSUMER=local` somente quando o DSH estiver configurado com
+um modelo que roda nesta máquina. Qualquer outro valor, inclusive `human`, faz
+o servidor recusar a inicialização e o guard negar toda chamada ao Brainskit.
+
+O guard aplica o mesmo teto antes de a chamada chegar ao servidor. Sob `cloud`,
+ele nega qualquer chamada que passe `consumer: local` ou `consumer: human`; sob
+`local`, permite `local` e `cloud` e nega `human`. O modelo é orientado a omitir
+`consumer` ou passar o valor declarado.
 
 ## Autoridade padrão
 
@@ -92,9 +124,14 @@ Defina `BRAINSKIT_ALLOW_MUTATIONS=1` somente quando o profile DSH tiver a
 intenção de gerenciar essas operações. Os portões de aplicação e proveniência
 do próprio Brainskit permanecem ativos de qualquer forma.
 
-Independentemente dessa liberação, `search` e `context` são negados a menos que
-declarem `consumer: local` ou `consumer: cloud`. Todo resultado passa pelo
-modelo, então `human` nunca é a fronteira correta para esta ponte.
+Independentemente dessa liberação, qualquer chamada cujo `consumer` seja mais
+amplo que o declarado é negada (veja [Privacidade](#privacidade)). Todo
+resultado passa pelo modelo, então `human` nunca é a fronteira correta para
+esta ponte.
+
+`capture` continua na lista de permissão padrão. Ele aceita texto e URLs, e um
+caminho de arquivo somente quando o arquivo está dentro do projeto e não é um
+segredo como `.env`; o servidor recusa todo o resto.
 
 ## Verificação
 
@@ -105,8 +142,14 @@ duas sessões novas:
 1. Peça à sessão A para lembrar um valor único e confirme que ela chamou
    `capture`.
 2. Peça à sessão B para recuperar o valor e confirme que ela chamou `search`
-   ou `context` com `consumer: local`.
-3. Peça ao modelo para chamar `apply`; confirme que o guard padrão nega a
+   ou `context` com `consumer: cloud` ou sem `consumer`. Uma captura entra no
+   inbox do vault, então o valor só volta quando `inbox_policy` é `cloud`, que
+   é o que o `bk init` grava ao escolher um provedor em nuvem. Um vault
+   configurado para Ollama mantém o inbox `local-only`, e uma leitura `cloud`
+   sem resultado ali é a fronteira funcionando, não uma falha.
+3. Peça ao modelo para chamar `search` com `consumer: local`; confirme que o
+   guard nega a chamada por ser mais ampla que o `cloud` declarado.
+4. Peça ao modelo para chamar `apply`; confirme que o guard padrão nega a
    operação, a menos que o DSH tenha sido iniciado com a opção explícita de
    mutação.
 

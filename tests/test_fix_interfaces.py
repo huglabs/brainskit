@@ -251,6 +251,8 @@ class CliEnvelopeAgreesWithExitStatusTest(unittest.TestCase):
         return run.code, run.json()
 
     def _mcp_lint(self) -> dict[str, Any]:
+        # `local`: the dirtied capture sits in `_inbox`, local-only here, so a
+        # cloud server would rightly withhold the finding along with the path.
         response = _handle(
             self._service(),
             {
@@ -259,6 +261,7 @@ class CliEnvelopeAgreesWithExitStatusTest(unittest.TestCase):
                 "method": "tools/call",
                 "params": {"name": "lint", "arguments": {}},
             },
+            "local",
         )
         assert response is not None
         return response["result"]
@@ -555,7 +558,7 @@ class McpStdioSafetyNetTest(unittest.TestCase):
         sys.stdin = stdin
         try:
             with redirect_stdout(out), redirect_stderr(err):
-                run_stdio(service)  # type: ignore[arg-type]
+                run_stdio(service, consumer="local")  # type: ignore[arg-type]
         finally:
             sys.stdin = original_stdin
         responses = {
@@ -787,7 +790,7 @@ class McpHttpContractTest(unittest.TestCase):
                     "method": "tools/call",
                     "params": {
                         "name": "search",
-                        "arguments": {"query": "q", "consumer": "local"},
+                        "arguments": {"query": "q", "consumer": "cloud"},
                     },
                 },
                 version=MCP_PROTOCOL_VERSION,
@@ -824,24 +827,29 @@ class McpErrorRedactionTest(unittest.TestCase):
 
 
 class McpConsumerSchemaTest(unittest.TestCase):
-    """An agent reading the schema must not mistake human for a safe default."""
+    """The schema offers only what the server will answer (ADR 0010).
 
-    def _consumer(self, tool_name: str) -> dict[str, Any]:
+    `human` is never offered: an MCP server cannot be declared `human`, and a
+    per-call consumer may only narrow the server's.
+    """
+
+    def _consumer(self, tool_name: str, server: str | None = None) -> dict[str, Any]:
         tool = next(
-            item for item in _tool_definitions() if item["name"] == tool_name
+            item for item in _tool_definitions(server) if item["name"] == tool_name
         )
         return dict(tool["inputSchema"]["properties"]["consumer"])
 
     def test_consumer_values_are_documented_for_search_and_context(self) -> None:
-        for tool_name in ("search", "context"):
-            with self.subTest(tool=tool_name):
-                schema = self._consumer(tool_name)
-                self.assertEqual(schema["enum"], ["human", "local", "cloud"])
-                description = schema["description"]
-                self.assertIn("no default", description.lower())
-                self.assertIn("NO restriction", description)
-                self.assertIn("never-ingest", description)
-                self.assertIn("cloud", description)
+        for server, offered in ((None, ["cloud"]), ("cloud", ["cloud"]), ("local", ["local", "cloud"])):
+            for tool_name in ("search", "context"):
+                with self.subTest(server=server, tool=tool_name):
+                    schema = self._consumer(tool_name, server)
+                    self.assertEqual(schema["enum"], offered)
+                    description = schema["description"]
+                    self.assertIn("no default", description.lower())
+                    self.assertIn("policy_denied", description)
+                    self.assertIn("never-ingest", description)
+                    self.assertIn(f"started as '{server or 'cloud'}'", description)
 
     def test_consumer_stays_required_on_search_and_context(self) -> None:
         for tool_name in ("search", "context"):
@@ -854,23 +862,25 @@ class McpConsumerSchemaTest(unittest.TestCase):
 class McpIntegrationStatusConsumerTest(unittest.TestCase):
     """integration_status over MCP names the machine boundary explicitly.
 
-    The tool schema declares no consumer, so the call inherits the transport's
-    own scope: `local`, the same boundary resources/list and resources/read
-    already hardcode. Before the fix the call was bare, which handed a machine
-    caller the unfiltered human payload.
+    The tool schema declares no consumer, so the call inherits the server's
+    declared one (ADR 0010): `cloud` unless the operator said `local`. Before
+    ADR 0001 the call was bare, which handed a machine caller the unfiltered
+    human payload.
     """
 
-    def test_the_tool_passes_the_local_consumer(self) -> None:
-        service = RecordingService()
-        _call_tool(service, "integration_status", {})  # type: ignore[arg-type]
-        name, args, kwargs = service.calls[-1]
-        self.assertEqual(name, "integration_status")
-        self.assertEqual(args, (None,))
-        self.assertEqual(kwargs.get("consumer"), "local")
+    def test_the_tool_passes_the_server_consumer(self) -> None:
+        for server, expected in ((None, "cloud"), ("local", "local")):
+            with self.subTest(server=server):
+                service = RecordingService()
+                _call_tool(service, "integration_status", {}, server)  # type: ignore[arg-type]
+                name, args, kwargs = service.calls[-1]
+                self.assertEqual(name, "integration_status")
+                self.assertEqual(args, (None,))
+                self.assertEqual(kwargs.get("consumer"), expected)
 
-    def test_a_named_integration_keeps_the_local_consumer(self) -> None:
+    def test_a_named_integration_keeps_the_server_consumer(self) -> None:
         service = RecordingService()
-        _call_tool(service, "integration_status", {"name": "web"})  # type: ignore[arg-type]
+        _call_tool(service, "integration_status", {"name": "web"}, "local")  # type: ignore[arg-type]
         name, args, kwargs = service.calls[-1]
         self.assertEqual(name, "integration_status")
         self.assertEqual(args, ("web",))
@@ -1251,6 +1261,394 @@ class CloudTransportsNameNoLocalPathTest(unittest.TestCase):
                 blob = json.dumps(response, ensure_ascii=False)
                 for marker in self.markers:  # non-vacuous: setUp binds a literal set
                     self.assertNotIn(marker, blob)
+
+
+def _tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+
+
+def _over_stdio(
+    service: Any, request: dict[str, Any], consumer: str | None = None
+) -> dict[str, Any]:
+    """One request through the real stdio loop, so errors arrive as on the wire."""
+
+    out = io.StringIO()
+    with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(request) + "\n")):
+        with redirect_stdout(out):
+            run_stdio(service, consumer=consumer)
+    return dict(json.loads(out.getvalue().splitlines()[0]))
+
+
+class McpServerConsumerTest(unittest.TestCase):
+    """The MCP server's declared consumer is the ceiling of every answer (ADR 0010).
+
+    Before, every MCP client read status, proposals, integrations and resources
+    as `local` and `status` returned the unfiltered operator report -- a cloud
+    model connected over MCP saw the vault's absolute path, every branch name
+    and never-ingest proposal payloads.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        raw = policy()
+        raw["branches"]["30-public"] = {"privacy": "cloud", "filing": "approve-each"}
+        self.vault = FileVault.initialize(self.root, raw)
+        self.service = BrainskitService(
+            self.vault,
+            SqliteFtsIndex(self.vault.index_path),
+            graph=MarkdownGraph(),
+            integrations=NativeIntegrations(self.vault),
+        )
+        self.hashes: dict[str, str] = {}
+        for branch, text in (
+            ("30-public", "Nota publica sobre cadencia."),
+            ("20-research", "Nota local sobre salarios."),
+            ("10-work", "Nota secreta sobre aquisicao."),
+        ):
+            captured = self.service.capture(None, text=text, title=f"nota-{branch}")
+            content_hash = captured["source"]["content_hash"]
+            self.service.file(content_hash, branch)
+            self.hashes[branch] = content_hash
+        self.service.reindex()
+
+        def seed(state: dict[str, Any]) -> dict[str, Any]:
+            state["version"] = 1
+            state["proposals"] = {
+                f"p-{branch}": {
+                    "proposal_id": f"p-{branch}",
+                    "source_hash": content_hash,
+                    "destination_branch": branch,
+                    "filing_mode": "approve-each",
+                    "apply_proposal": {"operations": [], "note": f"payload-{branch}"},
+                    "reason": "",
+                    "status": "pending",
+                    "created_at": "2026-09-01T00:00:00Z",
+                }
+                for branch, content_hash in self.hashes.items()
+            }
+            return state
+
+        self.vault.mutate_state("proposals", seed)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def call(
+        self, name: str, arguments: dict[str, Any], server: str | None = None
+    ) -> dict[str, Any]:
+        return _over_stdio(self.service, _tool_call(name, arguments), server)
+
+    def test_a_cloud_server_status_names_no_path_and_no_restricted_branch(self) -> None:
+        for server in (None, "cloud"):
+            with self.subTest(server=server):
+                response = self.call("status", {}, server)
+                result = response["result"]["structuredContent"]
+                self.assertEqual(result["consumer"], "cloud")
+                self.assertNotIn("vault", result)
+                blob = json.dumps(response, ensure_ascii=False)
+                for marker in (str(self.root), str(self.vault.root), "10-work", "20-research", "_inbox"):
+                    self.assertNotIn(marker, blob)
+                self.assertEqual(result["by_branch"], {"30-public": 1})
+
+    def test_a_local_server_status_keeps_the_path_and_drops_never_ingest(self) -> None:
+        result = self.call("status", {}, "local")["result"]["structuredContent"]
+        self.assertEqual(result["vault"], str(self.vault.root))
+        self.assertIn("20-research", result["by_branch"])
+        self.assertNotIn("10-work", result["by_branch"])
+
+    def test_proposals_are_scoped_to_the_server(self) -> None:
+        expected = {
+            "cloud": {"p-30-public"},
+            "local": {"p-30-public", "p-20-research"},
+        }
+        for server, ids in expected.items():
+            with self.subTest(server=server):
+                response = self.call("proposals", {}, server)
+                result = response["result"]["structuredContent"]
+                self.assertEqual({p["proposal_id"] for p in result["proposals"]}, ids)
+                self.assertNotIn("payload-10-work", json.dumps(response))
+
+    def test_a_wider_per_call_consumer_is_refused_not_clamped(self) -> None:
+        for tool in ("search", "context"):
+            for server, requested in ((None, "local"), ("cloud", "local"), ("cloud", "human"), ("local", "human")):
+                with self.subTest(tool=tool, server=server, requested=requested):
+                    response = self.call(tool, {"query": "nota", "consumer": requested}, server)
+                    self.assertEqual(response["error"]["data"]["code"], "policy_denied")
+                    self.assertEqual(
+                        response["error"]["data"]["server_consumer"], server or "cloud"
+                    )
+
+    def test_a_narrower_or_equal_per_call_consumer_is_answered(self) -> None:
+        for server, requested in (("local", "local"), ("local", "cloud"), ("cloud", "cloud")):
+            with self.subTest(server=server, requested=requested):
+                response = self.call("search", {"query": "nota", "consumer": requested}, server)
+                result = response["result"]["structuredContent"]
+                self.assertEqual(result["consumer"], requested)
+
+    def test_resources_follow_the_server(self) -> None:
+        listed = _handle(self.service, {"jsonrpc": "2.0", "id": 1, "method": "resources/list"})
+        assert listed is not None
+        self.assertNotIn("10-work", json.dumps(listed))
+
+    def test_file_cannot_move_a_source_the_server_cannot_see(self) -> None:
+        """Filing is how a source's privacy changes; a cloud caller cannot declassify."""
+
+        secret = self.hashes["10-work"]
+        response = self.call("file", {"item": secret[:12], "branch": "30-public"})
+        self.assertEqual(response["error"]["data"]["code"], "not_found")
+        record = self.vault.registry()[secret]
+        self.assertTrue(record.path.startswith("raw/10-work/"))
+
+    def test_approve_and_reject_cannot_reach_a_hidden_proposal(self) -> None:
+        for tool in ("approve", "reject"):
+            with self.subTest(tool=tool):
+                response = self.call(tool, {"proposal_id": "p-10-work"})
+                self.assertEqual(response["error"]["data"]["code"], "not_found")
+        stored = self.vault.read_state("proposals")["proposals"]["p-10-work"]
+        self.assertEqual(stored["status"], "pending")
+
+    def test_an_integration_cannot_be_widened_past_the_server(self) -> None:
+        response = self.call(
+            "integration_configure",
+            {"name": "web", "options": {"consumer": "human"}},
+            "local",
+        )
+        self.assertEqual(response["error"]["data"]["code"], "policy_denied")
+        self.assertNotEqual(
+            self.vault.config().integrations["web"].options.get("consumer"), "human"
+        )
+
+    def test_integration_configure_echoes_no_machine_layout(self) -> None:
+        target = self.root / "obsidian-export"
+        response = self.call(
+            "integration_configure",
+            {"name": "obsidian", "options": {"path": str(target)}},
+        )
+        self.assertNotIn(str(target), json.dumps(response))
+        human = self.service.integration_configure("obsidian")
+        self.assertEqual(human["policy"]["options"]["path"], str(target))
+
+    def test_lint_findings_on_hidden_material_are_withheld(self) -> None:
+        secret = self.vault.registry()[self.hashes["10-work"]]
+        (self.vault.root / secret.path).write_text("mutated", encoding="utf-8")
+        cloud = self.call("lint", {})["result"]
+        self.assertNotIn("10-work", json.dumps(cloud))
+        self.assertTrue(cloud["structuredContent"]["ok"])
+        self.assertFalse(cloud["isError"])
+        self.assertEqual(cloud["structuredContent"]["redacted_findings"], 1)
+        operator = self.service.lint()
+        self.assertFalse(operator["ok"])
+
+    def test_human_is_never_served(self) -> None:
+        from brainskit.domain.model import PolicyError
+        from brainskit.interfaces import mcp
+
+        for call in (
+            lambda: _handle(self.service, _tool_call("status", {}), "human"),
+            lambda: run_stdio(self.service, consumer="human"),
+            lambda: mcp.run_http(
+                self.service, host="127.0.0.1", port=1, token_env="", consumer="human"
+            ),
+        ):
+            with self.assertRaises(PolicyError) as refused:
+                call()
+            self.assertEqual(refused.exception.details["allowed"], ["local", "cloud"])
+
+
+class ServeConsumerCliTest(unittest.TestCase):
+    """`bk serve --mcp --transport stdio --consumer <cloud|local>`, default cloud."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.vault = FileVault.initialize(self.root, policy())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def serve(self, *extra: str) -> _harness.CliRun:
+        line = json.dumps(_tool_call("status", {})) + "\n"
+        with mock.patch.object(sys, "stdin", io.StringIO(line)):
+            return _harness.run_cli(
+                ["--vault", str(self.root), "serve", "--mcp", "--transport", "stdio", *extra]
+            )
+
+    def status(self, run: _harness.CliRun) -> dict[str, Any]:
+        response = json.loads(run.stdout.splitlines()[0])
+        return dict(response["result"]["structuredContent"])
+
+    def test_the_default_is_cloud(self) -> None:
+        run = self.serve()
+        self.assertEqual(run.code, 0, run.output)
+        result = self.status(run)
+        self.assertEqual(result["consumer"], "cloud")
+        self.assertNotIn(str(self.vault.root), run.stdout)
+
+    def test_local_is_declared_explicitly(self) -> None:
+        run = self.serve("--consumer", "local")
+        self.assertEqual(run.code, 0, run.output)
+        self.assertEqual(self.status(run)["vault"], str(self.vault.root))
+
+    def test_human_is_refused_before_serving(self) -> None:
+        run = _harness.run_cli(
+            ["--json", "--vault", str(self.root), "serve", "--mcp", "--consumer", "human"]
+        )
+        self.assertEqual(run.code, 3, run.output)
+        self.assertEqual(run.json()["error"]["code"], "policy_denied")
+
+
+class McpBooleanArgumentsTest(unittest.TestCase):
+    """Only a JSON boolean is a flag: `bool("false")` is True, and saved every answer."""
+
+    def test_non_boolean_flags_are_validation_errors(self) -> None:
+        cases = (
+            ("ask", {"question": "q", "save": "false"}),
+            ("ask", {"question": "q", "save": 0}),
+            ("ask", {"question": "q", "save": None}),
+            ("lint", {"semantic": "false"}),
+            ("integration_configure", {"name": "web", "enabled": "false"}),
+            ("integration_configure", {"name": "web", "managed": 1}),
+            ("search", {"query": "q", "consumer": "cloud", "limit": "5"}),
+            ("search", {"query": "q", "consumer": "cloud", "limit": True}),
+        )
+        for tool, arguments in cases:
+            with self.subTest(tool=tool, arguments=arguments):
+                service = RecordingService()
+                with self.assertRaises(ValidationError) as refused:
+                    _call_tool(service, tool, arguments)  # type: ignore[arg-type]
+                self.assertEqual(refused.exception.code, "validation_error")
+                self.assertEqual(service.calls, [], "nothing ran on a bad flag")
+
+    def test_real_booleans_and_absence_pass_through(self) -> None:
+        service = RecordingService()
+        _call_tool(service, "ask", {"question": "q", "save": False})  # type: ignore[arg-type]
+        _call_tool(service, "ask", {"question": "q"})  # type: ignore[arg-type]
+        _call_tool(service, "lint", {"semantic": True})  # type: ignore[arg-type]
+        _call_tool(service, "integration_configure", {"name": "web"})  # type: ignore[arg-type]
+        saves = [kwargs["save"] for name, _, kwargs in service.calls if name == "ask"]
+        self.assertEqual(saves, [False, False])
+        lint = next(kwargs for name, _, kwargs in service.calls if name == "lint")
+        self.assertIs(lint["semantic"], True)
+        configure = next(
+            kwargs for name, _, kwargs in service.calls if name == "integration_configure"
+        )
+        self.assertEqual((configure["enabled"], configure["managed"]), (None, None))
+
+    def test_the_wire_answers_validation_error(self) -> None:
+        response = _over_stdio(
+            RecordingService(), _tool_call("ask", {"question": "q", "save": "false"})
+        )
+        self.assertEqual(response["error"]["data"]["code"], "validation_error")
+        self.assertEqual(response["error"]["data"]["argument"], "save")
+
+
+class McpCaptureConfinementTest(unittest.TestCase):
+    """Over MCP a file path must be inside the project and not a credential file.
+
+    Before, MCP `capture` copied any file the process could read into
+    `raw/_inbox` -- `~/.ssh/id_rsa`, `.env` -- where search could then return
+    it. `bk capture <path>` is the operator typing, and is unchanged.
+    """
+
+    SECRET = "sk-live-do-not-echo-4242"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        base = Path(self.temporary.name).resolve()
+        self.home = base / "home"
+        self.project = base / "project"
+        (self.project / ".git").mkdir(parents=True)
+        (self.home / ".ssh").mkdir(parents=True)
+        self.vault = FileVault.initialize(self.project / "brain", policy())
+        self.service = BrainskitService(self.vault, SqliteFtsIndex(self.vault.index_path))
+        self.outside = base / "outside.md"
+        self.outside.write_text(f"outside {self.SECRET}", encoding="utf-8")
+        for name in (
+            ".env", "config/.env.production", ".envrc", "server.pem", "tls.key",
+            "id_rsa", "id_ed25519", ".netrc", ".npmrc", ".pypirc", ".git/config",
+        ):
+            path = self.project / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{name} {self.SECRET}", encoding="utf-8")
+        (self.home / ".ssh" / "config").write_text(self.SECRET, encoding="utf-8")
+        (self.project / "notes.md").write_text("Project notes.", encoding="utf-8")
+        (self.project / ".env.example").write_text("API_KEY=", encoding="utf-8")
+        (self.project / "link.md").symlink_to(self.outside)
+        (self.project / "innocent.txt").symlink_to(self.project / ".env")
+        patcher = mock.patch.dict("os.environ", {"HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def capture(self, **arguments: Any) -> dict[str, Any]:
+        return _over_stdio(self.service, _tool_call("capture", arguments), "local")
+
+    def assert_refused(self, source: str, reason: str) -> None:
+        response = self.capture(source=source)
+        blob = json.dumps(response, ensure_ascii=False)
+        self.assertIn("error", response, blob)
+        data = response["error"]["data"]
+        self.assertEqual(data["code"], "policy_denied")
+        self.assertEqual(data["reason"], reason)
+        self.assertIn("text", data["allowed"])
+        self.assertNotIn(self.SECRET, blob)
+        self.assertNotIn(str(self.project), blob)
+
+    def test_secret_shaped_files_are_refused_inside_the_project(self) -> None:
+        for name in (
+            ".env", "config/.env.production", ".envrc", "server.pem", "tls.key",
+            "id_rsa", "id_ed25519", ".netrc", ".npmrc", ".pypirc", ".git/config",
+            "innocent.txt",
+        ):
+            with self.subTest(name=name):
+                self.assert_refused(str(self.project / name), "secret_shaped")
+
+    def test_home_credential_directories_are_refused(self) -> None:
+        self.assert_refused(str(self.home / ".ssh" / "config"), "secret_shaped")
+        self.assert_refused("~/.ssh/config", "secret_shaped")
+        self.assert_refused("~/.ssh/id_rsa_missing_but_shaped", "secret_shaped")
+
+    def test_paths_outside_the_project_are_refused(self) -> None:
+        for source in (
+            str(self.outside),
+            str(self.project / "link.md"),
+            str(self.vault.root / ".brain" / "config.json"),
+            str(self.vault.index_path),
+            "/definitely/not/here.md",
+        ):
+            with self.subTest(source=source):
+                self.assert_refused(source, "outside_project")
+        self.assertEqual(self.vault.registry(), {})
+
+    def test_a_project_file_text_and_a_url_are_accepted(self) -> None:
+        for arguments in (
+            {"source": str(self.project / "notes.md")},
+            {"source": str(self.project / ".env.example")},
+            {"text": "Literal note.", "title": "note"},
+            {"source": "https://example.com/article"},
+        ):
+            with self.subTest(arguments=arguments):
+                response = self.capture(**arguments)
+                self.assertTrue(response["result"]["structuredContent"]["created"], response)
+
+    def test_a_missing_project_file_does_not_name_the_project(self) -> None:
+        response = self.capture(source=str(self.project / "missing.md"))
+        self.assertEqual(response["error"]["data"]["code"], "not_found")
+
+    def test_the_cli_captures_what_the_operator_typed(self) -> None:
+        run = _harness.run_cli(
+            ["--json", "--vault", str(self.vault.root), "capture", str(self.outside)]
+        )
+        self.assertEqual(run.code, 0, run.output)
+        self.assertTrue(run.json()["result"]["created"])
 
 
 @unittest.skipUnless(shutil.which("node"), "requires node to run the viewer JS")

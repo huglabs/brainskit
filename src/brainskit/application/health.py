@@ -171,7 +171,7 @@ class Health:
         self.ledger = ledger
 
 
-    def lint(self, *, semantic: bool = False) -> dict[str, Any]:
+    def lint(self, *, semantic: bool = False, ceiling: str = "local") -> dict[str, Any]:
         findings = self._mechanical_lint()
         self._review_drifted_code_citations(findings)
         semantic_report: dict[str, Any] | None = None
@@ -187,7 +187,8 @@ class Health:
             # the model. When the route those branches take is not local, read
             # again as `cloud`: a `local-only` page is then withheld and counted
             # instead of the router refusing the whole lint. The router's
-            # refusal stays as the last defence.
+            # refusal stays as the last defence. `ceiling` narrows the first
+            # read for a caller who may not see `local` itself (ADR 0010).
             def read(consumer: str) -> dict[str, Any]:
                 return self.retrieval.context(
                     "contradictions unsupported claims",
@@ -196,10 +197,11 @@ class Health:
                     include_apply_contract=False,
                 )
 
-            context = read("local")
+            context = read(ceiling)
             local_withheld = int(context["redacted"])
             if (
-                self.judgment_runner.consumer_for(
+                ceiling != "cloud"
+                and self.judgment_runner.consumer_for(
                     job="lint-semantic", branches=context_branches(context)
                 )
                 == "cloud"

@@ -2,7 +2,11 @@ export const name = 'dsh-brainskit'
 
 export const inject = ['systemPrompt', 'tools']
 
-const TOOL_PREFIX = 'mcp__brainskit__'
+// Must equal `serverName` in cordis.patch.yml. DSH names MCP tools
+// `mcp__<serverName>__<tool>` and a guard sees only that name, never which
+// server registered it, so a renamed server is invisible to this guard.
+export const SERVER_NAME = 'brainskit'
+const TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 
 // An allow-list, not a deny-list: a tool Brainskit adds later is denied until
 // someone decides it is safe for an autonomous agent, instead of being allowed
@@ -18,18 +22,38 @@ const DEFAULT_TOOLS = new Set([
   'integration_status',
 ])
 
-// Every tool result goes back to the model, so no call made through this
-// bridge is "shown directly to a person and not relayed".
-const MODEL_CONSUMERS = new Set(['local', 'cloud'])
-const CONSUMER_TOOLS = new Set(['search', 'context'])
+// Every tool result goes back to the model, so `human` is never a valid
+// boundary for this bridge. Ordered narrowest first: `cloud` sees a subset of
+// what `local` sees.
+const MODEL_CONSUMERS = ['cloud', 'local']
+export const DEFAULT_CONSUMER = 'cloud'
 
-export const BRAINSKIT_GUIDANCE = `Brainskit durable memory is available through tools named mcp__brainskit__*.
+// Must stay the same expression as the `--consumer` argument in
+// cordis.patch.yml, so the server's ceiling and this guard's cannot disagree.
+export function declaredConsumer(env = process.env) {
+  return env.BRAINSKIT_CONSUMER || DEFAULT_CONSUMER
+}
 
-- When historical context may matter, call mcp__brainskit__search or mcp__brainskit__context before answering.
-- Every machine read must declare its privacy consumer. Use local only when the result stays on the operator's machine. Use cloud before forwarding a result to a third-party model or service. Never use human: every result you read is relayed through a model, and the DSH bridge denies it.
-- Call mcp__brainskit__capture only when the user explicitly asks to remember something or supplies a durable source to retain.
-- Never edit the vault directly. Compiled wiki changes must go through mcp__brainskit__apply so schema, provenance, citation, link and novelty checks remain active.
+function isModelConsumer(consumer) {
+  return MODEL_CONSUMERS.includes(consumer)
+}
+
+export function brainskitGuidance(consumer = DEFAULT_CONSUMER) {
+  const privacy = !isModelConsumer(consumer)
+    ? `- This DSH process declared an invalid Brainskit consumer (${JSON.stringify(consumer)}), so the DSH bridge denies every Brainskit call until the operator sets BRAINSKIT_CONSUMER to cloud or local.`
+    : consumer === 'cloud'
+      ? '- This DSH process declared the Brainskit privacy consumer cloud: results reach a third-party model, so the server only returns cloud-eligible evidence. Omit the consumer argument or pass consumer: cloud. Never pass local or human; the DSH bridge denies both.'
+      : '- This DSH process declared the Brainskit privacy consumer local: the operator runs a model on this machine. Omit the consumer argument or pass consumer: local, or cloud to narrow a result you will forward to a third-party service. Never pass human; the DSH bridge denies it.'
+  return `Brainskit durable memory is available through tools named ${TOOL_PREFIX}*.
+
+- When historical context may matter, call ${TOOL_PREFIX}search or ${TOOL_PREFIX}context before answering.
+${privacy}
+- Call ${TOOL_PREFIX}capture only when the user explicitly asks to remember something or supplies a durable source to retain. It accepts text and URLs; a file path is accepted only inside this project and never for a secret file such as .env.
+- Never edit the vault directly. Compiled wiki changes must go through ${TOOL_PREFIX}apply so schema, provenance, citation, link and novelty checks remain active.
 - Mutable wiki, filing, saved-answer, resurface and integration operations are denied by the DSH bridge unless the operator launched DSH with BRAINSKIT_ALLOW_MUTATIONS=1.`
+}
+
+export const BRAINSKIT_GUIDANCE = brainskitGuidance(DEFAULT_CONSUMER)
 
 const MUTATION_DENIED = 'Brainskit mutation denied by the DSH bundle. Restart DSH with BRAINSKIT_ALLOW_MUTATIONS=1 only after confirming the vault and requested operation.'
 
@@ -44,19 +68,28 @@ function asksToSave(args) {
   return args.save !== undefined && args.save !== null && args.save !== false
 }
 
-function consumerDenial(tool, args) {
-  if (!CONSUMER_TOOLS.has(tool) || MODEL_CONSUMERS.has(args.consumer)) return undefined
-  return `Brainskit ${tool} denied by the DSH bundle: consumer must be local or cloud, never ${JSON.stringify(args.consumer ?? null)}, because the result is relayed through a model.`
+// Checked on every Brainskit tool, not only the ones that take a consumer
+// today: the server treats its declared consumer as a ceiling for all of them.
+function consumerDenial(tool, args, declared) {
+  if (!isModelConsumer(declared)) {
+    return `Brainskit ${tool} denied by the DSH bundle: BRAINSKIT_CONSUMER is ${JSON.stringify(declared)}, and only cloud or local can be declared for a model.`
+  }
+  if (!Object.hasOwn(args, 'consumer')) return undefined
+  const requested = args.consumer
+  if (isModelConsumer(requested) && MODEL_CONSUMERS.indexOf(requested) <= MODEL_CONSUMERS.indexOf(declared)) {
+    return undefined
+  }
+  return `Brainskit ${tool} denied by the DSH bundle: consumer ${JSON.stringify(requested)} is wider than the declared ${declared}. Omit consumer or pass ${declared}${declared === 'local' ? ' or cloud' : ''}.`
 }
 
-export function createMutationGuard(allowMutations = false) {
+export function createMutationGuard(allowMutations = false, consumer = DEFAULT_CONSUMER) {
   return (execution) => {
     if (typeof execution.name !== 'string' || !execution.name.startsWith(TOOL_PREFIX)) {
       return undefined
     }
     const tool = execution.name.slice(TOOL_PREFIX.length)
     const args = argumentsOf(execution)
-    const privacy = consumerDenial(tool, args)
+    const privacy = consumerDenial(tool, args, consumer)
     if (privacy !== undefined) return privacy
     if (allowMutations) return undefined
     if (!DEFAULT_TOOLS.has(tool)) return MUTATION_DENIED
@@ -66,10 +99,11 @@ export function createMutationGuard(allowMutations = false) {
 }
 
 export function apply(ctx) {
+  const consumer = declaredConsumer()
   ctx.systemPrompt.section({
     name: 'tool:brainskit',
     order: 145,
-    text: BRAINSKIT_GUIDANCE,
+    text: brainskitGuidance(consumer),
   })
-  ctx.tools.guard(createMutationGuard(process.env.BRAINSKIT_ALLOW_MUTATIONS === '1'))
+  ctx.tools.guard(createMutationGuard(process.env.BRAINSKIT_ALLOW_MUTATIONS === '1', consumer))
 }

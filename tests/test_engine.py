@@ -3274,6 +3274,45 @@ class JudgmentReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
                         prompts[0],
                     )
 
+    def test_a_cloud_caller_on_a_local_route_reads_only_cloud_evidence(self) -> None:
+        """ADR 0010: a model cannot read for a caller what the caller could not.
+
+        A cloud-declared MCP server used to hand `ask` and `resurface` answers
+        a local model had composed from local-only evidence.
+        """
+
+        calls = {
+            "query": (self.ANSWER, lambda service: service.ask("platform team", consumer="cloud")),
+            "resurface": (self.RESURFACE, lambda service: service.resurface(consumer="cloud")),
+        }
+        for job, (response, call) in calls.items():
+            with self.subTest(job=job):
+                self._vault(job, self.OLLAMA)
+                result, prompts, providers = self._run(response, call)
+                self.assertEqual(providers, ["ollama"])
+                self._assert_no_local_only(prompts[0])
+                self._assert_no_local_only(json.dumps(result, ensure_ascii=False))
+                self.assertGreaterEqual(result["withheld_sources"], 1)
+                self.assertIn("Fridays", prompts[0])
+
+    def test_the_mcp_ask_tool_reads_under_the_server_consumer(self) -> None:
+        from brainskit.interfaces.mcp import _call_tool
+
+        self._vault("query", self.OLLAMA)
+        result, prompts, _ = self._run(
+            self.ANSWER,
+            lambda service: _call_tool(service, "ask", {"question": "platform team"}),
+        )
+        self._assert_no_local_only(prompts[0])
+        local, local_prompts, _ = self._run(
+            self.ANSWER,
+            lambda service: _call_tool(
+                service, "ask", {"question": "platform team"}, "local"
+            ),
+        )
+        self.assertIn("kappa-sigma", local_prompts[0])
+        self.assertEqual(local["withheld_sources"], 0)
+
     def test_ask_reports_the_cloud_provider_that_answered(self) -> None:
         self._vault("query", self.CLOUD)
         result, _, _ = self._run(

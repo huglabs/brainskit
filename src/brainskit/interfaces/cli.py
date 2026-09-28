@@ -388,6 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--allowed-origin", action="append", default=[], help="Extra allowed Origin header; repeatable")
     serve.add_argument("--tls-cert", help="PEM certificate, to serve over HTTPS")
     serve.add_argument("--tls-key", help="PEM private key matching --tls-cert")
+    serve.add_argument(
+        "--consumer", choices=CONSUMER_CHOICES,
+        help="Widest privacy boundary any MCP call answers under: cloud (default) or local; human is refused")
 
     watch = commands.add_parser("watch", help="Watch configured source folders")
     watch.add_argument("--once", action="store_true", help="Scan the inbox a single time and exit")
@@ -1715,9 +1718,10 @@ def _dispatch(args: argparse.Namespace) -> Any:
                 allowed_origins=args.allowed_origin,
                 tls_cert=args.tls_cert,
                 tls_key=args.tls_key,
+                consumer=args.consumer,
             )
         else:
-            run_stdio(service)
+            run_stdio(service, consumer=args.consumer)
         return None
     if args.command == "watch":
         return _watch(service, once=args.once, interval=args.interval, json_mode=args.json)
