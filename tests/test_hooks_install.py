@@ -1377,13 +1377,17 @@ class DoctorGateProbeTest(ShellHookCase):
     ) -> None:
         """Claude Code still runs the registered command; `sh -c` exits 127,
         which is not a block, so every write goes through."""
-        self.script("brainskit-gate").unlink()
+        script = self.script("brainskit-gate")
+        script.unlink()
         value = self.doctor()
         probe = value["enforcement"]["write_gate_probe"]
         self.assertEqual(probe["state"], "not_enforcing")
         self.assertIn("registered command cannot run", probe["detail"])
-        self.assertIn("No such file", probe["detail"])
-        self.assertRegex(probe["hook_said"], "No such file")
+        # The shell's own complaint, whichever shell `/bin/sh` is: dash says
+        # `<path>: not found`, bash `<path>: No such file or directory`.
+        said = probe["hook_said"]
+        self.assertRegex(said, rf"/{script.name}: (not found|No such file)")
+        self.assertIn(f"({said})", probe["detail"])
         self.assertEqual(probe["hint"], "bk hooks install --agent claude")
         self.assertFalse(probe["denies_a_gated_write"])
         self.assertFalse(value["enforcement"]["gated"])

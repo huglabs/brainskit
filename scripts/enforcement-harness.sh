@@ -182,11 +182,13 @@ status_expect "the write gate is not active" \
     'result.healthy=false' 'result.enforcement.gated=false' \
     'result.enforcement.layers.write_gate.active=false' \
     'result.enforcement.layers.write_gate.detail~every write goes through'
+# The shell's error names the script either way; only its wording differs
+# (dash: `<path>: not found`, bash as sh: `<path>: No such file or directory`).
 doctor_expect "the registered command lets writes through" \
     'result.healthy=false' 'result.enforcement.gated=false' \
     'result.enforcement.write_gate_probe.state="not_enforcing"' \
     'result.enforcement.write_gate_probe.denies_a_gated_write=false' \
-    'result.enforcement.write_gate_probe.hook_said~No such file'
+    'result.enforcement.write_gate_probe.hook_said~/.claude/hooks/brainskit-gate.sh: '
 
 echo "==> gate unregistered, script left on disk"
 fresh_vault gate-unregistered
