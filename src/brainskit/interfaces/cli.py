@@ -2059,7 +2059,7 @@ def _latest_pypi_version(timeout: float = 8.0) -> str | None:
 
     if urllib.parse.urlparse(_PYPI_JSON_URL).scheme != "https":
         return None
-    request = urllib.request.Request(  # noqa: S310 - https-only, checked above
+    request = urllib.request.Request(
         _PYPI_JSON_URL, headers={"User-Agent": f"brainskit/{__version__}"}
     )
     try:

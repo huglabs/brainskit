@@ -718,7 +718,7 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         self.assertIn("not_found", str(caught.exception.details))
 
     def test_a_refusal_is_a_policy_denial_not_an_empty_answer(self) -> None:
-        sent, fake_urlopen = _wire_sequence(
+        _sent, fake_urlopen = _wire_sequence(
             {
                 "content": [],
                 "stop_reason": "refusal",
@@ -731,7 +731,7 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         self.assertEqual(caught.exception.details["category"], "cyber")
 
     def test_truncated_output_names_the_budget_that_truncated_it(self) -> None:
-        sent, fake_urlopen = _wire_sequence(
+        _sent, fake_urlopen = _wire_sequence(
             {
                 "content": [{"type": "text", "text": '{"answer": "half'}],
                 "stop_reason": "max_tokens",
@@ -746,7 +746,7 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         self.assertIn("max_tokens", str(caught.exception))
 
     def test_an_answer_with_no_text_is_rejected(self) -> None:
-        sent, fake_urlopen = _wire_sequence(
+        _sent, fake_urlopen = _wire_sequence(
             {"content": [{"type": "thinking", "thinking": ""}], "stop_reason": "end_turn"}
         )
         with mock.patch("urllib.request.urlopen", fake_urlopen):

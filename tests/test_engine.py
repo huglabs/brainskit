@@ -3299,7 +3299,7 @@ class JudgmentReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
         from brainskit.interfaces.mcp import _call_tool
 
         self._vault("query", self.OLLAMA)
-        result, prompts, _ = self._run(
+        _result, prompts, _ = self._run(
             self.ANSWER,
             lambda service: _call_tool(service, "ask", {"question": "platform team"}),
         )

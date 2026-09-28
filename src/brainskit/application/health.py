@@ -879,7 +879,7 @@ class Health:
             candidates = {str(path), str(resolved)}
             for hook in events.get(event, []):
                 command = str(hook.get("command", ""))
-                entry = {
+                entry: dict[str, Any] = {
                     key: hook[key] for key in ("command", "args", "shell") if key in hook
                 }
                 if command in candidates or any(c in command for c in candidates):
