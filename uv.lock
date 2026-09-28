@@ -130,7 +130,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "brainskit", extras = ["code"], marker = "extra == 'code-all'" },
-    { name = "jsonschema", extras = ["format"], specifier = ">=4.20,<5" },
+    { name = "jsonschema", extras = ["format"], specifier = ">=4.26.0,<5" },
     { name = "markitdown", marker = "extra == 'convert'" },
     { name = "neo4j", marker = "extra == 'integrations'", specifier = ">=5.25,<7" },
     { name = "neo4j", marker = "extra == 'neo4j'", specifier = ">=5.25,<7" },
