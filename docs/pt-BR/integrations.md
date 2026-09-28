@@ -4,7 +4,7 @@
 
 Toda integração é opcional e armazenada em `.brain/config.json`; pontos de verificação de ciclo de vida e sincronização são armazenados em `.brain/integration-state.json`. Segredos nunca são persistidos. A configuração armazena apenas o nome de uma variável de ambiente. `bk integration status` combina a política durável com o estado ativo de processos/contêineres.
 
-Todos os recursos estão disponíveis por meio da CLI JSON e das ferramentas MCP `integration_configure`, `integration_status`, `integration_up`, `integration_down` e `integration_sync`.
+Todos os recursos estão disponíveis por meio da CLI JSON e das ferramentas MCP `integration_configure`, `integration_status`, `integration_up`, `integration_down` e `integration_sync`. Via MCP, todas exceto `integration_status` exigem um servidor iniciado com `--consumer local`: um servidor `cloud` as recusa com `policy_denied` e as omite de `tools/list` (veja [Servindo](./serving.md#um-servidor-mcp-declara-seu-consumidor)).
 
 ## Obsidian
 

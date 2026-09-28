@@ -22,12 +22,18 @@ journal nor the transaction directory is left behind.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import sys
 import unittest
 from pathlib import Path
 from typing import Any
 
+from brainskit.domain.model import ConflictError
 from brainskit.infrastructure.apply_transaction import (
     CHECKPOINTS,
     ApplyTransaction,
@@ -68,6 +74,11 @@ class SeamFixture(ServiceFixture):
         self.original_pages = {
             path: (self.root / path).read_bytes() for path in self.paths
         }
+        # Every "never happened" check below loops over these two snapshots; a
+        # collapsed path or an absent state file would make them compare
+        # nothing, or `None` with `None`.
+        self.assertEqual(len(set(self.paths)), len(_PAGES))
+        self.assertNotIn(None, self.state_snapshot().values())
         self.journal_path = self.root / ".brain" / "apply-journal.json"
         # `crashing_at` returns a copy, so this one stays inert and every crash
         # in a loop starts from the same engine rather than from the last one.
@@ -133,10 +144,11 @@ class SeamFixture(ServiceFixture):
         state: dict[str, bytes | None],
         transaction: Path,
     ) -> None:
+        self.assertEqual(len(pages), len(_PAGES))
         for path, expected in pages.items():
             self.assertEqual(expected, (self.root / path).read_bytes(), path)
-        for relative, expected in state.items():
-            self.assertEqual(expected, self.state_snapshot()[relative], relative)
+        for relative in _STATE_FILES:
+            self.assertEqual(state[relative], self.state_snapshot()[relative], relative)
         self.assertNotIn(
             proposal_id,
             json.loads((self.root / ".brain/applied.json").read_text())["proposals"],
@@ -163,6 +175,7 @@ class FailurePointIsInertByDefaultTest(SeamFixture):
         # crash test below: they fail because of the point, not because the
         # engine is broken.
         self.service.apply(self.update_proposal("unarmed", "Sem falha."))
+        self.assertEqual(len(self.original_pages), len(_PAGES))
         for path, before in self.original_pages.items():
             self.assertNotEqual(before, (self.root / path).read_bytes(), path)
 
@@ -182,6 +195,21 @@ class FailurePointIsInertByDefaultTest(SeamFixture):
         and `page-replaced` are covered by the same run as the rest.
         """
 
+        self.assertEqual(
+            CHECKPOINTS,
+            (
+                "prepared",
+                "page-inflight",
+                "page-replaced",
+                "wiki-written",
+                "raw-move-inflight",
+                "raw-move-applied",
+                "state-written",
+                "index-written",
+                "applied-recorded",
+                "committed",
+            ),
+        )
         for step in CHECKPOINTS:
             with self.subTest(step=step):
                 # A `committed` iteration keeps its raw move, and a source
@@ -251,19 +279,20 @@ class CrashAtEachPhaseTest(SeamFixture):
         with self.assertRaises(InterruptedApply):
             self.service.apply(proposal)
 
+        self.assertEqual(len(pages), len(_PAGES))
         for path, before in pages.items():
             self.assertNotEqual(before, (self.root / path).read_bytes(), path)
-        for relative, before in state.items():
+        for relative in _STATE_FILES:
             if relative == ".brain/applied.json":
                 continue  # applied.json lands after this phase
-            self.assertNotEqual(before, self.state_snapshot()[relative], relative)
+            self.assertNotEqual(state[relative], self.state_snapshot()[relative], relative)
 
         self.reopen()
 
         for path, before in pages.items():
             self.assertEqual(before, (self.root / path).read_bytes(), path)
-        for relative, before in state.items():
-            self.assertEqual(before, self.state_snapshot()[relative], relative)
+        for relative in _STATE_FILES:
+            self.assertEqual(state[relative], self.state_snapshot()[relative], relative)
 
 
 class CrashMidPageReplaceTest(SeamFixture):
@@ -293,6 +322,7 @@ class CrashMidPageReplaceTest(SeamFixture):
         self.assertIsNone(journal["inflight"])
         # The vault really is a mixture at this point.
         replaced, untouched = sorted(self.paths)[:2], sorted(self.paths)[2]
+        self.assertEqual(len(replaced), 2)
         for path in replaced:
             self.assertNotEqual(pages[path], (self.root / path).read_bytes(), path)
         self.assertEqual(
@@ -344,6 +374,7 @@ class CrashMidPageReplaceTest(SeamFixture):
             self.service.apply(proposal)
 
         self.reopen()
+        self.assertEqual(len(pages), len(_PAGES))
         for path, before in pages.items():
             self.assertEqual(before, (self.root / path).read_bytes(), path)
 
@@ -398,6 +429,7 @@ class CommitBoundaryTest(SeamFixture):
         transaction = self.transaction_dir(journal)
         committed_pages = self.page_snapshot()
         committed_state = self.state_snapshot()
+        self.assertEqual(len(self.original_pages), len(_PAGES))
         for path, before in self.original_pages.items():
             self.assertNotEqual(before, committed_pages[path], path)
 
@@ -465,6 +497,38 @@ class CrashDuringRawMoveTest(SeamFixture):
         self.assertTrue((self.root / origin).is_file())
         self.assertEqual(origin_bytes, (self.root / origin).read_bytes())
         self.assertFalse((self.root / raw_move["destination"]).exists())
+
+
+class EditBetweenCheckAndCommitTest(SeamFixture):
+    """The version check is repeated under the lock, and that repeat matters.
+
+    `_prepare_apply` compares `base_hash` before any lock is held, so a write
+    landing between it and `commit_wiki_batch` passes the first check. Only
+    the transaction's own comparison stands between that write and an apply
+    that silently overwrites it.
+    """
+
+    def test_a_page_edited_after_validation_is_not_overwritten(self) -> None:
+        proposal = self.update_proposal("raced", "Corrida.")
+        target = self.root / self.paths[0]
+        interloper = target.read_bytes() + b"\nEdited meanwhile.\n"
+        commit = self.vault.commit_wiki_batch
+
+        def edit_then_commit(plan: Any) -> dict[str, Any]:
+            target.write_bytes(interloper)
+            return commit(plan)
+
+        self.vault.commit_wiki_batch = edit_then_commit  # type: ignore[method-assign]
+        state = self.state_snapshot()
+
+        with self.assertRaises(ConflictError) as refused:
+            self.service.apply(proposal)
+
+        self.assertEqual(self.paths[0], refused.exception.details["path"])
+        self.assertEqual(
+            {**self.original_pages, self.paths[0]: interloper}, self.page_snapshot()
+        )
+        self.assertEqual(state, self.state_snapshot())
 
 
 class TransactionCollaboratorTest(unittest.TestCase):

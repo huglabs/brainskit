@@ -17,8 +17,10 @@ from typing import Any, ClassVar
 from brainskit.application.ports import ApplyPlan, SearchIndexPort
 from brainskit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
+    SEED_PAGES,
     WIKI_DIRECTORIES,
     ConflictError,
+    ForgottenSourceError,
     NotConfiguredError,
     NotFoundError,
     RefusalError,
@@ -26,6 +28,7 @@ from brainskit.domain.model import (
     ValidationError,
     VaultConfig,
     normalize_branch,
+    render_seed_page,
     utc_now,
 )
 from brainskit.infrastructure.apply_transaction import ApplyTransaction
@@ -159,7 +162,7 @@ class FileVault:
             "views/domains",
             "graph",
             "output/digests",
-            "output/reports",
+            "output/resurface",
             "output/answers",
             ".brain",
         ]
@@ -188,10 +191,8 @@ class FileVault:
         except OSError:
             existing = ""
         _atomic_text(gitignore_path, merge_gitignore(existing, gitignore_block()))
-        index_page = _system_page("index", "Brainskit index")
-        log_page = _system_page("log", "Brainskit log")
-        _atomic_text(root / "wiki" / "index.md", index_page)
-        _atomic_text(root / "wiki" / "log.md", log_page)
+        for path, (slug, title) in SEED_PAGES.items():
+            _atomic_text(root / path, render_seed_page(slug, title, utc_now()))
         return cls(root)
 
     @staticmethod
@@ -394,7 +395,15 @@ class FileVault:
         with self._registry_lock(shared=False):
             self._write_registry_unlocked(records)
 
-    def capture_file(self, source: Path) -> tuple[SourceRecord, bool]:
+    def capture_file(
+        self, source: Path, *, revive: bool = True
+    ) -> tuple[SourceRecord, bool]:
+        """Register `source`, copying it into `raw/` if the content is new.
+
+        `revive` is whether forgotten content may come back: an explicit
+        capture is the deliberate re-add and clears the tombstone, while a
+        watch sweep passes False and is refused with `ForgottenSourceError`.
+        """
         source = source.expanduser().resolve()
         if not source.is_file():
             raise NotFoundError(
@@ -403,8 +412,14 @@ class FileVault:
         content_hash, size = _hash_file(source)
         with self._registry_lock(shared=False):
             records = self._read_registry_unlocked()
+            forgotten = self._read_forgotten_unlocked()
             if content_hash in records:
                 record, created = records[content_hash], False
+            elif content_hash in forgotten and not revive:
+                raise ForgottenSourceError(
+                    "Source was forgotten; capture it explicitly to re-add it",
+                    details={"source": str(source), "content_hash": content_hash},
+                )
             else:
                 destination = self._capture_destination(
                     source.name, content_hash, suffix=source.suffix
@@ -420,7 +435,8 @@ class FileVault:
                     captured_at=utc_now(),
                 )
                 records[content_hash] = record
-                self._write_registry_unlocked(records)
+                forgotten.pop(content_hash, None)
+                self._write_registry_unlocked(records, forgotten)
                 created = True
         self.raw_text(record)
         return record, created
@@ -446,7 +462,9 @@ class FileVault:
                 captured_at=utc_now(),
             )
             records[content_hash] = record
-            self._write_registry_unlocked(records)
+            forgotten = self._read_forgotten_unlocked()
+            forgotten.pop(content_hash, None)
+            self._write_registry_unlocked(records, forgotten)
             return record, True
 
     def reconcile(self) -> dict[str, int]:
@@ -457,13 +475,19 @@ class FileVault:
         briefly-absent one mid-move, so deleting on sight would be a race.
         `forget` is the explicit, one-record way to drop a genuinely gone
         source.
+
+        A forgotten source still on disk is counted under `forgotten` and left
+        unregistered; its tombstone's path is healed like a record's, so a
+        forgotten file that moved stays hidden from lint.
         """
         scanned = 0
         added = 0
         moved = 0
         duplicates = 0
+        still_forgotten = 0
         with self._registry_lock(shared=False):
             records = self._read_registry_unlocked()
+            forgotten = self._read_forgotten_unlocked()
             seen_hashes: set[str] = set()
             for path in self._iter_raw_paths():
                 scanned += 1
@@ -479,6 +503,10 @@ class FileVault:
                         record.path = relative
                         moved += 1
                     continue
+                if content_hash in forgotten:
+                    forgotten[content_hash] = {**forgotten[content_hash], "path": relative}
+                    still_forgotten += 1
+                    continue
                 records[content_hash] = SourceRecord(
                     content_hash=content_hash,
                     path=relative,
@@ -493,13 +521,14 @@ class FileVault:
                 for content_hash, record in records.items()
                 if not (self.root / record.path).is_file()
             ]
-            self._write_registry_unlocked(records)
+            self._write_registry_unlocked(records, forgotten)
         return {
             "scanned": scanned,
             "added": added,
             "moved": moved,
             "duplicates": duplicates,
             "missing": len(missing),
+            "forgotten": still_forgotten,
         }
 
     def forget(self, identifier: str, *, force: bool = False) -> SourceRecord:
@@ -511,6 +540,13 @@ class FileVault:
         entry (see its docstring). Refuses to drop a record whose raw file
         is still on disk unless `force` is set, so this cannot be used to
         silently lose a source that is still captured.
+
+        Leaves a tombstone keyed by content hash, because `--force` leaves the
+        file on disk by definition and `reconcile` -- the step `bk lint`
+        recommends next -- would otherwise register it again. It lives in
+        `registry.json` beside the records: every path that reads or clears it
+        already holds the registry lock, so the two are written in one atomic
+        replace and no new lock joins the order `commit_wiki_batch` states.
         """
         with self._registry_lock(shared=False):
             records = self._read_registry_unlocked()
@@ -521,7 +557,13 @@ class FileVault:
                     details={"path": record.path},
                 )
             del records[record.content_hash]
-            self._write_registry_unlocked(records)
+            forgotten = self._read_forgotten_unlocked()
+            forgotten[record.content_hash] = {
+                "path": record.path,
+                "original_name": record.original_name,
+                "forgotten_at": utc_now(),
+            }
+            self._write_registry_unlocked(records, forgotten)
             return record
 
     def file_source(self, identifier: str, branch: str) -> SourceRecord:
@@ -648,9 +690,29 @@ class FileVault:
         ]
 
     def raw_files(self) -> list[str]:
-        return [
-            path.relative_to(self.root).as_posix() for path in self._iter_raw_paths()
-        ]
+        """Every file under `raw/`, less forgotten sources still on disk.
+
+        A forgotten file is deliberately unregistered, so reporting it as
+        untracked would send the operator to `reconcile` for nothing. Only the
+        tombstoned path is hashed, and only a match is hidden: new content
+        written over that path is a new source.
+        """
+
+        # Unlocked on purpose: an apply's index rebuild reaches this while
+        # `commit_wiki_batch` holds the registry lock, which is not re-entrant.
+        # The registry is replaced atomically, so the read is still consistent.
+        tombstoned = {
+            str(entry.get("path")): content_hash
+            for content_hash, entry in self._read_forgotten_unlocked().items()
+        }
+        files = []
+        for path in self._iter_raw_paths():
+            relative = path.relative_to(self.root).as_posix()
+            content_hash = tombstoned.get(relative)
+            if content_hash is not None and _hash_file(path)[0] == content_hash:
+                continue
+            files.append(relative)
+        return files
 
     def wiki_version(self, relative_path: str) -> str | None:
         path = self._resolve_relative(relative_path)
@@ -736,26 +798,52 @@ class FileVault:
             raise RefusalError("Path escapes the vault")
         return path
 
-    def _read_registry_unlocked(self) -> dict[str, SourceRecord]:
+    def _registry_document(self) -> dict[str, Any]:
         path = self.root / ".brain" / "registry.json"
         if not path.exists():
             return {}
         raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+
+    def _read_registry_unlocked(self) -> dict[str, SourceRecord]:
         return {
             content_hash: SourceRecord.from_dict(value)
-            for content_hash, value in raw.get("sources", {}).items()
+            for content_hash, value in self._registry_document().get("sources", {}).items()
         }
 
-    def _write_registry_unlocked(self, records: dict[str, SourceRecord]) -> None:
-        _atomic_json(
-            self.root / ".brain" / "registry.json",
-            {
-                "version": 1,
-                "sources": {
-                    key: value.to_dict() for key, value in sorted(records.items())
-                },
-            },
-        )
+    def _read_forgotten_unlocked(self) -> dict[str, dict[str, Any]]:
+        """Tombstones `forget` left, keyed by content hash."""
+
+        forgotten = self._registry_document().get("forgotten", {})
+        if not isinstance(forgotten, dict):
+            return {}
+        return {
+            content_hash: dict(entry)
+            for content_hash, entry in forgotten.items()
+            if isinstance(entry, dict)
+        }
+
+    def _write_registry_unlocked(
+        self,
+        records: dict[str, SourceRecord],
+        forgotten: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Write the records, carrying the tombstones over unless handed new ones.
+
+        Every writer that does not deal in tombstones -- an apply, `file`,
+        `save_registry` -- passes records alone, and must not erase a `forget`
+        by rewriting the file without them.
+        """
+
+        if forgotten is None:
+            forgotten = self._read_forgotten_unlocked()
+        document: dict[str, Any] = {
+            "version": 1,
+            "sources": {key: value.to_dict() for key, value in sorted(records.items())},
+        }
+        if forgotten:
+            document["forgotten"] = dict(sorted(forgotten.items()))
+        _atomic_json(self.root / ".brain" / "registry.json", document)
 
     def _read_state_unlocked(self, name: str) -> dict[str, Any]:
         path = self.root / ".brain" / f"{name}.json"
@@ -1114,18 +1202,3 @@ def _atomic_text(path: Path, content: str) -> None:
 
 def _atomic_json(path: Path, content: dict[str, Any]) -> None:
     _atomic_text(path, json.dumps(content, indent=2, ensure_ascii=False) + "\n")
-
-
-def _system_page(slug: str, title: str) -> str:
-    now = utc_now()
-    return (
-        "---\n"
-        f'id: "system:{slug}"\n'
-        'type: "system"\n'
-        f"title: {json.dumps(title)}\n"
-        "aliases:\n"
-        "sources:\n"
-        f'updated_at: "{now}"\n'
-        "---\n\n"
-        f"# {title}\n"
-    )

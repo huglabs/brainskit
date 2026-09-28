@@ -26,6 +26,11 @@ repository with a two-node graph, and `bk code status` then called that graph
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import unittest
 import unittest.mock
@@ -37,6 +42,7 @@ from test_projections import policy as _base_policy
 from brainskit.application.codegraph import CodeGraph
 from brainskit.domain.model import (
     DEFAULT_CODE_SCAN_LIMIT,
+    VAULT_DIRECTORIES,
     GrammarNeed,
     ScanSurvey,
     ValidationError,
@@ -279,6 +285,7 @@ class VaultGitignoreTest(unittest.TestCase):
         # derived output -- here a 683 MB `graph/code.json`.
         vault = FileVault.initialize(self.root / "vault", policy())
         ignored = (vault.root / ".gitignore").read_text()
+        self.assertEqual(set(DERIVED_DIRECTORIES), {"graph", "output", "views"})
         for name in DERIVED_DIRECTORIES:
             self.assertIn(f"{name}/", ignored, f"{name}/ is generated but tracked")
 
@@ -290,6 +297,15 @@ class VaultGitignoreTest(unittest.TestCase):
             {".brain"},
             "a generated directory is neither ignored nor deliberately kept",
         )
+
+    def test_every_directory_a_vault_creates_is_named_as_the_vault_s_own(self) -> None:
+        # `bk code build` on a vault that is its own code root tells the
+        # vault's files from the project's by these names alone; a directory
+        # the scaffold grows without joining the list would be graphed.
+        vault = FileVault.initialize(self.root / "vault", policy())
+        created = {path.name for path in vault.root.iterdir() if path.is_dir()}
+        self.assertLessEqual(created, set(VAULT_DIRECTORIES))
+        self.assertLessEqual(set(GENERATED_DIRECTORIES), set(VAULT_DIRECTORIES))
 
     def test_an_existing_gitignore_survives(self) -> None:
         target = self.root / "project"
@@ -867,15 +883,16 @@ class CommandDeadEndTest(unittest.TestCase):
         self.assertTrue(any(not o.takes_value for o in ingest_options))
 
     def test_declared_alternatives_name_real_flags(self) -> None:
-        for command, (_, options) in self.cli._ALTERNATIVES.items():
+        declared = [
+            (command, option.flag)
+            for command, (_, options) in self.cli._ALTERNATIVES.items()
+            for option in options
+            if option.flag
+        ]
+        self.assertEqual(declared, [("capture", "--text"), ("ingest", "--all")])
+        for command, flag in declared:
             rendered = self.cli._subcommand_help(self.parser, command)
-            for option in options:
-                if option.flag:
-                    self.assertIn(
-                        option.flag,
-                        rendered,
-                        f"{command} has no {option.flag}",
-                    )
+            self.assertIn(flag, rendered, f"{command} has no {flag}")
 
 
 class PastedValueTest(unittest.TestCase):

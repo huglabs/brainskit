@@ -9,6 +9,11 @@ that instability is exactly what these tests exist to pin down.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import re
 import unittest
 from unittest.mock import patch
@@ -86,6 +91,20 @@ class StatusLineTests(unittest.TestCase):
             f"{console.CROSS} 2 lint errors",
             console.status_line(False, "2 lint errors", stream=PIPE),
         )
+
+    def test_a_warning_is_neither_a_tick_nor_a_cross(self) -> None:
+        """Off a terminal the glyph is all that is left to read."""
+
+        line = console.warn_line("1 warning(s)", stream=PIPE)
+        self.assertEqual(line, f"{console.BANG} 1 warning(s)")
+        self.assertNotIn(console.CHECK, line)
+        self.assertNotIn(console.CROSS, line)
+
+    def test_a_warning_is_drawn_in_the_warn_colour_on_a_terminal(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            line = console.warn_line("stale", stream=TTY)
+        self.assertTrue(line.startswith(console.WARN))
+        self.assertNotIn(console.OK, line)
 
 
 class LinkTests(unittest.TestCase):
@@ -255,6 +274,7 @@ class TableTests(unittest.TestCase):
         rows = [["short", "1"], ["a moderately long title here", "22"]]
         for width in (20, 40, 80, 120):
             text = console.table(["title", "n"], rows, width=width, stream=PIPE)
+            self.assertEqual(len(text.splitlines()), 2 + len(rows))
             for line in text.splitlines():
                 self.assertLessEqual(len(line), width)
 

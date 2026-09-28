@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brainskit"
-version = "0.7.0"
+version = "0.8.0"
 description = "Local-first, LLM-agnostic second-brain engine: the compilation gate between raw evidence and knowledge an agent may act on"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,7 +40,7 @@ classifiers = [
   "Topic :: Text Processing :: Indexing",
   "Topic :: Utilities",
 ]
-dependencies = ["jsonschema[format]>=4.20,<5"]
+dependencies = ["jsonschema[format]>=4.26.0,<5"]
 
 [project.urls]
 Homepage = "https://github.com/huglabs/brainskit"
@@ -64,7 +64,7 @@ integrations = ["neo4j>=5.25,<7", "psycopg[binary]>=3.3.4,<4"]
 # against; a grammar is a parser, and a newer one changes the shape of the tree
 # the extractors walk.
 code = [
-  "tree-sitter>=0.23.0,<0.26",
+  "tree-sitter>=0.23.0,<0.27",
   "tree-sitter-python>=0.23,<0.26",
   "tree-sitter-javascript>=0.23,<0.26",
   "tree-sitter-typescript>=0.23,<0.25",
@@ -117,9 +117,9 @@ bk = "brainskit.interfaces.cli:main"
 
 [dependency-groups]
 dev = [
-  "pytest>=8,<9",
-  "ruff>=0.11,<0.13",
-  "mypy>=1.15,<2",
+  "pytest>=8,<10",
+  "ruff>=0.11,<0.17",
+  "mypy>=1.15,<3",
 ]
 
 [tool.setuptools]
@@ -211,11 +211,6 @@ ignore = [
 # environment variable's name — never a value. The two subprocess calls carry
 # their reasoning inline, at the site.
 "src/brainskit/interfaces/cli.py" = ["S105"]
-#   S607 — one fixed argument vector with no shell, asking `git` where it runs
-#     hooks from. It must be the same `git` the operator's commit will use, so
-#     it is invoked by name on PATH; an absolute path would answer for a
-#     different install than the one that matters.
-"src/brainskit/application/health.py" = ["S607"]
 
 [tool.mypy]
 python_version = "3.11"

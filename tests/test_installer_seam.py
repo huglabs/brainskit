@@ -15,6 +15,11 @@ fail in one line rather than in a fixture.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import tempfile
 import unittest
@@ -229,6 +234,7 @@ class LegacyArtefactTest(SeamCase):
 
     def test_a_generated_script_is_removed(self) -> None:
         paths = [self.legacy_hook(hook.template) for hook in installer.CLAUDE_HOOKS]
+        self.assertTrue(paths, "no hook to retire")
         retired = installer._retire_legacy_hook_scripts(
             self.root, installer.CLAUDE_HOOKS
         )

@@ -17,6 +17,11 @@ surfaces to it, and fail when a new code is added without a row. See ADR 0006.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import ast
 import io
 import json
@@ -201,12 +206,8 @@ class CliExitStatusTest(unittest.TestCase):
     """
 
     def status_for(self, error: BrainskitError) -> int:
-        buffer = io.StringIO()
-        with (
-            mock.patch.object(cli, "_dispatch", side_effect=error),
-            redirect_stderr(buffer),
-        ):
-            return cli.main(["status"])
+        with mock.patch.object(cli, "_dispatch", side_effect=error):
+            return _harness.run_cli(["status"]).code
 
     def test_only_a_policy_denial_exits_three(self) -> None:
         for error, code in CLASSES.items():
@@ -465,14 +466,9 @@ class InstallHintReachesEverySurfaceTest(unittest.TestCase):
     )
 
     def test_the_cli_still_enriches(self) -> None:
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            mock.patch.object(cli, "_dispatch", side_effect=self.ERROR),
-            redirect_stdout(out),
-            redirect_stderr(err),
-        ):
-            cli.main(["--json", "status"])
-        payload = json.loads(out.getvalue() or err.getvalue())
+        with mock.patch.object(cli, "_dispatch", side_effect=self.ERROR):
+            run = _harness.run_cli(["--json", "status"])
+        payload = json.loads(run.stdout or run.stderr)
         self.assertIn("brainskit[code]", payload["error"]["details"]["hint"])
 
     def test_the_web_viewer_enriches_too(self) -> None:
@@ -553,8 +549,12 @@ class ConsumerDefaultTest(unittest.TestCase):
 
         values = [consumer.value for consumer in Consumer]
         self.assertEqual(cli.CONSUMER_CHOICES, values)
-        self.assertEqual(mcp._consumer_schema()["enum"], values)
-        self.assertEqual(mcp.MCP_CONSUMER, Consumer.LOCAL.value)
+        self.assertEqual(
+            mcp._consumer_schema(Consumer.LOCAL)["enum"],
+            [value for value in values if value != Consumer.HUMAN.value],
+        )
+        self.assertEqual(mcp.MCP_DEFAULT_CONSUMER, Consumer.CLOUD)
+        self.assertEqual(mcp.MCP_CONSUMERS, (Consumer.LOCAL, Consumer.CLOUD))
         source = Path(cli.__file__).read_text(encoding="utf-8")
         self.assertNotIn('choices=["human", "local", "cloud"]', source)
         for module in (cli, mcp, web):

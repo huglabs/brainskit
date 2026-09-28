@@ -10,19 +10,27 @@ prevent.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from test_engine import policy
 
-from brainskit.application.health import redirected_git_hooks_path
+from brainskit.application.install import redirected_git_hooks_path
 from brainskit.application.services import BrainskitService
+from brainskit.domain.model import PolicyError
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces import cli, console
 
@@ -94,12 +102,19 @@ class EnforcementStatusTest(unittest.TestCase):
         )
 
     def test_every_inactive_layer_explains_itself(self) -> None:
-        for entry in self.enforcement()["layers"]:
-            self.assertNotEqual(
-                entry["detail"],
-                "active",
-                f"{entry['layer']} is off but offers no reason",
-            )
+        layers = self.enforcement()["layers"]
+        self.assertEqual(
+            [entry["layer"] for entry in layers],
+            ["write_gate", "session_status", "commit_lint", "instructions"],
+        )
+        for entry in layers:
+            with self.subTest(layer=entry["layer"]):
+                self.assertFalse(entry["active"])
+                self.assertTrue(
+                    str(entry["detail"]).strip(),
+                    f"{entry['layer']} is off but offers no reason",
+                )
+                self.assertNotEqual(entry["detail"], "active")
 
     # the divergence cases ----------------------------------------------------
 
@@ -205,6 +220,28 @@ class EnforcementStatusTest(unittest.TestCase):
         report = self.service.status()
         for key in ("vault", "sources", "wiki_pages", "freshness", "projections"):
             self.assertIn(key, report)
+
+    def test_status_counts_every_source_and_each_branch(self) -> None:
+        """The counts themselves, not just their keys, through `bk status`."""
+
+        def capture(text: str, branch: str | None) -> None:
+            content_hash = self.service.capture(None, text=text, title=text)["source"][
+                "content_hash"
+            ]
+            if branch is not None:
+                self.service.file(content_hash, branch)
+
+        capture("first work note", "10-work")
+        capture("second work note", "10-work")
+        capture("one research note", "20-research")
+        capture("still in the inbox", None)
+        run = _harness.run_cli(["--vault", str(self.root), "--json", "status"])
+        self.assertEqual(run.code, 0, run.output)
+        result = run.json()["result"]
+        self.assertEqual(result["sources"], 4)
+        self.assertEqual(
+            result["by_branch"], {"10-work": 2, "20-research": 1, "_inbox": 1}
+        )
 
 
 class HealthyHeadlineMeansEnforcementTooTest(EnforcementStatusTest):
@@ -579,6 +616,188 @@ class EnforcementRowsDistinguishAdvisoryTest(unittest.TestCase):
             with self.subTest(layer=spec[0]):
                 (row,) = self.rows(spec)
                 self.assertIn("d", console.strip_ansi(row[1]))
+
+
+class SemanticLintWithholdsNeverIngestEvidenceTest(unittest.TestCase):
+    """`bk lint --semantic` narrows what reaches the model; it does not refuse.
+
+    TC4, the twin of U1 in `Jobs`: semantic lint read its evidence as `human`
+    and handed every contributing branch to the router, so one never-ingest
+    page in recall refused the whole lint. The real router runs here, so its
+    refusal stays the last defence and anything that slipped through would
+    fail these tests rather than reach the recording driver.
+    """
+
+    PRIVATE_TEXT = "Contradictions unsupported claims in the zebra-omega salary ledger."
+    PRIVATE_TITLE = "Salary ledger"
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str, *, model: str, output_schema: Any = None) -> str:
+            self.prompts.append(prompt)
+            return json.dumps({"findings": []})
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.vault = FileVault.initialize(Path(self.temporary.name), policy())
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = self.seed.capture(None, text=self.PRIVATE_TEXT, title=self.PRIVATE_TITLE)
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = self.seed.file(self.private_hash, "10-work")["source"]["path"]
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def capture_public(self, text: str) -> None:
+        public = self.seed.capture(None, text=text, title="Public notes")
+        self.seed.file(public["source"]["content_hash"], "20-research")
+
+    def lint(self) -> tuple[dict[str, Any], _Recorder]:
+        driver = self._Recorder()
+        router = PolicyJudgmentRouter(self.vault.config(), JobSpecs())
+        service = BrainskitService(
+            self.vault, self.index, judgment=router, jobs=JobSpecs(), graph=MarkdownGraph()
+        )
+        with mock.patch("brainskit.infrastructure.llm._create_driver", return_value=driver):
+            return service.lint(semantic=True), driver
+
+    def assert_nothing_private(self, text: str) -> None:
+        for disclosure in (
+            "zebra-omega",
+            self.PRIVATE_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "10-work",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def test_lint_judges_the_permissible_pages_and_counts_the_rest(self) -> None:
+        self.capture_public("Contradictions and unsupported claims about release cadence.")
+        result, driver = self.lint()
+        self.assertEqual(result["semantic_report"], {"findings": []})
+        self.assertEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("release cadence", driver.prompts[0])
+        self.assert_nothing_private(driver.prompts[0])
+        self.assert_nothing_private(json.dumps(result["semantic_report"]))
+
+    def test_only_never_ingest_pages_is_an_actionable_refusal(self) -> None:
+        with self.assertRaises(PolicyError) as caught:
+            self.lint()
+        self.assertEqual(caught.exception.code, "policy_denied")
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("bk search", details["hint"])
+        self.assert_nothing_private(
+            json.dumps({"message": str(caught.exception), "details": details})
+        )
+
+    def test_mechanical_lint_carries_no_withheld_count(self) -> None:
+        """Nothing is sent to a model, so there is nothing to have withheld."""
+
+        self.assertNotIn("withheld_sources", self.seed.lint())
+
+
+class SemanticLintReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
+    """`bk lint --semantic` on a cloud route withholds `local-only` pages.
+
+    The twin of the `ask`/`resurface`/`digest` fix: semantic lint read as
+    `local`, which keeps `local-only` pages, and handed their branch to the
+    router, so with `lint-semantic` mapped to a cloud provider one local-only
+    page in recall refused the whole lint. The real router runs, so a
+    local-only branch reaching the cloud prompt would be refused there.
+    """
+
+    LOCAL_ONLY_TEXT = "Contradictions unsupported claims about kappa-sigma pay bands."
+    LOCAL_ONLY_TITLE = "Pay bands"
+    CLOUD_TEXT = "Contradictions unsupported claims about the Friday release cadence."
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str, *, model: str, output_schema: Any = None) -> str:
+            self.prompts.append(prompt)
+            return json.dumps({"findings": []})
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        raw = policy()
+        raw["branches"]["30-public"] = {"privacy": "cloud", "filing": "approve-each"}
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"]["lint-semantic"] = {"provider": "openai", "model": "m"}
+        self.vault = FileVault.initialize(Path(temporary.name), raw)
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = self.seed.capture(
+            None, text=self.LOCAL_ONLY_TEXT, title=self.LOCAL_ONLY_TITLE
+        )
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = self.seed.file(self.private_hash, "20-research")[
+            "source"
+        ]["path"]
+
+    def lint(self) -> tuple[dict[str, Any], _Recorder, list[str]]:
+        driver = self._Recorder()
+        providers: list[str] = []
+
+        def create_driver(name: str, config: Any) -> SemanticLintReadsUnderTheRoutesBoundaryTest._Recorder:
+            providers.append(name)
+            return driver
+
+        service = BrainskitService(
+            self.vault,
+            self.index,
+            judgment=PolicyJudgmentRouter(self.vault.config(), JobSpecs()),
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+        with mock.patch("brainskit.infrastructure.llm._create_driver", create_driver):
+            return service.lint(semantic=True), driver, providers
+
+    def assert_no_local_only(self, text: str) -> None:
+        for disclosure in (
+            "kappa-sigma",
+            self.LOCAL_ONLY_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "20-research",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def test_a_cloud_route_lints_the_cloud_pages_and_counts_the_rest(self) -> None:
+        public = self.seed.capture(None, text=self.CLOUD_TEXT, title="Cadence")
+        self.seed.file(public["source"]["content_hash"], "30-public")
+        result, driver, providers = self.lint()
+        self.assertEqual(providers, ["openai"])
+        self.assertEqual(result["semantic_report"], {"findings": []})
+        self.assertEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("Friday release cadence", driver.prompts[0])
+        self.assert_no_local_only(driver.prompts[0])
+        self.assert_no_local_only(json.dumps(result, ensure_ascii=False))
+
+    def test_only_local_only_pages_names_the_mapping_that_would_read_them(
+        self,
+    ) -> None:
+        with self.assertRaises(PolicyError) as caught:
+            self.lint()
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("job_models.lint-semantic.local-only", details["hint"])
+        self.assert_no_local_only(
+            json.dumps(
+                {"message": str(caught.exception), "details": details},
+                ensure_ascii=False,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -94,7 +94,8 @@ de seguir em março.
 ## Funciona no seu laptop e não pede nada
 
 Nenhum sistema de conta. Nenhuma credencial. Nenhuma rede para qualquer trabalho mecânico.
-Uma dependência no núcleo.
+Uma dependência declarada no núcleo, `jsonschema[format]`, que resolve para
+cerca de 17 pacotes no total — todos Python puro, exceto `rpds-py`.
 
 Anthropic, OpenAI, OpenRouter e Ollama são drivers intercambiáveis atrás de um
 contrato de trabalho — e evidência que você marcou `local-only` vai para Ollama ou não vai
@@ -111,7 +112,7 @@ uv tool install brainskit     # ou: pipx install brainskit
 bk --help
 ```
 
-Quatro extras são opcionais, porque o núcleo mantém uma única dependência e nenhuma dessas
+Quatro extras são opcionais, porque o núcleo se limita a essa única dependência declarada e nenhuma dessas
 capacidades é obrigatória para cada vault:
 
 ```bash
@@ -132,7 +133,7 @@ Instale a árvore de trabalho, uma ref git, ou um wheel construído com o mesmo 
 
 ```bash
 uv tool install /path/to/brainskit
-uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.5.0'
+uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.8.0'
 ```
 
 Para fixar `bk` a um projeto em vez da máquina, declare-o como uma dependência
@@ -225,6 +226,7 @@ se um arquivo está rodando.
 | [Enriquecimento](./docs/pt-BR/enrichment.md) | Arestas propostas pelo modelo, e as regras que tornam uma admissível |
 | [Integrações persistentes](./docs/pt-BR/integrations.md) | Obsidian, Neo4j, PostgreSQL, muitos vaults em uma loja |
 | [Servindo um vault](./docs/pt-BR/serving.md) | O visualizador web local, e MCP sobre stdio ou HTTP |
+| [Plugin do DeepSeek Harness](./plugins/dsh-brainskit/README.pt-BR.md) | Conecte um vault local ao DSH pelo cliente MCP oficial |
 | [Agentes de codificação](./docs/pt-BR/agents.md) | `bk hooks install`, e provando que o portão de escrita realmente guarda |
 | [Arquitetura](./docs/pt-BR/architecture.md) | Camadas, módulos da aplicação, roteamento de julgamento |
 | [Benchmarks](./docs/pt-BR/benchmarks.md) | Cobertura de código-grafo e recuperação LOCOMO |

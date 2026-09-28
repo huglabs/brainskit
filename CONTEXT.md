@@ -33,15 +33,36 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   every node and edge exists, so a link cannot pull a redacted node back in
   through its neighbour. A redacted source contributes nothing: not its body,
   not its filename, not its branch.
+- **Installation fact** — an absolute local path: the vault root, the home
+  directory, the workspace, the code root, the interpreter. Inside the
+  boundary: a `cloud` consumer is never told one on a consumer-scoped
+  response, and the key is omitted rather than blanked; `local` and `human`
+  keep it. Decided by `Consumer.sees_installation`, applied by
+  `PrivacyBoundary.installation_facts(**facts)`. Vault-relative paths are
+  evidence identifiers, not installation facts. See ADR 0009.
+- **Server consumer** — the consumer an MCP server is declared as, with `bk
+  serve --mcp --consumer cloud|local`; `cloud` when none is named, and `human`
+  is refused. It is a ceiling: every tool and resource answers under it, and a
+  per-call `consumer` may only narrow it — a wider one is `policy_denied`, never
+  clamped. Validated once by `server_consumer`; "narrows" is derived from
+  `Consumer.allows`. A server whose consumer does not `sees_installation`
+  (`cloud`) neither lists nor runs the integration lifecycle tools
+  (`integration_configure`, `_up`, `_down`, `_sync`): they are operator
+  actions on this machine. See ADR 0010.
+- **Confined capture** — a capture a model asked for (MCP): text and URLs as
+  usual, a file only inside the code root or an installed workspace, outside
+  the vault, and never a credential-shaped file. `bk capture` is not confined.
+  The name list lives in `application/capture.py`. See ADR 0010.
 
 ## Freshness
 
 - **FreshnessLedger** — the one owner of `.brain/freshness.json`. Every read and
   write goes through it; no other module names the state file. Transitions are
   named after intent (`mark_applied`, `mark_reviewed`, `record_resurfaced`,
-  `refresh_staleness`, `record_projection`, `drop`), so the rules that hold
-  across the file are stated once instead of in each writer. Built at the
-  composition root and handed to its collaborators, never constructed by them.
+  `refresh_staleness`, `record_projection`, `record_seeded`, `drop`), so the
+  rules that hold across the file are stated once instead of in each writer.
+  Built at the composition root and handed to its collaborators, never
+  constructed by them.
 - **FreshnessSnapshot** — one read of the ledger, and every question asked of
   that read. Request-scoped by the same convention as `PrivacyBoundary`: taken,
   questioned, dropped — never held across a write.
@@ -52,6 +73,23 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   nothing. `applied_hash` answers `None` for it, exactly as for no entry at all,
   so `wiki.outside_apply` still reports the page. Populating the field outside
   apply would bless a hand edit rather than report it.
+- **seed record** — a record that brainskit, not the apply gate, wrote a seed
+  page (`wiki/index.md`, `wiki/log.md`), kept in its own `seeded` table rather
+  than as a page entry. It vouches only that the page is still byte-identical to
+  the template `bk init` wrote; `record_seeded` writes it, from lint and only
+  for a page equal to that template, and `seeded_hash` is compared exactly as
+  `applied_hash` is, after it. It does not age, and it counts neither in the
+  freshness summary nor in the projection fingerprint — none of which is true
+  of a page compiled from no sources.
+- **artefact hash** — `artefact_hash`, the SHA-256 of a projection's anchor
+  (`views/home.md`, `graph/graph.json`) stamped by `record_projection` from the
+  text just written. It answers "is this the file brainskit wrote" by identity
+  rather than by shape: an anchor whose bytes differ is `malformed`. A
+  projection recorded before the stamp existed is **`unverified`** — built from
+  the current inputs, but nothing can say the file is still the one written —
+  which is regenerate-class (`stale: true`) and cleared by one run of its
+  command. Not `malformed`, because a view an older release generated is a
+  legitimate artefact.
 - **never-downgrade** — `review` is a weaker claim on attention than `stale`,
   and the ageing pass skips `review`, so writing it over `stale` removes the
   page from the loop rather than lowering a badge. `mark_reviewed` refuses,
@@ -76,11 +114,24 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   and the third instance of the one `ConstantsHaveOneOwnerTest` was written for.
   An agent with no hooks reports no `write_gate` layer rather than an inactive
   one: "there is no guard here" and "the guard fell off" are different claims.
+- **outdated** — an installed, brainskit-generated hook script that differs
+  from what the installer would render for that workspace now. Judged against
+  `installer.render_hook_script`, the one renderer both the writer and `Health`
+  call, so "current" cannot mean two things. An outdated `write_gate` is not the
+  gate this version specifies, so the vault is not `gated`; an outdated
+  `session_status` still runs and only warns, because a stale summary
+  misreports the vault without letting a write through. The remedy is the
+  layer's `hint`, which names `--root` when the workspace is not the vault — an
+  installation fact, so `cloud` gets it with the path replaced (ADR 0009).
 - **adapter** — `.brain/agent-<agent>.json`, the only thing on disk that records
   an install. It carries the resolved workspace (which is not always the vault)
   and the gate's deny rules, so `installed_agents` reading the directory is the
   whole answer to "who is this vault installed for". Its path is `adapter_path`,
   spelled once, because the gate, the installer and the reader all open it.
+  `rendered` is the SHA-256 of each file the installer rendered for the operator
+  to keep, by workspace-relative path (today, the skill), so an unedited copy is
+  replaced without `--force` when the template changes; any edit makes the file
+  the operator's.
 - **workspace vs vault** — `.claude/`, the instruction file and the git
   pre-commit hook belong to the project an agent is opened on; `.brain/` and the
   graph belong to the vault. A reader that assumes they are the same directory
@@ -90,6 +141,15 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   `wiki/` is refused". `bk doctor` runs the gate hook on one path it must deny
   and one it must allow (`enforcing` / `not_enforcing` / `over_blocking` /
   `unknown` / `absent`), because the hook fails open by design in eight places.
+  What it runs is the command `settings.json` registers, through `sh -c` as
+  Claude Code runs it, not the script path: a registration that does not
+  survive the shell fails open while the script it names works by hand. The
+  same goes for the `commit_lint` probe: doctor runs the pre-commit hook
+  brainskit installed, from the workspace as git does, and a hook that exits
+  anything but a lint verdict is `not_enforcing`. `absent` means nothing will
+  run: no registration and no script. A registered gate whose script is gone is
+  `not_enforcing`, because the agent still runs the command, the shell exits
+  127, and Claude Code does not treat that as a block.
   It lives in `application/doctor.py`, apart from the installer whose output it
   refuses to take on trust.
 - **decide here, say it there** — where `interfaces/cli.py` ends. Writing an

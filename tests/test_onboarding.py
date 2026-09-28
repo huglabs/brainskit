@@ -20,6 +20,11 @@ them is a regression test for a bug that made every arrow key read as "cancel".
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import os
 import re
 import select
@@ -94,9 +99,12 @@ class PolicyAssemblyTest(unittest.TestCase):
         from brainskit.domain.model import VaultConfig
 
         options = ["agent", "obsidian", "web"]
-        every = chain.from_iterable(
-            combinations(options, n) for n in range(len(options) + 1)
+        every = list(
+            chain.from_iterable(
+                combinations(options, n) for n in range(len(options) + 1)
+            )
         )
+        self.assertEqual(len(every), 2 ** len(options))
         with tempfile.TemporaryDirectory() as name:
             for extras in every:
                 policy = self.assemble(Path(name), list(extras))
@@ -125,6 +133,10 @@ class PolicyAssemblyTest(unittest.TestCase):
         got this wrong would be unfixable after the fact.
         """
 
+        self.assertEqual(
+            [preset.key for preset in onboarding.PRESETS],
+            ["work", "personal", "research"],
+        )
         for preset in onboarding.PRESETS:
             private = [
                 name
@@ -174,6 +186,74 @@ class ProbeTest(unittest.TestCase):
             models=(OllamaModel("only", "3B", 8192, False),),
         )
         self.assertEqual([m.name for m in probe.usable], ["only"])
+
+
+class ModelCountTest(unittest.TestCase):
+    """The header, the provider row and the picker count the same models.
+
+    The header said `4 models` above a picker of 3: the one model without tool
+    support was dropped from the list without a word, and it was the largest.
+    """
+
+    PROBE = OllamaProbe(
+        base_url="http://127.0.0.1:11434",
+        reachable=True,
+        models=(
+            OllamaModel("qwen2.5:3b", "3.1B", 32768, True),
+            OllamaModel("qwen2.5:1.5b", "1.5B", 32768, True),
+            OllamaModel("llama3.2:1b", "1.2B", 131072, True),
+            OllamaModel("big-no-tools", "13.8B", 262144, False),
+        ),
+    )
+
+    def picker_rows(self, probe: OllamaProbe) -> list[Choice[str]]:
+        offered: list[list[Choice[str]]] = []
+
+        def select(_title: str, choices: list[Choice[str]], **_: object) -> str:
+            offered.append(list(choices))
+            return next(c.value for c in choices if c.enabled)
+
+        with patch.object(prompt, "select", select), patch("sys.stdout", StringIO()):
+            onboarding._ask_ollama_model(probe)
+        return offered[0]
+
+    def test_every_count_on_screen_is_the_number_of_picker_rows(self) -> None:
+        rows = self.picker_rows(self.PROBE)
+        self.assertEqual(len(rows), 4)
+        with patch("sys.stdout", StringIO()):
+            header = console_text(onboarding._context_panel(_environment(), self.PROBE))
+        self.assertIn("4 models", header)
+
+    def test_the_model_without_tools_is_dimmed_with_its_reason_not_dropped(self) -> None:
+        rows = self.picker_rows(self.PROBE)
+        dimmed = [row for row in rows if not row.enabled]
+        self.assertEqual([row.value for row in dimmed], ["big-no-tools"])
+        self.assertIn("no tool support", dimmed[0].note)
+        self.assertEqual(rows[0].value, "qwen2.5:3b")
+        self.assertEqual(onboarding._model_count(self.PROBE), "4 models (1 without tool support)")
+
+    def test_when_nothing_has_tools_nothing_is_dimmed(self) -> None:
+        probe = OllamaProbe(
+            base_url="x",
+            reachable=True,
+            models=(OllamaModel("a", "3B", 8192, False), OllamaModel("b", "1B", 8192, False)),
+        )
+        self.assertTrue(all(row.enabled for row in self.picker_rows(probe)))
+        self.assertEqual(onboarding._model_count(probe), "2 models")
+
+
+def _environment() -> onboarding.Environment:
+    return onboarding.Environment(
+        vault=Path("/v"),
+        workspace=Path("/v"),
+        is_git_repo=False,
+        has_agent_dir=False,
+        language="English",
+    )
+
+
+def console_text(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 class DetectionTest(unittest.TestCase):
@@ -414,13 +494,20 @@ def _drive(
         process.kill()
         process.wait(timeout=10)
         os.close(master)
-        return "".join(chunks)
+        return _reached("".join(chunks))
     while time.time() < deadline and process.poll() is None:
         pump(0.3)
     pump(0.3)
     process.wait(timeout=10)
     os.close(master)
-    return "".join(chunks)
+    return _reached("".join(chunks))
+
+
+def _reached(transcript: str) -> str:
+    """A child that crashed painted a traceback, not the screen under test."""
+
+    _harness.refuse_vacuous(transcript)
+    return transcript
 
 
 _RAW_PRELUDE = """
@@ -508,17 +595,8 @@ class TopLevelHelpTest(unittest.TestCase):
     """
 
     def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
-        from contextlib import redirect_stderr, redirect_stdout
-
-        from brainskit.interfaces import cli
-
-        out, err = StringIO(), StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            try:
-                code = cli.main(argv)
-            except SystemExit as exit_:  # argparse's own failures
-                code = int(exit_.code or 0)
-        return code, out.getvalue(), err.getvalue()
+        run = _harness.run_cli(argv)
+        return run.code, run.stdout, run.stderr
 
     def test_a_bare_bk_prints_the_grouped_help_and_succeeds(self) -> None:
         code, out, _ = self.run_cli([])
@@ -721,13 +799,31 @@ raise SystemExit(cli.main([]))
 
         from brainskit.interfaces import cli
 
-        self.assertIn("forget", cli._DESTRUCTIVE)
-        for command in cli._DESTRUCTIVE:
-            self.assertIn(
-                command,
-                {name for _, names in cli.HELP_CATEGORIES for name in names},
-                "a destructive command must still be reachable to be shown",
-            )
+        self.assertEqual(cli._DESTRUCTIVE, {"forget", "reject", "apply"})
+        parser = cli.build_parser()
+        reachable = {name for _, names in cli.HELP_CATEGORIES for name in names}
+
+        def offered(command: str) -> list[str]:
+            seen: list[list[str]] = []
+
+            def select(_question: str, choices: list, **_: object) -> str:
+                seen.append([choice.value for choice in choices])
+                raise prompt.Cancelled
+
+            with patch.object(cli.prompt, "select", select):
+                cli._offer_to_run(parser, command)
+            (values,) = seen
+            return values
+
+        self.assertIn("run", offered("status"))
+        for command in sorted(cli._DESTRUCTIVE):
+            with self.subTest(command=command):
+                self.assertIn(
+                    command,
+                    reachable,
+                    "a destructive command must still be reachable to be shown",
+                )
+                self.assertEqual(offered(command), ["compose", "back"])
 
 
 class SubcommandHelpTest(unittest.TestCase):
@@ -828,10 +924,14 @@ class RowFittingTest(unittest.TestCase):
         return rendered
 
     def test_no_real_command_row_can_overflow_any_plausible_terminal(self) -> None:
-        from brainskit.interfaces import console
+        from brainskit.interfaces import cli, console
 
+        commands = sum(len(names) for _, names in cli.HELP_CATEGORIES)
         for width in (40, 60, 80, 100, 120):
-            for row in self.rows_for_every_group(width):
+            rows = self.rows_for_every_group(width)
+            self.assertEqual(len(rows), commands)
+            self.assertTrue(any("forget" in row for row in rows))
+            for row in rows:
                 self.assertLess(
                     console._visible_len(row),
                     width,
@@ -924,8 +1024,8 @@ raise SystemExit(cli.main([]))
     def test_each_command_appears_exactly_once(self) -> None:
         screen = self.screen_after_browsing(24, 80)
         for command in ("capture", "status", "reconcile", "watch", "lint"):
-            self.assertLessEqual(
+            self.assertEqual(
                 screen.count(f"◇ {command}") + screen.count(f"◆ {command}"),
                 1,
-                f"{command} was painted more than once",
+                f"{command} was not painted exactly once",
             )

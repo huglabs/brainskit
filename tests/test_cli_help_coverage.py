@@ -10,6 +10,11 @@ later is covered without anyone remembering to extend a fixture.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import argparse
 import unittest
 

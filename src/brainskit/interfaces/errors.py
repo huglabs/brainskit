@@ -208,6 +208,39 @@ def refusal_envelope(
     return {"ok": False, "error": error}
 
 
+def succeeded(command: str, subcommand: str | None, result: Any) -> bool:
+    """Whether a command that returned a result did what it was asked.
+
+    The other half of the envelope: an error has a code and this table reads
+    it, but a few commands fail *inside* a result, and there the result is the
+    only place the answer exists. `bk lint` fails by finding an error; `bk
+    vaults sync` by one vault failing while the loop carries on for the rest
+    (a skipped vault is the policy working, not a failure); `bk update` by an
+    upgrade command that exited non-zero.
+
+    Everything else is a report whose answer is a state -- `status`'s and
+    `doctor`'s `healthy`, `code status`'s `stale`, `watch`'s per-file
+    `failures`, `update`'s `unavailable` when PyPI cannot be reached. The
+    command answered, so it succeeded.
+
+    One function because two readings used to disagree: the CLI printed
+    `{"ok": true, "result": {"ok": false}}` above an exit 1, and MCP answered
+    `isError: false` to the same lint. The CLI derives both `ok` and its exit
+    status from this; MCP derives `isError`, passing its tool name, which is
+    the command it mirrors.
+    """
+
+    if not isinstance(result, dict):
+        return True
+    if command == "lint":
+        return bool(result["ok"])
+    if command == "vaults" and subcommand == "sync":
+        return not result["failed"]
+    if command == "update":
+        return result.get("state") != "failed"
+    return True
+
+
 def jsonrpc_error_data(error: BrainskitError) -> dict[str, Any]:
     """The `data` member of a JSON-RPC error, identical on both transports.
 

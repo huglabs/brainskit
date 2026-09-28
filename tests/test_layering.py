@@ -14,6 +14,11 @@ side effects and lets it run without the optional extras installed.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import ast
 import sys
 import unittest

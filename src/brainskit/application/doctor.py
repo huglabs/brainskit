@@ -3,7 +3,8 @@
 `installer.py` writes an install and `Health` reads one back; both then say a
 layer is *installed and registered*. This module answers the different question
 `bk doctor` exists for -- whether the thing installed actually refuses a write
--- by executing the gate hook on one path it must deny and one it must allow.
+-- by executing the gate hook on one path it must deny and one it must allow,
+and the git pre-commit hook to see that it lints this vault.
 That is the "exercised, not believed" idea ADR 0004 keeps separate from the
 registry, and it is separate here for the same reason: the installer's remit
 ends when the files are on disk, and this begins by distrusting them.
@@ -21,13 +22,20 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import re
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from brainskit.application.install import WRITE_GATE
+from brainskit.application.codegraph import CODE_PROJECTION
+from brainskit.application.install import COMMIT_LINT, DEFAULT_GIT_HOOKS, WRITE_GATE
+from brainskit.application.installer import (
+    is_generated_pre_commit,
+    pre_commit_lints,
+    pre_commit_vault,
+)
 from brainskit.application.ports import EnvironmentPort, VaultPort
 
 #: The probe payload is the shape Claude Code sends a PreToolUse hook.
@@ -37,32 +45,94 @@ _GATE_PROBE_NAME = "brainskit-doctor-probe.md"
 _SELF_DISTRIBUTION = "brainskit"
 
 
-def _run_gate_hook(script: Path, target: Path) -> tuple[int | None, str]:
-    """Ask the installed hook about one path, exactly as the agent would.
+def _run_hook(
+    argv: list[str], *, stdin: str | None, workspace: Path | None, timeout: int = 60
+) -> tuple[int | None, str]:
+    """Run one installed hook the way its caller would; (status, first stderr line).
 
-    Runs the script itself rather than `sh script`, because the executable bit
-    is part of what makes a hook fire and `sh` would paper over its absence.
     Never raises: a hook that cannot run is a finding, not a crash.
     """
-    payload = json.dumps(
-        {"tool_name": "Write", "tool_input": {"file_path": str(target)}}
-    )
+    env = dict(os.environ)
+    cwd = workspace if workspace is not None and workspace.is_dir() else None
+    if cwd is not None:
+        env["CLAUDE_PROJECT_DIR"] = str(cwd)
     try:
-        # The path is the hook brainskit installed and `Health` reports, not
-        # caller input, and it is a one-element argument vector with no shell.
-        # Executing it is the entire point: reading the file instead is the
-        # bug this probe exists to catch.
+        # The argument vector is the hook brainskit installed or the command
+        # the operator's settings.json registers -- the thing the agent or git
+        # will run anyway. Executing it is the entire point: reading the file
+        # instead is the bug this probe exists to catch.
         done = subprocess.run(  # noqa: S603
-            [str(script)],
-            input=payload,
+            argv,
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
             check=False,
+            cwd=cwd,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, str(exc)
     return done.returncode, done.stderr.strip()
+
+
+def _registered_argv(registration: Mapping[str, Any]) -> list[str]:
+    """How Claude Code runs a registered hook command.
+
+    Per its hooks reference: with `args` it spawns `command` directly with that
+    argument vector; without, "the `command` string is passed to a shell: `sh -c`
+    on macOS and Linux". Running the script path instead is what let a command
+    that exits 127 under `sh` -- an unquoted workspace path with a space -- pass
+    this probe while every write went through.
+    """
+    command = str(registration.get("command", ""))
+    args = registration.get("args")
+    if isinstance(args, list):
+        return [command, *(str(arg) for arg in args)]
+    shell = "/bin/bash" if registration.get("shell") == "bash" else "/bin/sh"
+    return [shell, "-c", command]
+
+
+#: The extra whose grammars pip installs as one unit, and the one the docs
+#: recommend. `code-all` adds grammars `bk code build` also offers to install
+#: one at a time, so a subset of those is a choice rather than a broken install.
+_CODE_EXTRA = "code"
+_ALL_EXTRA = "code-all"
+
+
+def _declared_requirements() -> list[tuple[str, str, str, str | None]]:
+    """This distribution's requirements as (name, bracketed extras, specifiers, extra).
+
+    `tree-sitter-python>=0.23,<0.26; extra == "code"` is a name, any version
+    specifiers, and the extra that pulls it in; `brainskit[code]; extra ==
+    "code-all"` is how one extra includes another. An unresolvable
+    self-distribution (an exotic install without dist-info) yields nothing, and
+    every reader below degrades to "cannot judge" rather than to a fault.
+    """
+
+    try:
+        requires = importlib.metadata.requires(_SELF_DISTRIBUTION) or []
+    except Exception:
+        return []
+    parsed: list[tuple[str, str, str, str | None]] = []
+    for requirement in requires:
+        head, _, marker = requirement.partition(";")
+        match = re.match(
+            r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?\s*(.*)$", head.strip()
+        )
+        if match is None:
+            continue
+        extra = re.search(r"extra\s*==\s*[\"']([^\"']+)[\"']", marker)
+        parsed.append(
+            (
+                match.group(1).lower(),
+                match.group(2) or "",
+                match.group(3).strip(),
+                extra.group(1) if extra else None,
+            )
+        )
+    return parsed
 
 
 def _grammar_requirements() -> dict[str, str]:
@@ -74,29 +144,85 @@ def _grammar_requirements() -> dict[str, str]:
     first time a pin moved. `importlib.metadata` is stdlib, so the layering
     rule (no `infrastructure` imports below `application`) is untouched.
 
-    An unresolvable self-distribution (an exotic install without dist-info)
-    yields an empty mapping: the update check degrades to absent, never to a
-    false "outdated".
+    An unresolvable self-distribution yields an empty mapping: the update check
+    degrades to absent, never to a false "outdated".
     """
 
-    try:
-        requires = importlib.metadata.requires(_SELF_DISTRIBUTION) or []
-    except Exception:
-        return {}
     pins: dict[str, list[str]] = {}
-    for requirement in requires:
-        # `tree-sitter-python>=0.23,<0.26; extra == "code"` — name, then any
-        # version specifiers, then an environment marker we can ignore: every
-        # grammar requirement in the metadata arrives through an extra.
-        head = requirement.split(";", 1)[0].strip()
-        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)$", head)
-        if match is None:
-            continue
-        name, specifiers = match.group(1), match.group(2).strip()
+    for name, _, specifiers, _ in _declared_requirements():
         if not name.startswith("tree-sitter") or not specifiers:
             continue
-        pins.setdefault(name.lower(), []).append(specifiers)
+        pins.setdefault(name, []).append(specifiers)
     return {name: ",".join(parts) for name, parts in sorted(pins.items())}
+
+
+def _grammar_extras() -> dict[str, frozenset[str]]:
+    """Each extra's grammar distributions, with included extras folded in.
+
+    `code-all` declares `brainskit[code]` rather than repeating its grammars,
+    so the closure is taken here; otherwise "is `code-all` complete" would be
+    answered over the sixteen grammars it names and not the twenty-nine it
+    installs.
+    """
+
+    direct: dict[str, set[str]] = {}
+    includes: dict[str, set[str]] = {}
+    for name, bracketed, _, extra in _declared_requirements():
+        if extra is None:
+            continue
+        if name == _SELF_DISTRIBUTION:
+            includes.setdefault(extra, set()).update(
+                part.strip() for part in bracketed.split(",") if part.strip()
+            )
+        elif name.startswith("tree-sitter-"):
+            direct.setdefault(extra, set()).add(name)
+
+    def closure(extra: str, seen: frozenset[str] = frozenset()) -> set[str]:
+        members = set(direct.get(extra, set()))
+        for included in includes.get(extra, set()) - seen - {extra}:
+            members |= closure(included, seen | {extra})
+        return members
+
+    extras = set(direct) | set(includes)
+    return {
+        extra: frozenset(members)
+        for extra in sorted(extras)
+        if (members := closure(extra))
+    }
+
+
+def grammar_install_state(grammars: Mapping[str, bool]) -> dict[str, Any]:
+    """Whether the grammars present are a choice or a broken install.
+
+    `code` is an optional extra, so no grammar at all is `absent`: an operator
+    who never asked for the code graph has nothing wrong with their machine,
+    and folding that into `healthy` made the field a constant on every default
+    install (#13). The `code-all` grammars beyond `code` are individually
+    optional too -- `bk code build` itself offers to install just the ones a
+    scan needs -- so `[code]` complete with none of them is `complete` (#24).
+
+    What *is* a fault is `partial`: some of the `code` extra's grammars present
+    and some not. pip installs that extra as one unit, so a subset is an
+    interrupted or hand-assembled install, and `bk code build` over it succeeds
+    while a language contributes nothing. `broken` names exactly the grammars
+    whose absence is that fault, and nothing that is merely optional.
+    """
+
+    known = {str(name).lower() for name in grammars}
+    installed = {str(name).lower() for name, present in grammars.items() if present}
+    extras = _grammar_extras()
+    unit = extras.get(_CODE_EXTRA, frozenset()) & known
+    if not installed:
+        state, broken = "absent", []
+    else:
+        broken = sorted(unit - installed)
+        state = "partial" if broken else "complete"
+    complete = [
+        extra
+        for extra, members in extras.items()
+        if (members & known) and (members & known) <= installed
+    ]
+    return {"state": state, "broken": broken, "extras_complete": complete}
 
 
 def _version_key(version: str) -> tuple[int, ...]:
@@ -240,23 +366,57 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
         ),
         None,
     )
+    if entry is not None and entry.get("workspace_missing"):
+        return _workspace_missing(entry)
     script = Path(entry["script"]) if entry and entry.get("script") else None
-    if script is None or not script.is_file():
+    registration = entry.get("registration") if entry else None
+    registered = isinstance(registration, dict) and bool(registration.get("command"))
+    # "Absent" means nothing will run: no script and no registration. A deleted
+    # script whose registration remains is still run by the agent -- and fails.
+    if entry is None or script is None or not (script.is_file() or registered):
         return {
             "state": "absent",
             "detail": "no write-gate hook is installed; nothing to exercise",
         }
+    missing = not script.is_file()
+
+    if isinstance(registration, dict) and registered:
+        argv = _registered_argv(registration)
+        exercised = "registered_command"
+    else:
+        # Nothing registers it, so the agent never runs it and `gated` already
+        # says so; the script is still worth running to say whether it works.
+        # Run as itself rather than `sh script`: the executable bit is part of
+        # what makes a hook fire, and `sh` would paper over its absence.
+        argv = [str(script)]
+        exercised = "script"
+    workspace = Path(entry["workspace"]) if entry.get("workspace") else None
 
     vault_root = vault.root
     gated = vault_root / "wiki" / _GATE_PROBE_NAME
     ordinary = vault_root.parent / _GATE_PROBE_NAME
 
-    denied_status, denied_note = _run_gate_hook(script, gated)
-    allowed_status, allowed_note = _run_gate_hook(script, ordinary)
+    def ask(target: Path) -> tuple[int | None, str]:
+        payload = json.dumps(
+            {"tool_name": "Write", "tool_input": {"file_path": str(target)}}
+        )
+        return _run_hook(argv, stdin=payload, workspace=workspace)
+
+    denied_status, denied_note = ask(gated)
+    allowed_status, allowed_note = ask(ordinary)
     denies_gated = denied_status == 2
     allows_ordinary = allowed_status == 0
 
-    if denied_status is None or allowed_status is None:
+    if missing and not denies_gated:
+        # Claude Code treats neither a shell's 127 nor a spawn failure as a
+        # block, so an unrunnable registration fails open rather than unknown.
+        state = "not_enforcing"
+        said = _first_line(denied_note) or f"exit {denied_status}"
+        detail = (
+            f"{script.name} is missing but still registered, so the registered "
+            f"command cannot run ({said}); every write to wiki/ goes through"
+        )
+    elif denied_status is None or allowed_status is None:
         state, detail = "unknown", f"the hook could not be run: {denied_note or allowed_note}"
     elif denies_gated and allows_ordinary:
         state, detail = "enforcing", f"a write to wiki/ is refused (exit {denied_status})"
@@ -277,6 +437,7 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
         "state": state,
         "detail": detail,
         "script": str(script),
+        "exercised": exercised,
         "denies_a_gated_write": denies_gated,
         "allows_an_ordinary_write": allows_ordinary,
     }
@@ -285,6 +446,173 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
     note = denied_note or allowed_note
     if note and state != "enforcing":
         report["hook_said"] = note
+    if entry.get("hint") and state != "enforcing":
+        report["hint"] = entry["hint"]
+    if isinstance(registration, dict) and exercised == "registered_command":
+        report["command"] = str(registration["command"])
+    return report
+
+
+def _workspace_missing(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A layer whose recorded workspace is gone: nothing there to run."""
+
+    report: dict[str, Any] = {
+        "state": "unknown",
+        "detail": f"nothing to exercise: {entry.get('detail', '')}",
+    }
+    if entry.get("hint"):
+        report["hint"] = entry["hint"]
+    return report
+
+
+#: `bk lint`'s exit status when it ran and found an error: `interfaces/cli.py`
+#: returns `0 if ok else 1` for a lint result, and every `BrainskitError` --
+#: "Not a brainskit vault" among them -- exits through the error table with 2.
+_LINT_FOUND_ERRORS = 1
+
+
+def _first_line(text: str) -> str:
+    return next((line for line in text.splitlines() if line.strip()), "")
+
+
+def probe_commit_lint(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run the git pre-commit hook instead of reading it.
+
+    `commit_lint` was judged by the file's existence and content, so a hook
+    naming a vault that does not exist -- a pre-0.8.0 hook's JSON-quoted
+    non-ASCII path, or a repository moved since install -- read `active` while
+    every commit failed with "Not a brainskit vault". Run from the workspace
+    with nothing on stdin, as git runs it: exit 0 is a clean lint and exit 1 is
+    lint finding errors, both of which mean the hook linted this vault. Anything
+    else -- 126/127 from the shell, 2 from a `bk` error -- means it refuses every
+    commit without checking one, which teaches `--no-verify`.
+
+    Only a hook brainskit wrote is run. An operator's hook may do anything at
+    all, and executing it to find out is not a diagnosis doctor gets to make.
+    `bk lint` refreshes page ages in the freshness ledger as it goes, the same
+    bookkeeping every commit and every `bk status` performs; nothing else is
+    written.
+    """
+
+    entry = next(
+        (
+            layer
+            for layer in layers
+            if layer["layer"] == COMMIT_LINT and layer.get("script")
+        ),
+        None,
+    )
+    if entry is not None and entry.get("workspace_missing"):
+        return _workspace_missing(entry)
+    hook = Path(entry["script"]) if entry else None
+    if entry is None or hook is None or not hook.is_file():
+        stranded = _stranded_pre_commit(entry, hook)
+        if stranded is not None:
+            return stranded
+        return {
+            "state": "absent",
+            "detail": "no pre-commit hook is installed; nothing to exercise",
+        }
+    workspace = Path(entry.get("workspace") or hook.parent)
+    report: dict[str, Any] = {"script": str(hook)}
+    try:
+        content = hook.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {**report, "state": "unknown", "detail": f"the hook could not be read: {exc}"}
+    if not is_generated_pre_commit(content):
+        return {
+            **report,
+            "state": "not_judged",
+            "detail": "the pre-commit hook was not written by brainskit, so it is not run",
+        }
+    if not os.access(hook, os.X_OK):
+        return {
+            **report,
+            "state": "not_enforcing",
+            "detail": (
+                "the pre-commit hook is not executable, and git skips it, so "
+                "commits are never linted"
+            ),
+            "hint": f"chmod +x {hook}",
+        }
+    if pre_commit_lints(content, workspace, vault.root) is False:
+        named = pre_commit_vault(content, workspace)
+        report.update(
+            {
+                "state": "not_enforcing",
+                "detail": f"the pre-commit hook lints {named}, not this vault",
+            }
+        )
+        if entry.get("hint"):
+            report["hint"] = entry["hint"]
+        return report
+
+    status, stderr = _run_hook([str(hook)], stdin=None, workspace=workspace, timeout=300)
+    if status is None:
+        return {**report, "state": "unknown", "detail": f"the hook could not be run: {stderr}"}
+    report["exit"] = status
+    if status == 0:
+        report.update(state="enforcing", detail="the pre-commit hook linted this vault (exit 0)")
+    elif status == _LINT_FOUND_ERRORS:
+        report.update(
+            state="enforcing",
+            detail=(
+                "the pre-commit hook linted this vault and found errors (exit 1), "
+                "so a commit is refused until they are fixed"
+            ),
+        )
+    else:
+        report.update(
+            state="not_enforcing",
+            detail=(
+                f"the pre-commit hook exited {status} before linting anything, "
+                "so every commit is refused and none is checked"
+            ),
+        )
+        said = _first_line(stderr)
+        if said:
+            report["hook_said"] = said
+        if entry.get("hint"):
+            report["hint"] = entry["hint"]
+    return report
+
+
+def _stranded_pre_commit(
+    entry: Mapping[str, Any] | None, hook: Path | None
+) -> dict[str, Any] | None:
+    """A brainskit hook in `.git/hooks` that `core.hooksPath` leaves unrun.
+
+    Git runs `hook`, which is missing; the generated hook sits in the default
+    directory git no longer reads. `bk status` reads that layer inactive, so
+    calling it `absent` here would make the two reports disagree.
+    """
+
+    if entry is None or hook is None or not entry.get("workspace"):
+        return None
+    workspace = Path(entry["workspace"])
+    default = workspace / DEFAULT_GIT_HOOKS / "pre-commit"
+    try:
+        if hook.parent.resolve() == default.parent.resolve():
+            return None
+        content = default.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not is_generated_pre_commit(content):
+        return None
+    try:
+        shown: Path = hook.parent.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        shown = hook.parent
+    report: dict[str, Any] = {
+        "script": str(default),
+        "state": "not_enforcing",
+        "detail": (
+            f"git runs hooks from {shown}, which has no pre-commit; "
+            f"brainskit's hook in {DEFAULT_GIT_HOOKS} is never run"
+        ),
+    }
+    if entry.get("hint"):
+        report["hint"] = entry["hint"]
     return report
 
 
@@ -322,17 +650,62 @@ def doctor_report(
 
     root, reason = vault.code_root_reason()
     missing = [name for name, installed in grammars.items() if not installed]
+    verdict = grammar_install_state(grammars)
+    broken = verdict["broken"]
     probe = probe_write_gate(vault, enforcement["layers"])
     enforcement["write_gate_probe"] = probe
+    commit_probe = probe_commit_lint(vault, enforcement["layers"])
+    enforcement["commit_lint_probe"] = commit_probe
     # The update half of the grammar check: a distribution may be present and
     # still violate the pin brainskit declares, which fails later, per file,
-    # at extraction time. Same report as missing, because it is the same
-    # "this language will let you down" fact.
-    updates = grammar_update_check(grammar_versions, environment=environment)
+    # at extraction time. Same report as a broken install, because it is the
+    # same "this language will let you down" fact. Optional grammars that are
+    # simply absent are left out, or a default install would carry an upgrade
+    # command for twenty-nine packages it never asked for.
+    updates = grammar_update_check(
+        {
+            name: info
+            for name, info in (grammar_versions or {}).items()
+            if grammars.get(name) or str(name).lower() in broken
+        },
+        environment=environment,
+    )
     outdated = [
         str(entry.get("distribution", ""))
         for entry in (updates.get("grammars_outdated") or [])
     ]
+    code: dict[str, Any] = {
+        "root": str(root),
+        "why_this_root": reason,
+        "scan_limit": vault.config().code_scan_limit,
+        "grammars_installed": sum(grammars.values()),
+        "grammars_known": len(grammars),
+        "grammars_missing": missing,
+        "grammars_state": verdict["state"],
+        "grammars_broken": broken,
+        "extras_complete": verdict["extras_complete"],
+        "grammars_outdated": outdated,
+        **updates,
+    }
+    if missing and environment.installable:
+        # The smallest command that moves this install forward: the grammars a
+        # partial `code` lacks, else the extra itself, else the optional rest.
+        if broken:
+            packages = broken
+        elif verdict["state"] == "absent":
+            packages = [f"{_SELF_DISTRIBUTION}[{_CODE_EXTRA}]"]
+        else:
+            packages = [f"{_SELF_DISTRIBUTION}[{_ALL_EXTRA}]"]
+        code["install"] = environment.install_hint(packages)
+    graph_note = _code_graph_without_grammars(vault, verdict["state"])
+    if graph_note is not None:
+        code["graph_without_grammars"] = graph_note
+    # The probe ran the command settings.json registers, through the shell
+    # Claude Code uses, which proves that command refuses a write; `gated` is
+    # what says it runs the script this version installs rather than an older
+    # copy that may enforce older rules. Both, or nobody has shown that a write
+    # to wiki/ is refused.
+    gate_live = probe["state"] == "absent" or bool(enforcement.get("gated"))
     return {
         "vault": str(vault.root),
         "environment": {
@@ -341,21 +714,7 @@ def doctor_report(
             "executable": environment.executable,
             "installable": environment.installable,
         },
-        "code": {
-            "root": str(root),
-            "why_this_root": reason,
-            "scan_limit": vault.config().code_scan_limit,
-            "grammars_installed": sum(grammars.values()),
-            "grammars_known": len(grammars),
-            "grammars_missing": missing,
-            "grammars_outdated": outdated,
-            **updates,
-            **(
-                {"install": environment.install_hint(missing)}
-                if missing and environment.installable
-                else {}
-            ),
-        },
+        "code": code,
         "enforcement": enforcement,
         # An allowlist, not a denylist: only two states are compatible with a
         # healthy installation -- the gate refused what it must ("enforcing"),
@@ -365,11 +724,53 @@ def doctor_report(
         # an installed gate that does not guard is worse than none: every other
         # layer keeps reporting success while writes go around it.
         #
-        # An out-of-range grammar counts against health for the same reason a
-        # missing one does: both are ways a build silently loses a language.
+        # Grammars count only when they are broken, never when they are absent:
+        # the extra is optional, and a field that is False on every default
+        # install is a constant a CI gate cannot use -- it hid the gate fault it
+        # was meant to report (#13). A partial `code` extra and an out-of-range
+        # grammar do count, because both are ways a build that reports success
+        # silently loses a language. A code graph this machine cannot rebuild
+        # is reported beside them but is not one: `bk code build` refuses loudly
+        # with the install command, and the stored graph still answers.
+        #
+        # A pre-commit hook brainskit wrote that does not lint this vault counts
+        # too, though it is not the guarantee `gated` is. It does not fail
+        # open quietly: it refuses every commit, which is how operators learn
+        # `--no-verify`, and `bk status` already counts an inactive commit_lint
+        # against its own `healthy` -- a doctor that stayed green over it would
+        # be the one report of the two that missed a fault it had just run into.
+        # Absent (no repository, no hook) and an operator's own hook are not
+        # faults doctor can see, so they stay compatible, as for the gate.
         "healthy": (
-            not missing
+            not broken
             and not outdated
             and probe["state"] in {"enforcing", "absent"}
+            and gate_live
+            and commit_probe["state"] in {"enforcing", "absent", "not_judged"}
+        ),
+    }
+
+
+def _code_graph_without_grammars(vault: VaultPort, state: str) -> dict[str, Any] | None:
+    """A code graph this vault uses, on a machine with no grammar to rebuild it.
+
+    Built (`graph/code.json` exists) or configured (`code_root` is set) says the
+    operator chose the code graph, so here the absent extra stops being a
+    choice made on their behalf. Reported, not counted against `healthy`: see
+    the verdict in `doctor_report`.
+    """
+
+    if state != "absent":
+        return None
+    built = (vault.root / CODE_PROJECTION).is_file()
+    configured = vault.config().code_root is not None
+    if not (built or configured):
+        return None
+    return {
+        "built": built,
+        "configured": configured,
+        "detail": (
+            "this vault uses a code graph, but no tree-sitter grammar is "
+            "installed, so `bk code build` cannot refresh it here"
         ),
     }

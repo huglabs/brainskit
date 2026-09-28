@@ -34,6 +34,11 @@ which is the layout the defect needs.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import sys
 import unittest
@@ -217,29 +222,41 @@ class DeletedFilesArePrunedTest(ScopedBuildFixture):
     def test_no_edge_dangles_after_a_prune(self) -> None:
         """An edge to a pruned node would break every traversal.
 
-        The fixture's `src/b.py` declares an edge to `src/c.py`, so this loop
-        has a body: the previous version of this test ran over an empty edge
-        list and would have passed with the dangling guard deleted.
+        `src/b.py` gets two out-of-scope edges: one into `src/c.py`, which the
+        prune removes, and one into `src/a.py`, which survives. With only the
+        first, the correct result is an empty edge list, so the endpoint loop
+        below ran zero times on every passing run -- the guard was proven only
+        by the loop's absence of a body. The surviving edge gives it one, and
+        the exact edge set pins both halves: the dangling edge is dropped and
+        the sound one is not dropped with it.
         """
 
+        (self.repo / "src" / "b.py").write_text(
+            "# uses: src/c.py\n# uses: src/a.py\ndef beta():\n    pass\n", "utf-8"
+        )
         self.service.code_build()
         before = self.graph()
-        doomed = {
-            str(node["id"])
+        file_ids = {
+            str(node["path"]): str(node["id"])
             for node in before["nodes"]
-            if str(node["path"]) == "src/c.py"
+            if str(node["label"]) in {"a", "b", "c"}
         }
-        self.assertTrue(
-            [edge for edge in before["edges"] if str(edge["target"]) in doomed],
-            "the fixture must have an edge into the file the prune removes",
-        )
+        a, b, c = file_ids["src/a.py"], file_ids["src/b.py"], file_ids["src/c.py"]
+
+        def edge_pairs(edges: list[dict[str, Any]]) -> set[tuple[str, str]]:
+            return {(str(edge["source"]), str(edge["target"])) for edge in edges}
+
+        self.assertEqual(edge_pairs(before["edges"]), {(b, c), (b, a)})
         (self.repo / "src" / "c.py").unlink()
 
         self.service.code_build(["src/a.py"])
 
         graph = self.graph()
+        edges = graph["edges"]
+        self.assertEqual(edge_pairs(edges), {(b, a)})
         ids = {str(node["id"]) for node in graph["nodes"]}
-        for edge in graph["edges"]:
+        self.assertNotIn(c, ids)
+        for edge in edges:
             self.assertIn(str(edge["source"]), ids)
             self.assertIn(str(edge["target"]), ids)
 
@@ -535,7 +552,13 @@ class MalformedStoredGraphTest(ScopedBuildFixture):
         result = self.service.code_build()
 
         self.assertGreater(result["nodes"], 0)
-        self.assertTrue(all("type" in edge for edge in self.graph()["edges"]))
+        self.assertEqual(
+            [
+                (edge["source"], edge["target"], edge.get("type"))
+                for edge in self.graph()["edges"]
+            ],
+            [("src_b_py", "src_c_py", "imports_from")],
+        )
         self.assertTrue(self.service.code_hubs()["hubs"])
 
     def test_a_sound_stored_graph_still_merges(self) -> None:

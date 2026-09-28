@@ -15,7 +15,9 @@ things it cannot work out for itself:
    cannot walk back: what has been sent to a provider has been sent.
 2. **Which model runs the six jobs.** Chosen from the models ollama reports,
    never from a hardcoded name — a vault configured for a model you do not have
-   is a vault whose every judgment fails at first use.
+   is a vault whose every judgment fails at first use. Models ollama reports
+   without tool support are listed too, dimmed and not selectable, so the count
+   in the header is the length of the list.
 3. **Anything else** — Obsidian sync, the local web UI, and wiring up a coding
    agent, which is on by default and writes `.claude/` plus a managed
    `CLAUDE.md` block for you.
@@ -24,6 +26,31 @@ Answers are validated at the prompt that produced them and shown as a summary
 you can walk back into before anything is written. If ollama is down or has no
 models, `init` says so and still produces a valid vault — the jobs simply stay
 idle until a provider is up.
+
+`init` ends on a **Next** block, written to work from the directory you ran it
+in. Run from the parent directory, `bk init ./my-vault` prints:
+
+```text
+Next
+  → bk hooks install --agent claude --vault my-vault  wire up your agent
+  → bk status --vault my-vault                        see vault health
+  → bk capture <file> --vault my-vault                add your first note
+  → bk ask "..." --vault my-vault                     ask a question
+```
+
+`--vault` appears only when discovery from the current directory would miss
+the new vault. When the vault is nested in a git repository, `hooks install`
+also gets `--root <project>`, so the agent files land where an agent opened on
+the project will load them — `bk init my-vault` at a repository's root prints
+`bk hooks install --agent claude --root . --vault my-vault`. The
+`hooks install` line is dropped once onboarding has wired the agent itself.
+With `--json`, the same steps are in `result.next`.
+
+Above the Next block, `init` may print a `!` warning when `job_models.ingest`
+routes to an ollama model under 7B parameters: such a model tends to lose
+ingest's citation contract on longer sources. It is advice, not a refusal —
+route `job_models.ingest` to a larger model in `.brain/config.json` if ingest
+fails. `--json` carries these as `result.warnings`.
 
 Arrow keys drive the selections. Off a terminal `init` refuses rather than
 answering its own questions from defaults nobody saw, so automation takes the
@@ -104,8 +131,12 @@ my-vault/
 │   ├── index.md             system pages, maintained by the engine
 │   └── log.md
 ├── views/map/  views/domains/   generated navigation
-├── graph/                   generated graph.json
-├── output/                  digests/, reports/, answers/
+├── graph/                   generated graph.json, and code.json from bk code build
+├── output/                  written by judgment jobs and exports
+│   ├── digests/<date>.md    bk digest
+│   ├── resurface/<date>.md  bk resurface
+│   ├── answers/<date>-<slug>.md   bk ask --save (and the viewer's "save" box)
+│   └── export-<target>.<ext>      bk export --target json|graphml|cypher|…
 └── .brain/                  policy and durable state
     ├── config.json          branches, providers, sources, ignore, integrations (no secrets)
     ├── schema.json          human-owned page schema, enforced by apply/lint

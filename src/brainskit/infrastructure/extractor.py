@@ -83,7 +83,7 @@ def _install_hint() -> str:
 # it appears in a scanned tree — nested at any depth, since a vault commonly
 # sits inside the repository it documents (`repo/docs/brain`) — the files
 # under it are the vault's config, registry, freshness and proposal JSON,
-# never source a caller meant to index. `CodeGraph._vault_prefix` already
+# never source a caller meant to index. `CodeGraph._owned_by_the_vault` already
 # drops any resulting node at import time, but that is after extraction has
 # already spent time on them and after upstream has already printed the
 # zero-nodes warning about them; filtering them out of the file list itself

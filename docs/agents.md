@@ -42,22 +42,89 @@ reporting the layer active.
 
 So `bk doctor` runs it. It sends the gate one path it must refuse and one it
 must allow, using the same payload Claude Code sends, and reports what actually
-happened under `enforcement.write_gate_probe`:
+happened under `enforcement.write_gate_probe`. What it runs is the command
+`.claude/settings.json` registers, the way Claude Code runs it — through
+`sh -c`, from the workspace, with `CLAUDE_PROJECT_DIR` set — so a registration
+that does not survive the shell (an unquoted path with a space exits 127, and
+Claude Code lets the write through) is caught even though the script it names
+works. `command` names what was run and `exercised` says whether it was the
+registered command or, when nothing registers the gate, the script itself.
 
 | `state` | Meaning |
 |---|---|
 | `enforcing` | a write to `wiki/` was refused and an ordinary write was not |
-| `not_enforcing` | the hook is installed and let a gated write through |
+| `not_enforcing` | the hook is installed and let a gated write through, or its script is gone while `settings.json` still registers it |
 | `over_blocking` | it refused an ordinary write outside the vault too |
-| `unknown` | the hook could not be executed at all |
-| `absent` | no gate is installed — a choice, not a fault |
+| `unknown` | the hook could not be executed at all, or its recorded workspace is gone |
+| `absent` | no gate is registered and no script is installed — a choice, not a fault |
+
+A deleted gate script whose registration remains is not `absent`. Claude Code
+still runs the registered command, `sh -c` exits 127, and Claude Code does not
+treat that as a block, so every write goes through. `doctor` runs the command,
+quotes the shell's error in `detail` and `hook_said`, and gives the reinstall
+command as `hint`; `bk status` reads the layer inactive and says the same.
 
 Both probes are decisions only: `gate check-write` writes nothing, and no probe
 file is ever created. When the hook fails open it explains itself on stderr, and
 that sentence is repeated back as `hook_said` because it names the missing piece
 better than an exit code can. `doctor` reports `healthy: false` for every state
 except `enforcing` and `absent` — an installed gate that does not guard is worse
-than none, because everything else goes on reporting success.
+than none, because everything else goes on reporting success. `enforcing` also
+needs `status` to agree that the gate is live (`gated: true`): the probe can
+pass for an unregistered script (run directly) or for an outdated copy.
+
+The git pre-commit hook is exercised the same way, under
+`enforcement.commit_lint_probe`: the hook git will run (`core.hooksPath`
+honoured) is executed from the workspace with nothing on stdin. `bk lint` exits
+0 when clean and 1 when it finds errors — both mean the hook linted this vault,
+`enforcing`. Anything else is `not_enforcing` and quotes the first stderr line:
+126/127 from the shell, or 2 from a `bk` error such as `Not a brainskit vault`.
+Such a hook refuses every commit without checking one. A hook naming another
+vault is reported without being run, and one without its executable bit is
+`not_enforcing` because git skips it, as is a brainskit hook left in
+`.git/hooks` while `core.hooksPath` points at a directory with no pre-commit;
+the hint says to add `bk lint --changed` to the redirected hook, as the
+installer does. A hook brainskit did not write is
+`not_judged` and never executed. `not_enforcing` and `unknown` make `healthy`
+false, as they do for the gate; `gated` is unaffected, because commit-time lint
+catches a bypass after the fact. The lint refreshes page ages in the freshness
+ledger, the same bookkeeping every commit does.
+
+`bk status` makes the cheap half of that check without running anything: it
+reads the `--vault` a generated hook passes, as sh will read it, and reports
+`commit_lint` inactive when that is not this vault — a hook from before 0.8.0
+that JSON-quoted a non-ASCII path, or one naming where the repository used to
+be.
+
+If the workspace recorded in `.brain/agent-<agent>.json` no longer exists —
+the repository was moved — every layer says so, carries
+`workspace_missing: true`, and gives the reinstall command with
+`--root <project>` (the repository the vault now sits in, when there is one).
+The skill file an earlier install wrote for the old vault path is replaced by
+that reinstall without `--force`, as long as it was not edited.
+
+`healthy` does not depend on the optional `[code]` extra. A default install with
+no tree-sitter grammar can report `healthy: true`, so CI can gate on it. Only a
+*broken* grammar install counts against it. See
+[the code graph](code-graph.md#what-needs-the-extra).
+
+### Outdated hook scripts
+
+Every hook script the installer writes carries a `# brainskit:generated` marker.
+`bk status` and `bk doctor` compare each marked script against what
+`bk hooks install` would write now, using the installer's own renderer. A copy
+left by an older brainskit is reported with `outdated: true` on its layer, in
+`enforcement.outdated`, and with the fix in `hint`: `bk hooks install --agent
+<agent>`, plus `--root` when the install recorded a workspace other than the
+vault.
+
+| Layer | When outdated | Why |
+|---|---|---|
+| `write_gate` | `active: false`, so `gated: false` and `healthy: false` | a stale gate may enforce rules that have since changed |
+| `session_status` | stays active, reported as a warning; `healthy` is unaffected | it is observability: it can misreport the vault, but it lets no write through |
+
+A script without the marker belongs to you. It is not judged, and a reinstall
+leaves it in place unless you pass `--force`.
 
 A repository whose `core.hooksPath` points somewhere other than `.git/hooks` —
 which is what Husky sets, and what any repository may set globally — gets no
@@ -111,6 +178,24 @@ nothing else on disk remembers it and `bk status` has to look in the same place
 the installer wrote to. An adapter written before that field existed falls back
 to the vault, so an existing install keeps reporting exactly as it did.
 
+## Connecting an agent over MCP
+
+`bk serve --mcp` answers under the consumer it is started with, and defaults to
+`cloud`: an MCP client's answers may be forwarded to a hosted model, and the
+server cannot tell. For an agent that runs on this machine and should read
+local-only evidence, say so:
+
+```bash
+bk --vault ./my-vault serve --mcp --transport stdio --consumer local
+```
+
+`human` is refused over MCP. A `search` or `context` call may ask for a
+narrower consumer than the server's, never a wider one. Over MCP, `capture`
+accepts a file only inside the project and never a credential file such as
+`.env` or an SSH key. Integration lifecycle tools (`integration_configure`,
+`_up`, `_down`, `_sync`) run only on a `local` server; a `cloud` one refuses
+them and does not list them — see [the privacy boundary](./privacy.md#an-mcp-server-declares-its-consumer).
+
 ## What a watch will not capture
 
 `bk watch` walks every configured source folder and captures what it finds, and
@@ -139,3 +224,8 @@ once rather than per file inside them.
 
 The vault's own directory is always excluded, so a source folder that contains
 the vault cannot re-capture `raw/` into itself.
+
+Nor does it bring back a source you `bk forget`: the forget leaves a tombstone
+keyed by content hash, a sweep that meets that content again counts it under
+`forgotten` instead of capturing it, and only an explicit `bk capture` re-adds
+it.

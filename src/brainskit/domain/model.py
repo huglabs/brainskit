@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -103,6 +104,16 @@ class RefusalError(ValidationError):
     """
 
     code = "refused"
+
+
+class ForgottenSourceError(RefusalError):
+    """An unattended capture met content an operator deliberately forgot.
+
+    Only a `bk watch` sweep asks for this refusal; an explicit `bk capture` is
+    the deliberate re-add and clears the tombstone instead. Shares `refused`
+    rather than adding a code of its own, because the one caller catches it and
+    counts it -- it never reaches a surface.
+    """
 
 
 class ModelResponseError(ValidationError):
@@ -214,6 +225,63 @@ LEGACY_WIKI_DIRECTORIES: dict[str, str] = {
     for kind in PageKind
     if f"{kind.value}s" != PAGE_DIRECTORIES[kind]
 }
+
+#: Every top-level directory a vault owns. A scan of a tree the vault sits at
+#: the root of -- `bk code build` on a vault outside any repository -- has
+#: nothing but these names to tell the vault's files from the project's.
+VAULT_DIRECTORIES: tuple[str, ...] = ("raw", "wiki", "views", "graph", "output", ".brain")
+
+#: The pages `bk init` seeds under `wiki/`, as path -> (slug, title). One
+#: definition, read by `FileVault.initialize` to write them and by lint to
+#: recognise a seed written before init recorded what it wrote.
+SEED_PAGES: dict[str, tuple[str, str]] = {
+    "wiki/index.md": ("index", "Brainskit index"),
+    "wiki/log.md": ("log", "Brainskit log"),
+}
+
+#: Titles earlier releases seeded under, before the brainkit -> brainskit
+#: rename. The template itself is unchanged since the first release.
+_LEGACY_SEED_TITLES: dict[str, tuple[str, ...]] = {
+    "wiki/index.md": ("Brainkit index",),
+    "wiki/log.md": ("Brainkit log",),
+}
+
+_SEED_UPDATED_AT_RE = re.compile(r'^updated_at: "([^"\n]*)"$', re.MULTILINE)
+
+
+def render_seed_page(slug: str, title: str, updated_at: str) -> str:
+    return (
+        "---\n"
+        f'id: "system:{slug}"\n'
+        'type: "system"\n'
+        f"title: {json.dumps(title)}\n"
+        "aliases:\n"
+        "sources:\n"
+        f'updated_at: "{updated_at}"\n'
+        "---\n\n"
+        f"# {title}\n"
+    )
+
+
+def is_seed_template(path: str, text: str) -> bool:
+    """Whether `text` is exactly what some release of `bk init` seeded at `path`.
+
+    Equality against the re-rendered template, not a shape: only the timestamp
+    is read back from the page, because init stamped the moment it ran, and
+    every other byte must match one of the titles a release actually used.
+    """
+
+    seed = SEED_PAGES.get(path)
+    if seed is None:
+        return False
+    match = _SEED_UPDATED_AT_RE.search(text)
+    if match is None:
+        return False
+    slug, title = seed
+    return any(
+        text == render_seed_page(slug, candidate, match.group(1))
+        for candidate in (title, *_LEGACY_SEED_TITLES.get(path, ()))
+    )
 
 
 def _guard_page_directories() -> None:

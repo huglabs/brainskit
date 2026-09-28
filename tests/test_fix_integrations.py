@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import os
 import re
@@ -649,13 +654,15 @@ class PostgresVaultScopeTest(unittest.TestCase):
         vault_id = self.sync(integrations, module)["vault_id"]
         inserts = module.store.statements_matching("INSERT INTO")  # type: ignore[attr-defined]
         self.assertEqual(len(inserts), 2)
+        self.assertEqual(sorted(len(rows) for _, rows in inserts), [1, 2])
         for statement, rows in inserts:
             self.assertIn("vault_id", statement)
-            self.assertTrue(rows)
             for row in rows:
                 self.assertIn(vault_id, row)
-        for table in ("nodes", "edges"):
-            for row in module.store.rows(table):  # type: ignore[attr-defined]
+        for table, count in (("nodes", 2), ("edges", 1)):
+            stored = module.store.rows(table)  # type: ignore[attr-defined]
+            self.assertEqual(len(stored), count, table)
+            for row in stored:
                 self.assertEqual(row["vault_id"], vault_id)
 
     def test_stored_ids_are_namespaced_and_keep_the_natural_id_reachable(self) -> None:

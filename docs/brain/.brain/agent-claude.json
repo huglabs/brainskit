@@ -1,7 +1,7 @@
 {
   "agent": "claude",
   "version": 2,
-  "workspace": "/Users/raulmata/Projetos/tools/brainkit",
+  "workspace": "/Users/raulmata/Opera\u00e7\u00e3o/shared/tools/brainskit",
   "gate": {
     "deny_prefixes": [
       "wiki/",
@@ -16,5 +16,8 @@
     "Read evidence with bk context --json --consumer local",
     "Write wiki pages only with bk apply",
     "Never edit raw content"
-  ]
+  ],
+  "rendered": {
+    ".claude/skills/brainskit/SKILL.md": "6255ab0e3bfbc987113418fa8a98d576f7686b8da38c8702997867cb3458737a"
+  }
 }

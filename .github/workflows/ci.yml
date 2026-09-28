@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -55,7 +55,7 @@ jobs:
         python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -68,14 +68,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: ./scripts/verify-wheel.sh
+      # Tracks 1 and 2 of the four-track review, against the wheel just built:
+      # the getting-started guide followed literally, then every enforcement
+      # layer broken in turn and required to show up in status and doctor.
+      - run: ./scripts/fresh-install-smoke.sh
+      - run: ./scripts/enforcement-harness.sh
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: dist
           path: dist/
           retention-days: 7
+
+  dsh-bundle:
+    # The DeepSeek Harness bundle's guard is the only thing between a cloud
+    # model and a wider consumer or a mutation. It has no npm dependencies, so
+    # the tests run straight from the checkout on both ends of `engines.node`.
+    name: dsh-brainskit bundle (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    defaults:
+      run:
+        working-directory: plugins/dsh-brainskit
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test

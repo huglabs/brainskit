@@ -5,8 +5,9 @@ that check it.
 read one back and report whether it is still guarding anything. Those are two
 sides of the same table -- which instruction file an agent reads, which state
 file records where its configuration went, which hook scripts this brand
-installs, and what each enforcement layer is called -- and the table is here so
-that neither side can restate it.
+installs, what each enforcement layer is called, and which directory git runs
+the commit hook from -- and the table is here so that neither side can restate
+it.
 
 The alternative is the shape this module replaces. The installer knew all four
 agents; the reader knew only `claude`, in six separate hardcoded strings, so an
@@ -30,6 +31,8 @@ Stdlib only, like the gate: the write gate imports `adapter_path` from here.
 
 from __future__ import annotations
 
+import shlex
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +61,9 @@ COMMIT_LINT_MECHANISM = ".git/hooks/pre-commit running bk lint --changed"
 #: quickstart, and what a vault with no adapter at all is reported as, because a
 #: reader has to say where the layers *would* land rather than invent an agent.
 DEFAULT_AGENT = "claude"
+
+#: Where git reads hooks from when `core.hooksPath` says nothing.
+DEFAULT_GIT_HOOKS = Path(".git") / "hooks"
 
 
 def adapter_path(agent: str) -> str:
@@ -95,6 +101,12 @@ class AgentHook:
         """The filename on disk, which is the template plus `.sh`."""
 
         return f"{self.template}.sh"
+
+    @property
+    def path(self) -> str:
+        """Where the installer writes the script, relative to the workspace."""
+
+        return f".claude/hooks/{self.script}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,4 +201,73 @@ def installed_agents(vault_root: Path) -> tuple[str, ...]:
 
     return tuple(
         agent for agent in AGENTS if (vault_root / adapter_path(agent)).is_file()
+    )
+
+
+def redirected_git_hooks_path(root: Path) -> Path | None:
+    """Where git actually runs hooks from, when that is not `.git/hooks`.
+
+    `core.hooksPath` moves the directory git reads -- Husky sets it on every
+    install -- and once it is set git never looks at `.git/hooks/pre-commit`
+    again. A hook written there is dead code, and reporting it as an active
+    layer is reporting a guard that does not run: the artefact exists, but it
+    is not the thing executing. That is the precise failure `_enforcement_state`
+    exists to catch, so it has to be caught here too.
+
+    Asks git rather than parsing `.git/config`, because the setting may come
+    from the local, global or system file and git is the only thing that
+    resolves all three the way a commit will. `None` means git runs the default
+    directory, or could not be asked at all -- and a machine with no usable git
+    runs no hook of any kind, so there is no claim left to correct.
+
+    Answered only for a repository root. Asked from a subdirectory git answers
+    about the repository above, which would read here as a redirect away from a
+    `.git/hooks` that was never this directory's to begin with. `.git` is a file
+    rather than a directory in a worktree or submodule, and both are roots.
+    """
+    if not (root / ".git").exists():
+        return None
+    try:
+        # A fixed argument vector with no shell, asking `git` where it reads
+        # hooks from. By name on PATH, because it must be the `git` the
+        # operator's commit will use; an absolute path would answer for a
+        # different install than the one that matters.
+        completed = subprocess.run(
+            ["git", "rev-parse", "--git-path", "hooks"],  # noqa: S607
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    reported = completed.stdout.strip()
+    if not reported:
+        return None
+    # Reported relative to the cwd the question was asked from, which is `root`.
+    hooks = Path(reported)
+    if not hooks.is_absolute():
+        hooks = root / hooks
+    default = root / DEFAULT_GIT_HOOKS
+    try:
+        same = hooks.resolve() == default.resolve()
+    except OSError:
+        same = hooks == default
+    return None if same else hooks
+
+
+def redirected_hooks_hint(vault: Path, hooks: Path) -> str:
+    """What to do when `core.hooksPath` sends git to `hooks`.
+
+    A reinstall writes nothing there, so the lint has to be merged into the
+    hook git does run. One wording, shared by the installer's refusal, `bk
+    status` and `bk doctor`, so the three cannot drift apart.
+    """
+
+    return (
+        f"Add `bk --vault {shlex.quote(str(vault))} lint --changed` to "
+        f"{hooks / 'pre-commit'} and commit it"
     )

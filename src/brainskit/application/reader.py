@@ -11,8 +11,9 @@ current endpoints.
 
 from __future__ import annotations
 
+import shlex
 from collections import defaultdict
-from pathlib import PurePosixPath
+from pathlib import PurePath, PurePosixPath
 from typing import Any
 
 from brainskit.application.filing import Filing
@@ -20,19 +21,47 @@ from brainskit.application.freshness import FreshnessLedger
 from brainskit.application.health import Health, enforcement_ok
 from brainskit.application.pages import parse_frontmatter
 from brainskit.application.ports import SearchIndexPort, VaultPort
-from brainskit.application.privacy import for_consumer
+from brainskit.application.privacy import PrivacyBoundary, for_consumer
 from brainskit.application.projections import Projections
-from brainskit.domain.model import NotFoundError, PolicyError, ValidationError
-from brainskit.domain.privacy import record_branch
+from brainskit.domain.model import (
+    NotFoundError,
+    PolicyError,
+    SourceRecord,
+    ValidationError,
+)
+from brainskit.domain.privacy import Consumer, record_branch
 
 
-def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
+def _hint_without_paths(hint: str) -> str:
+    """`hint` with every absolute path argument replaced by `<path>`.
+
+    A reinstall hint names the workspace with `--root` when it is not the
+    vault, and that is an installation fact (ADR 0009). The command stays
+    useful without it: the reader learns what to run and that a root belongs
+    there, not where this machine keeps it.
+    """
+
+    try:
+        tokens = shlex.split(hint)
+    except ValueError:
+        return "bk hooks install"
+    return " ".join(
+        "<path>" if PurePath(token).is_absolute() or token.startswith("~") else token
+        for token in tokens
+    )
+
+
+def _reportable_enforcement(
+    enforcement: dict[str, Any], boundary: PrivacyBoundary
+) -> dict[str, Any]:
     """The enforcement report with the machine-specific fields dropped.
 
     Enforcement is not evidence, so the consumer filter has nothing to say about
-    it: a hook is installed or it is not, identically for whoever asks, and this
-    surface already reports `vault` and `index` on the same footing. What is
-    withheld here is withheld for minimality rather than for privacy. `detail`
+    whether a layer is on: a hook is installed or it is not, identically for
+    whoever asks. Where it lives is another matter -- an installation fact,
+    inside the boundary since ADR 0009 -- and the `vault` key beside this one is
+    withheld from `cloud` for that reason. What is dropped here is dropped for
+    every consumer, for minimality as much as for privacy. `detail`
     interpolates the workspace root and the redirected hooks directory, and
     `script` is an absolute path added for `bk doctor`, which opens the file;
     the viewer only has to name the layer that is off. A hook path names a local
@@ -43,19 +72,32 @@ def _reportable_enforcement(enforcement: dict[str, Any]) -> dict[str, Any]:
     vault is installed for more than one, and without it two identically named
     rows would render as one layer reported twice. It names an agent, not a
     machine.
+
+    `outdated` and its `hint` are kept too: a stale session-status script still
+    runs and misreports the vault, and dropping them here meant the viewer never
+    said so. The hint is the one field that can carry an installation fact, so
+    it goes through the boundary -- whole for `local` and `human`, path-free for
+    `cloud`.
     """
 
+    layers = []
+    for layer in enforcement.get("layers", []):
+        reported = {
+            key: layer[key]
+            for key in ("layer", "mechanism", "active", "advisory", "agent", "outdated")
+            if key in layer
+        }
+        if "hint" in layer:
+            hint = str(layer["hint"])
+            reported["hint"] = boundary.installation_facts(hint=hint).get(
+                "hint", _hint_without_paths(hint)
+            )
+        layers.append(reported)
     return {
         "gated": enforcement.get("gated", False),
         "inactive": list(enforcement.get("inactive", [])),
-        "layers": [
-            {
-                key: layer[key]
-                for key in ("layer", "mechanism", "active", "advisory", "agent")
-                if key in layer
-            }
-            for layer in enforcement.get("layers", [])
-        ],
+        "outdated": list(enforcement.get("outdated", [])),
+        "layers": layers,
     }
 
 
@@ -78,10 +120,11 @@ class Reader:
         self.projections = projections
         self.ledger = ledger
 
-    def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
-        boundary = for_consumer(consumer, self.vault)
-        if consumer == "human":
-            return self.health.status()
+    def _visible(
+        self, boundary: PrivacyBoundary, consumer: str
+    ) -> tuple[dict[str, SourceRecord], int, set[str]]:
+        """The sources and pages this consumer may see, and how many were not."""
+
         visible_records, redacted_sources = boundary.split_records()
         graph = self.projections.graph_data(consumer=consumer)
         visible_pages = {
@@ -89,24 +132,39 @@ class Reader:
             for node in graph["nodes"]
             if str(node["id"]).startswith("page:")
         }
-        visible_paths = {
-            *(record.path for record in visible_records.values()),
-            *visible_pages,
-        }
-        findings = self.health.lint()["findings"]
-        visible_findings = [
+        return visible_records, redacted_sources, visible_pages
+
+    def _visible_findings(
+        self,
+        findings: list[dict[str, Any]],
+        records: dict[str, SourceRecord],
+        pages: set[str],
+    ) -> list[dict[str, Any]]:
+        visible_paths = {*(record.path for record in records.values()), *pages}
+        return [
             finding
             for finding in findings
             if not finding.get("path") or finding["path"] in visible_paths
         ]
+
+    def reader_status(self, *, consumer: str = "human") -> dict[str, Any]:
+        boundary = for_consumer(consumer, self.vault)
+        if consumer == "human":
+            return self.health.status()
+        visible_records, redacted_sources, visible_pages = self._visible(
+            boundary, consumer
+        )
+        visible_findings = self._visible_findings(
+            self.health.lint()["findings"], visible_records, visible_pages
+        )
         raw_counts: dict[str, int] = defaultdict(int)
         for record in visible_records.values():
             raw_counts[record_branch(record)] += 1
         freshness = self.ledger.snapshot()
         index_state = self.index.stats()
-        enforcement = _reportable_enforcement(self.health.enforcement())
+        enforcement = _reportable_enforcement(self.health.enforcement(), boundary)
         return {
-            "vault": str(self.vault.root),
+            **boundary.installation_facts(vault=str(self.vault.root)),
             "sources": len(visible_records),
             "pending": sum(
                 record.status == "pending" for record in visible_records.values()
@@ -298,6 +356,56 @@ class Reader:
             "privacy": privacy.value,
             "content": content,
         }
+
+    def lint_for_consumer(
+        self, result: dict[str, Any], *, consumer: str = "human"
+    ) -> dict[str, Any]:
+        """A lint result with the findings on material `consumer` may not see removed.
+
+        The same rule `reader_status` applies to its `lint_errors`: a finding
+        names a path, and a path names a document and its branch. `ok` is
+        recomputed from what is left, for the reason `healthy` is there --
+        restricted content must not decide a filtered consumer's answer.
+        """
+
+        boundary = for_consumer(consumer, self.vault)
+        if consumer == "human":
+            return result
+        records, _, pages = self._visible(boundary, consumer)
+        findings = self._visible_findings(result["findings"], records, pages)
+        return {
+            **result,
+            "ok": not any(finding["severity"] == "error" for finding in findings),
+            "findings": findings,
+            "consumer": consumer,
+            "redacted_findings": len(result["findings"]) - len(findings),
+        }
+
+    def visible_source(self, identifier: str, *, consumer: str = "human") -> str:
+        """The content hash `identifier` names among the sources `consumer` may see.
+
+        A source outside the boundary is not found rather than forbidden: a
+        hash prefix or a path is a guess, and answering "exists, but not for
+        you" would turn every guess into a probe.
+        """
+
+        boundary = for_consumer(consumer, self.vault)
+        records = (
+            boundary.records
+            if boundary.consumer is Consumer.HUMAN
+            else boundary.split_records()[0]
+        )
+        return self.filing._resolve_record(dict(records), identifier).content_hash
+
+    def require_proposal(self, proposal_id: str, *, consumer: str = "human") -> None:
+        """Refuse a proposal id whose source `consumer` may not see, as not found."""
+
+        visible = self.proposals_for_consumer(consumer=consumer)["proposals"]
+        if not any(proposal.get("proposal_id") == proposal_id for proposal in visible):
+            raise NotFoundError(
+                "Filing proposal was not found",
+                details={"proposal_id": proposal_id},
+            )
 
     def proposals_for_consumer(
         self, status: str | None = None, *, consumer: str = "human"

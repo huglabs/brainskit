@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from brainskit.application.ports import JudgmentRoute
 from brainskit.domain.model import (
     ModelResponseError,
     NotConfiguredError,
@@ -37,6 +38,10 @@ from brainskit.infrastructure.vaults import config_home
 #: applications are not an option at all -- Claude Desktop and ChatGPT Desktop
 #: are MCP *clients* and expose no endpoint anything can call into.
 SUBSCRIPTION_CLI_PROVIDERS = {"claude-code", "codex"}
+
+#: Providers whose inference runs on this machine: the only ones `local-only`
+#: evidence may be routed to, and what `JudgmentRoute.local` reports.
+LOCAL_PROVIDERS = frozenset({"ollama"})
 
 SUPPORTED_PROVIDERS = {
     "anthropic",
@@ -140,14 +145,14 @@ class PolicyJudgmentRouter:
         self.config = config
         self.jobs = jobs
 
-    def run(
-        self,
-        *,
-        job: str,
-        branches: Sequence[str],
-        variables: dict[str, Any],
-        output_schema: dict[str, Any] | None = None,
-    ) -> str:
+    def route_for(self, *, job: str, branches: Sequence[str]) -> JudgmentRoute:
+        """Where `run` would send `job` over `branches`, or the refusal it would raise.
+
+        Side-effect free: no prompt is built and no provider is reached. `run`
+        goes through here, so a caller deciding what may enter a prompt before
+        it exists asks the same code that later routes it, not a copy of it.
+        """
+
         if not branches:
             branches = ["_inbox"]
         policies: dict[str, Any] = {}
@@ -200,16 +205,32 @@ class PolicyJudgmentRouter:
             raise NotConfiguredError(
                 "Job model mapping is invalid", details={"job": job}
             )
-        if effective_privacy == PrivacyMode.LOCAL_ONLY and provider_name != "ollama":
+        local = provider_name in LOCAL_PROVIDERS
+        if effective_privacy == PrivacyMode.LOCAL_ONLY and not local:
             raise PolicyError(
                 "Local-only content can only be routed to Ollama",
-                details={"branches": sorted(policies), "provider": provider_name},
+                details={
+                    "branches": sorted(policies),
+                    "provider": provider_name,
+                    "privacy": effective_privacy.value,
+                },
             )
-        provider_config = self.config.providers.get(provider_name)
+        return JudgmentRoute(provider=str(provider_name), model=str(model), local=local)
+
+    def run(
+        self,
+        *,
+        job: str,
+        branches: Sequence[str],
+        variables: dict[str, Any],
+        output_schema: dict[str, Any] | None = None,
+    ) -> str:
+        route = self.route_for(job=job, branches=branches)
+        provider_config = self.config.providers.get(route.provider)
         if not isinstance(provider_config, dict):
             raise NotConfiguredError(
                 "Selected provider is not configured",
-                details={"provider": provider_name},
+                details={"provider": route.provider},
             )
         prompt = self.jobs.prompt(
             job,
@@ -218,10 +239,10 @@ class PolicyJudgmentRouter:
                 **variables,
             },
         )
-        driver = _create_driver(provider_name, provider_config)
+        driver = _create_driver(route.provider, provider_config)
         return driver.complete(
             prompt,
-            model=model,
+            model=route.model,
             output_schema=output_schema or self.jobs.schema(job),
         )
 
@@ -1411,6 +1432,25 @@ def _post_json(
             if attempt == _HTTP_ATTEMPTS - 1:
                 raise last_error from exc
             time.sleep(float(2**attempt))
+        except TimeoutError as exc:
+            # `urlopen` wraps a timeout while *sending* in `URLError`, but not
+            # one while waiting for the answer -- which is where a local model
+            # too slow for the job spends its time. That escaped as a bare
+            # `timed out` with no provider, model or next step. Not retried: the
+            # next attempt repeats the same generation against the same clock.
+            raise NotConfiguredError(
+                "Provider did not answer in time",
+                details={
+                    "provider": resolved.provider,
+                    "model": resolved.model,
+                    "timeout_seconds": timeout,
+                    "hint": (
+                        f"Raise providers.{resolved.provider or '<provider>'}."
+                        "timeout_seconds in .brain/config.json, or route this "
+                        "job to a faster model."
+                    ),
+                },
+            ) from exc
     if last_error:
         raise last_error
     try:

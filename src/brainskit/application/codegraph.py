@@ -40,8 +40,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from brainskit.application.install import AGENTS
 from brainskit.application.ports import CodeExtractorPort, VaultPort
 from brainskit.domain.model import (
+    VAULT_DIRECTORIES,
     NotConfiguredError,
     NotFoundError,
     PrivacyMode,
@@ -71,7 +73,7 @@ CODE_PROJECTION_COMMAND = "bk code import <graph.json>"
 #: Node kinds a code graph may hold. An extractor that also indexed prose will
 #: offer `document`, `concept` and `rationale` nodes; those are claims, and
 #: claims belong to the wiki where they are cited, gated and reviewed. Dropping
-#: them here rather than trusting the caller to pass `--code-only` makes the
+#: them here, with no `--code-only` flag for the caller to remember, makes the
 #: boundary a property of the vault instead of a property of the command line.
 CODE_NODE_KINDS = frozenset({"code"})
 
@@ -82,6 +84,9 @@ CODE_PRIVACY = PrivacyMode.LOCAL_ONLY
 
 SCHEMA_VERSION = 1
 
+#: The remedy a missing or out-of-date graph names. A fresh vault has no
+#: `graph.json` to import, so `CODE_PROJECTION_COMMAND` is named only where no
+#: extractor is configured and extracting elsewhere is the one route left.
 CODE_REBUILD_COMMAND = "bk code build"
 
 #: What a reader says when it refuses a malformed artefact, and what `status`
@@ -201,11 +206,18 @@ class CodeGraph:
         if paths is not None:
             nodes, edges, notes, carry = self._merge_scoped(nodes, edges, paths)
         if not nodes:
+            root, reason = self.vault.code_root_reason()
             raise ValidationError(
                 "No code nodes in the imported graph",
                 details={
                     "dropped_non_code_nodes": dropped,
-                    "hint": "Extract with --code-only; prose belongs in the wiki",
+                    "code_root": str(root),
+                    "why_this_root": reason,
+                    "hint": (
+                        "Nothing under the code root is source code. Set code_root "
+                        "in .brain/config.json to the repository this vault "
+                        f"documents, then run {CODE_REBUILD_COMMAND}"
+                    ),
                 },
             )
         result = self._write(
@@ -215,6 +227,7 @@ class CodeGraph:
             survey=survey,
             scoped=paths is not None,
             carry=carry,
+            vault_files=self._vault_files(payload),
         )
         return {**result, **notes}
 
@@ -564,7 +577,11 @@ class CodeGraph:
                 "No code nodes in the imported graph",
                 details={
                     "dropped_non_code_nodes": dropped,
-                    "hint": "Extract with --code-only; prose belongs in the wiki",
+                    "hint": (
+                        'Only nodes with file_type "code" are kept; prose belongs '
+                        "in the wiki. Import a graph that holds code nodes, or "
+                        f"extract one here with {CODE_REBUILD_COMMAND}"
+                    ),
                 },
             )
         edges = self._edges(payload, known=set(nodes))
@@ -579,6 +596,7 @@ class CodeGraph:
         survey: ScanSurvey | None = None,
         scoped: bool = False,
         carry: dict[str, str] | None = None,
+        vault_files: int = 0,
     ) -> dict[str, Any]:
         # Hashed at import, compared at status. This is the artefact's input
         # set, and the only reason the graph can ever be called stale.
@@ -619,7 +637,7 @@ class CodeGraph:
         # scrolls away -- which is how a two-node graph of a four-file
         # repository came to be reported as `fresh`.
         coverage = self._coverage(
-            survey, scoped=scoped, covered=len(files)
+            survey, scoped=scoped, covered=len(files) + vault_files
         )
         if coverage is not None:
             graph["coverage"] = coverage
@@ -643,7 +661,7 @@ class CodeGraph:
         # makes the gap negative and the check silently unreachable, which is
         # worse than not offering it.
         if survey is not None and not scoped:
-            result.update(self._unexplained(survey, covered=len(files)))
+            result.update(self._unexplained(survey, covered=len(files) + vault_files))
         return result
 
     def _coverage(
@@ -735,27 +753,60 @@ class CodeGraph:
             "unexplained_ratio": round(gap / survey.parseable_files, 4),
         }
 
-    def _vault_prefix(self) -> str:
-        """Where the vault sits inside the code root, as a path prefix.
+    def _owned_by_the_vault(self) -> Callable[[str], bool]:
+        """Whether a code-root-relative path is the vault's rather than the code's.
 
         An extractor pointed at the repository has no idea one of those
         directories is the vault asking the question, so it indexes
         `.brain/schema.json` and `graph/code.json` as source and they arrive as
         the most connected nodes in the graph. Only brainskit knows where its own
         vault is, which makes excluding it brainskit's job.
+
+        A vault that *is* the code root -- one outside any repository, or one
+        configured at the top of the repository it documents -- has no prefix
+        to test, and an empty prefix used to exclude nothing. There the vault's
+        own directories are named instead, since the project's files sit beside
+        them. The installed hook scripts are excluded either way: they land in
+        the workspace, which is the code root whether the vault is nested in it
+        or is it.
         """
 
+        hook_scripts = {
+            hook.path for install in AGENTS.values() for hook in install.hooks
+        }
         try:
             relative = self.vault.root.resolve().relative_to(self.vault.code_root().resolve())
         except ValueError:
-            return ""
+            return hook_scripts.__contains__
         prefix = relative.as_posix()
-        return "" if prefix == "." else f"{prefix}/"
+        if prefix == ".":
+            return lambda path: (
+                path in hook_scripts or path.split("/", 1)[0] in VAULT_DIRECTORIES
+            )
+        return lambda path: path in hook_scripts or path.startswith(f"{prefix}/")
+
+    def _vault_files(self, payload: dict[str, Any]) -> int:
+        """How many parsed files `_nodes` dropped for being the vault's own.
+
+        The survey counted them as parseable, so leaving them out of `covered`
+        would report a deliberate exclusion as unexplained, and `status` would
+        call the graph `partial` for it.
+        """
+
+        owned_by_the_vault = self._owned_by_the_vault()
+        owned: set[str] = set()
+        for raw in payload.get("nodes", []):
+            if not isinstance(raw, dict):
+                continue
+            path = str(raw.get("source_file", "")).strip()
+            if str(raw.get("file_type", "code")) in CODE_NODE_KINDS and owned_by_the_vault(path):
+                owned.add(path)
+        return len(owned)
 
     def _nodes(self, payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], int]:
         nodes: dict[str, dict[str, Any]] = {}
         dropped = 0
-        vault_prefix = self._vault_prefix()
+        owned_by_the_vault = self._owned_by_the_vault()
         for raw in payload.get("nodes", []):
             if not isinstance(raw, dict):
                 continue
@@ -771,7 +822,7 @@ class CodeGraph:
             if not node_id or not path:
                 dropped += 1
                 continue
-            if vault_prefix and path.startswith(vault_prefix):
+            if owned_by_the_vault(path):
                 dropped += 1
                 continue
             nodes[node_id] = {
@@ -853,7 +904,7 @@ class CodeGraph:
                 "state": "missing",
                 "stale": False,
                 "generated_at": None,
-                "command": CODE_PROJECTION_COMMAND,
+                "command": CODE_REBUILD_COMMAND,
             }
 
         generated_at = graph.get("built_at")
@@ -878,14 +929,16 @@ class CodeGraph:
                 "command": CODE_REBUILD_COMMAND,
             }
 
-        files = graph.get("files", {})
+        # No default: `_write` always records `files`, so a missing key is an
+        # altered artefact, not an empty input set that trivially verifies.
+        files = graph.get("files")
         if not isinstance(files, dict):
             return {
                 "state": "stale",
                 "stale": True,
                 "generated_at": generated_at if isinstance(generated_at, str) else None,
                 "reason": "the graph records no input set, so it cannot be verified",
-                "command": CODE_PROJECTION_COMMAND,
+                "command": CODE_REBUILD_COMMAND,
             }
 
         changed: list[str] = []
@@ -929,7 +982,7 @@ class CodeGraph:
             "removed": removed[:20],
             "changed_total": len(changed),
             "removed_total": len(removed),
-            **({} if fresh else {"command": CODE_PROJECTION_COMMAND}),
+            **({} if fresh else {"command": CODE_REBUILD_COMMAND}),
         }
         if missing:
             result["missing_grammars"] = [
@@ -1113,8 +1166,10 @@ class CodeGraph:
         have to keep matching.
         """
 
-        cluster_mod = _load_analysis()
+        # Read first: `_read` refuses `cloud`, and the missing-dependency error
+        # carries an install command naming local paths (ADR 0009).
         graph = self._read(consumer)
+        cluster_mod = _load_analysis()
         G = _networkx_graph(graph)
         communities = cluster_mod.cluster(G, resolution=resolution)
         cohesion = cluster_mod.score_all(G, communities)
@@ -1276,7 +1331,7 @@ class CodeGraph:
         if graph is None:
             raise NotFoundError(
                 "No code graph in this vault",
-                details={"hint": f"Build one with {CODE_PROJECTION_COMMAND}"},
+                details={"hint": f"Build one with {CODE_REBUILD_COMMAND}"},
             )
         self._refuse_malformed(graph, hint=CODE_MALFORMED_HINT)
         return graph

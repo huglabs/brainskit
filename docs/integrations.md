@@ -8,7 +8,10 @@ process/container state.
 
 All capabilities are available through JSON CLI and the MCP tools
 `integration_configure`, `integration_status`, `integration_up`,
-`integration_down` and `integration_sync`.
+`integration_down` and `integration_sync`. Over MCP, all but
+`integration_status` need a server started with `--consumer local`: a `cloud`
+server refuses them with `policy_denied` and leaves them out of `tools/list`
+(see [Serving](./serving.md#an-mcp-server-declares-its-consumer)).
 
 ## Obsidian
 
@@ -189,7 +192,9 @@ vault alone:
 ```
 
 Exit is `1` when any vault failed and `0` when every vault succeeded or was
-skipped, so a scheduled run can branch on the status alone. `list` reports a
+skipped, so a scheduled run can branch on the status alone. With `--json` the
+envelope agrees with it — `{"ok": false, "result": {…}}` on a failure, the
+per-vault outcomes still under `result`. `list` reports a
 vault whose directory has been deleted rather than failing, and still prints its
 `vault_id` — which is what you need to find the rows it left behind in a shared
 schema before running `bk vaults forget`.
@@ -230,3 +235,4 @@ boundary past what the integration was configured to permit.
 <!-- doc-tracking -->
 - Created: 2026-08-13 14:50
 - Updated: 2026-08-13 15:18
+- Updated: 2026-09-27

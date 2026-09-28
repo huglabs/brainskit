@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import contextlib
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import dataclasses
-import io
 import json
 import os
 import sys
@@ -492,27 +495,11 @@ class GateCliPathBaseTest(GateFixture):
         FileVault.initialize(self.root, engine_policy())
 
     def run_cli(self, argv: list[str], cwd: Path) -> tuple[int, str]:
-        from brainskit.interfaces import cli
-
-        previous = os.getcwd()
-        buffer = io.StringIO()
-        os.chdir(cwd)
-        try:
-            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-                code = cli.main(argv)
-        finally:
-            os.chdir(previous)
-        output = buffer.getvalue()
-        # Any of these means the CLI failed before the gate ran, and every
-        # assertion below would then be comparing two identical errors rather
-        # than two verdicts. A NameError in the resolver did exactly that once.
-        for vacuous in ("Not a brainskit vault", "unhandled internal error", "Traceback"):
-            self.assertNotIn(
-                vacuous,
-                output,
-                msg=f"the CLI never reached the gate ({vacuous}); assertion vacuous",
-            )
-        return code, output
+        # The harness refuses a run that never reached the gate: every assertion
+        # below would then compare two identical errors rather than two
+        # verdicts. A NameError in the resolver did exactly that once.
+        run = _harness.run_cli(argv, cwd=cwd)
+        return run.code, run.output
 
     def test_a_relative_path_from_cwd_agrees_with_its_absolute_spelling(self) -> None:
         gated = self.root / "wiki" / "entities" / "thing.md"
@@ -554,12 +541,9 @@ class GateCliPathBaseTest(GateFixture):
     def test_the_help_states_which_base_a_relative_path_resolves_against(self) -> None:
         """The silence was the defect, so the disclosure is part of the fix."""
 
-        from brainskit.interfaces import cli
-
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer), self.assertRaises(SystemExit):
-            cli.main(["gate", "check-write", "--help"])
-        self.assertIn("current directory", buffer.getvalue().lower())
+        run = _harness.run_cli(["gate", "check-write", "--help"])
+        self.assertTrue(run.exited)
+        self.assertIn("current directory", run.stdout.lower())
 
 
 if __name__ == "__main__":

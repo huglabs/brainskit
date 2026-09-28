@@ -17,6 +17,11 @@ Two properties carry the whole design, and each has its own failure mode:
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import os
 import subprocess
@@ -29,7 +34,6 @@ from typing import Any
 
 from brainskit.application.codegraph import CODE_PROJECTION, _malformation
 from brainskit.application.freshness import (
-    _GENERATED_MARKER_RE,
     GRAPH_PROJECTION,
     PROJECTION_RAW_FIELDS,
     VIEWS_PROJECTION,
@@ -37,13 +41,17 @@ from brainskit.application.freshness import (
     _graph_integrity,
     _projection_source_hash,
 )
-from brainskit.application.health import SEEDED_SYSTEM_PAGES, _is_seeded_shape
 from brainskit.application.pages import GENERATED_MARKER, parse_frontmatter
 from brainskit.application.services import BrainskitService
-from brainskit.domain.model import SourceRecord
+from brainskit.domain.model import (
+    SEED_PAGES,
+    SourceRecord,
+    is_seed_template,
+    render_seed_page,
+)
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
-from brainskit.infrastructure.vault import FileVault, _system_page
+from brainskit.infrastructure.vault import FileVault
 
 PROJECTION_CODES = {"graph.stale", "views.stale"}
 
@@ -836,23 +844,39 @@ class UnusableProjectionTest(ProjectionFixture):
         self.write_home("# my own notes\n")
         report = self.views_report()
         self.assertEqual(report["state"], "malformed")
-        self.assertEqual(report["problem"], "not a generated view")
+        self.assertEqual(report["problem"], "changed since it was generated")
 
     def test_an_empty_views_home_is_malformed(self) -> None:
         self.write_home("")
         self.assertEqual(self.views_report()["state"], "malformed")
 
-    def test_a_view_generated_before_the_rename_still_counts(self) -> None:
-        # The marker used to say `brainkit`. A vault upgraded across that rename
-        # holds a perfectly good view, and reporting it as not-an-artefact would
-        # fire on every one of them over a brand name.
-        home = (self.root / "views" / "home.md").read_text(encoding="utf-8")
-        self.write_home(home.replace("brainskit", "brainkit", 1))
-        self.assertEqual(self.views_report()["state"], "fresh")
+    def test_a_views_home_gutted_to_its_marker_is_malformed(self) -> None:
+        # TC2 (#33). The marker line was the whole identity check, so a home
+        # page emptied down to it still read `fresh`.
+        self.write_home(GENERATED_MARKER + "\n")
+        report = self.views_report()
+        self.assertEqual(report["state"], "malformed")
+        self.assertTrue(report["stale"])
 
-    def test_the_generated_marker_matches_the_shape_that_is_checked(self) -> None:
-        # Keeps the constant and the tolerant pattern from drifting apart.
-        self.assertIsNotNone(_GENERATED_MARKER_RE.match(GENERATED_MARKER))
+    def test_a_graph_that_still_parses_but_was_edited_is_malformed(self) -> None:
+        # The twin for the graph: its structural check passes any traversable
+        # graph, including one with nodes deleted by hand.
+        self.write_graph('{"nodes": [], "edges": []}\n')
+        self.assertIsNone(_graph_integrity('{"nodes": [], "edges": []}'))
+        report = self.graph_report()
+        self.assertEqual(report["state"], "malformed")
+        self.assertEqual(report["problem"], "changed since it was generated")
+
+    def test_generation_stamps_the_bytes_it_wrote(self) -> None:
+        for artifact, anchor in (
+            (GRAPH_PROJECTION, GRAPH_PROJECTION),
+            (VIEWS_PROJECTION, "views/home.md"),
+        ):
+            with self.subTest(artifact=artifact):
+                self.assertEqual(
+                    self.recorded()[artifact]["artefact_hash"],
+                    self.vault.content_hash(anchor),
+                )
 
     def test_a_malformed_artefact_is_a_warning_that_names_its_fault(self) -> None:
         self.write_graph("{{{ not json at all\n")
@@ -911,6 +935,135 @@ class UnusableProjectionTest(ProjectionFixture):
                 self.assertEqual(states[VIEWS_PROJECTION], "malformed")
 
 
+class UnstampedProjectionTest(ProjectionFixture):
+    """An artefact generated before brainskit stamped what it writes.
+
+    Every vault upgraded into this release holds one: the recorded fingerprint
+    is there, the `artefact_hash` is not. It must not read `fresh`, which is the
+    answer a gutted `views/home.md` got, and it must not read `malformed`,
+    which would call a legitimately generated view broken on every upgraded
+    vault -- including one whose marker still says `brainkit`.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = self.capture(text="Evidencia de antes.", title="antes")
+        self.apply_page("pagina-de-antes", self.source)
+        self.service.graph()
+        self.service.views()
+        self.unstamp()
+
+    def unstamp(self) -> None:
+        def mutate(state: dict) -> dict:
+            for entry in state["projections"].values():
+                entry.pop("artefact_hash", None)
+                entry.pop("inputs", None)
+            return state
+
+        self.vault.mutate_state("freshness", mutate)
+
+    def test_an_unstamped_artefact_with_current_inputs_is_unverified(self) -> None:
+        for artifact in (GRAPH_PROJECTION, VIEWS_PROJECTION):
+            with self.subTest(artifact=artifact):
+                report = self.projections()[artifact]
+                self.assertEqual(report["state"], "unverified")
+                self.assertTrue(report["stale"])
+
+    def test_a_pre_rename_view_is_unverified_not_malformed(self) -> None:
+        home = self.root / "views" / "home.md"
+        home.write_text(
+            home.read_text(encoding="utf-8").replace("brainskit", "brainkit", 1),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.projections()[VIEWS_PROJECTION]["state"], "unverified")
+
+    def test_lint_names_the_remedy_without_calling_it_broken(self) -> None:
+        messages = [
+            item["message"]
+            for item in self.service.lint()["findings"]
+            if item["code"] == "views.stale"
+        ]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("cannot be verified", messages[0])
+        self.assertIn("run bk views", messages[0])
+        self.assertNotIn("answers nothing", messages[0])
+
+    def test_an_unstamped_graph_is_still_checked_for_structure(self) -> None:
+        (self.root / GRAPH_PROJECTION).write_text("{{{ nope\n", encoding="utf-8")
+        self.assertEqual(self.projections()[GRAPH_PROJECTION]["state"], "malformed")
+
+    def test_unstamped_and_behind_its_inputs_is_stale(self) -> None:
+        second = self.capture(text="Evidencia nova e diferente.", title="nova")
+        self.apply_page("pagina-nova", second)
+        self.assertEqual(self.projections()[VIEWS_PROJECTION]["state"], "stale")
+
+    def test_regenerating_stamps_it(self) -> None:
+        self.service.graph()
+        self.service.views()
+        self.assertEqual(self.projection_codes(), set())
+        self.assertEqual(self.projections()[VIEWS_PROJECTION]["state"], "fresh")
+
+
+class StaleReasonTest(ProjectionFixture):
+    """A stale projection says which input moved, not always "wiki pages".
+
+    T7 (#29): after a raw file was moved and `bk reconcile` re-linked it, lint
+    said the graph "was built from a different set of wiki pages". No page had
+    changed; the fingerprint covers the raw registry too, and the sentence
+    named only half of it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = self.capture(text="Evidencia que se move.", title="movel")
+        self.service.graph()
+        self.service.views()
+
+    def messages(self) -> dict[str, str]:
+        return {
+            item["code"]: item["message"]
+            for item in self.service.lint()["findings"]
+            if item["code"] in PROJECTION_CODES
+        }
+
+    def test_a_raw_file_moved_and_reconciled_is_named_as_a_move(self) -> None:
+        record = self.vault.registry()[self.source]
+        moved = self.root / "raw" / "20-research" / Path(record.path).name
+        (self.root / record.path).rename(moved)
+        self.assertEqual(self.service.reconcile()["moved"], 1)
+        messages = self.messages()
+        self.assertEqual(set(messages), PROJECTION_CODES)
+        for message in messages.values():
+            with self.subTest(message=message):
+                self.assertIn("a raw source moved", message)
+                self.assertNotIn("wiki pages", message)
+
+    def test_a_new_page_is_named_as_wiki_pages(self) -> None:
+        self.apply_page("pagina-nova", self.source)
+        for message in self.messages().values():
+            with self.subTest(message=message):
+                self.assertIn("wiki pages changed", message)
+                self.assertNotIn("raw source", message)
+
+    def test_a_capture_is_named_as_raw_sources(self) -> None:
+        self.capture(text="Outra evidencia sem relacao.", title="outra")
+        for message in self.messages().values():
+            with self.subTest(message=message):
+                self.assertIn("raw sources were captured or forgotten", message)
+
+    def test_a_record_from_before_the_breakdown_says_it_cannot_tell(self) -> None:
+        def mutate(state: dict) -> dict:
+            for entry in state["projections"].values():
+                entry.pop("inputs", None)
+            return state
+
+        self.vault.mutate_state("freshness", mutate)
+        self.apply_page("pagina-nova", self.source)
+        for message in self.messages().values():
+            with self.subTest(message=message):
+                self.assertIn("different wiki pages or raw sources", message)
+
+
 class StatusBlockTest(ProjectionFixture):
     """`bk status` is where the four states are told apart."""
 
@@ -930,13 +1083,18 @@ class StatusBlockTest(ProjectionFixture):
 
     def test_each_entry_carries_the_contracted_fields(self) -> None:
         self.service.graph()
-        for artifact, report in self.projections().items():
+        projections = self.projections()
+        self.assertEqual(
+            set(projections), {GRAPH_PROJECTION, VIEWS_PROJECTION, CODE_PROJECTION}
+        )
+        for artifact, report in projections.items():
             with self.subTest(artifact=artifact):
                 self.assertIn("generated_at", report)
                 self.assertIn("stale", report)
                 self.assertIsInstance(report["stale"], bool)
                 self.assertIn(
-                    report["state"], {"missing", "malformed", "stale", "fresh"}
+                    report["state"],
+                    {"missing", "malformed", "stale", "unverified", "fresh"},
                 )
 
     def test_age_days_appears_once_the_artefact_has_been_generated(self) -> None:
@@ -977,25 +1135,27 @@ class StatusBlockTest(ProjectionFixture):
         self.assertEqual(restored, self.projections())
 
 
-# The two classes below are about `wiki.outside_apply`, not about projections,
+# The seeded-page classes below are about `wiki.outside_apply`, not projections,
 # so their natural home is `tests/test_enforcement_status.py`. They live here
 # because that file was being edited concurrently when these were written and
 # splitting a fix across two agents' files loses more than the misfiling costs.
 # Move them when that settles; they depend on nothing in this module but the
 # fixture's vault-and-service setup.
+def impostor_page(slug: str = "impostor", title: str = "Impostor") -> str:
+    """The exact shape `bk init` seeds, for a page init never wrote."""
+    return render_seed_page(slug, title, "2026-01-01T00:00:00+00:00")
+
+
 class SeededSystemPageTest(ProjectionFixture):
-    """The exemption is the path `bk init` writes, never the page's own claim.
+    """The seeded pages are hash-checked like every other page.
 
     `wiki.outside_apply` is the finding that says a page reached `wiki/` without
-    passing the apply gate. The two pages `bk init` seeds have no ledger entry,
-    so they need an exemption or every vault would report them forever -- and
-    the exemption used to be `metadata["type"] == "system"`, read from the file
-    being checked. That let any page under `wiki/` buy permanent silence by
-    writing four words into its own frontmatter: the integrity check let its
-    subject decide whether it would be checked.
-
-    The exemption is now `SEEDED_SYSTEM_PAGES`, a fixed pair of paths, and the
-    two of them are checked for the shape init gives them rather than skipped.
+    passing the apply gate. The two pages `bk init` seeds used to have no ledger
+    record, so they were exempted by path and checked for a *shape* -- a single
+    `# ` heading -- which any other single heading passed (TC3, #34). Before
+    that the exemption was `metadata["type"] == "system"`, read from the file
+    being checked. Init now records what it wrote, and lint compares against
+    it; neither the path nor the frontmatter buys anything.
     """
 
     def outside_apply(self) -> dict[str, str]:
@@ -1019,13 +1179,42 @@ class SeededSystemPageTest(ProjectionFixture):
         # defect it replaced.
         self.assertEqual(self.outside_apply(), {})
 
+    def test_a_seed_whose_heading_was_replaced_is_reported(self) -> None:
+        # TC3 itself. The body is still one heading -- the shape the old
+        # check accepted -- and only the words changed.
+        for relative in SEED_PAGES:
+            with self.subTest(path=relative):
+                original = (self.root / relative).read_text(encoding="utf-8")
+                _, body = parse_frontmatter(original)
+                self.write_wiki(relative, original.replace(body, "# Outra coisa\n"))
+                self.assertIn("changed outside", self.outside_apply()[relative])
+                self.write_wiki(relative, original)
+
+    def test_the_seeded_bytes_are_recorded_before_init_returns(self) -> None:
+        # The fixture does what `bk init` does after `initialize`: reindex and
+        # generate the views, which runs a lint, which records the seeds.
+        seeded = self.freshness()["seeded"]
+        self.assertEqual(set(seeded), set(SEED_PAGES))
+        for relative in SEED_PAGES:
+            with self.subTest(path=relative):
+                self.assertEqual(seeded[relative]["hash"], self.vault.content_hash(relative))
+
+    def test_a_seed_record_is_not_an_applied_entry(self) -> None:
+        # `content_hash` means the apply gate wrote the page. A seed carries no
+        # freshness: it must not age, count in the summary, or enter the
+        # projection fingerprint that `views` was just stamped with.
+        pages = self.freshness().get("pages", {})
+        for relative in SEED_PAGES:
+            with self.subTest(path=relative):
+                self.assertNotIn(relative, pages)
+        self.assertEqual(sum(self.service.status()["freshness"].values()), 0)
+        self.assertEqual(self.projections()[VIEWS_PROJECTION]["state"], "fresh")
+
     def test_a_page_declaring_itself_system_is_still_reported(self) -> None:
-        # The defect, in its purest form. These are the exact bytes `bk init`
-        # writes for a seeded page -- `type: "system"` frontmatter and a lone
-        # heading -- at a path init never writes. Content is held constant, so
-        # the only thing that can distinguish it is the path, which is the
-        # whole point of the fix. Under the old rule this page was silent.
-        self.write_wiki("wiki/concepts/impostor.md", _system_page("impostor", "Impostor"))
+        # These are the exact bytes `bk init` writes for a seeded page --
+        # `type: "system"` frontmatter and a lone heading -- at a path init
+        # never writes. Under the frontmatter rule this page was silent.
+        self.write_wiki("wiki/concepts/impostor.md", impostor_page())
         self.assertIn("wiki/concepts/impostor.md", self.outside_apply())
 
     def test_the_frontmatter_claim_buys_nothing_at_any_path(self) -> None:
@@ -1035,26 +1224,24 @@ class SeededSystemPageTest(ProjectionFixture):
             "wiki/entities/deep/impostor.md",
         ):
             with self.subTest(path=relative):
-                self.write_wiki(relative, _system_page("impostor", "Impostor"))
+                self.write_wiki(relative, impostor_page())
                 self.assertIn(relative, self.outside_apply())
                 (self.root / relative).unlink()
 
     def test_a_page_named_like_a_seed_elsewhere_is_still_reported(self) -> None:
-        # `SEEDED_SYSTEM_PAGES` holds whole paths, not basenames. A check keyed
-        # on the filename would exempt these two as well.
+        # Seeds are whole paths, not basenames, and the seed template at
+        # another path is not adopted.
         for relative in ("wiki/concepts/index.md", "wiki/concepts/log.md"):
             with self.subTest(path=relative):
-                self.write_wiki(relative, _system_page("index", "Brainskit index"))
-                self.assertIn(relative, self.outside_apply())
+                self.write_wiki(relative, impostor_page("index", "Brainskit index"))
+                self.assertIn("not tracked", self.outside_apply()[relative])
                 (self.root / relative).unlink()
 
     def test_appending_to_a_seeded_page_is_reported(self) -> None:
-        # The other half of the old rule: the seeded pages were skipped
-        # entirely, so a fabricated claim appended to `wiki/index.md` produced
-        # no finding at all -- while `bk gate check-write` refused the very
-        # same path. The gate's header comment names this backstop as the
-        # reason it may fail open, so it has to hold for these two pages too.
-        for relative in ("wiki/index.md", "wiki/log.md"):
+        # A fabricated claim appended to `wiki/index.md` must be found: the
+        # gate's header comment names this backstop as the reason it may fail
+        # open, so it has to hold for these two pages too.
+        for relative in SEED_PAGES:
             with self.subTest(path=relative):
                 original = (self.root / relative).read_text(encoding="utf-8")
                 self.write_wiki(relative, original + "\nUma alegacao inventada.\n")
@@ -1062,25 +1249,20 @@ class SeededSystemPageTest(ProjectionFixture):
                 self.write_wiki(relative, original)
 
     def test_a_modified_seed_is_reported_as_changed_not_as_untracked(self) -> None:
-        # The two sentences are not interchangeable: one says a page appeared
-        # from nowhere, the other says a known page was edited. A reader acts
-        # differently on each.
+        # One says a page appeared from nowhere, the other says a known page
+        # was edited. A reader acts differently on each.
         relative = "wiki/index.md"
         original = (self.root / relative).read_text(encoding="utf-8")
         self.write_wiki(relative, original + "\nUma alegacao inventada.\n")
         self.assertIn("changed outside", self.outside_apply()[relative])
 
     def test_an_unseeded_page_is_reported_as_untracked(self) -> None:
-        self.write_wiki("wiki/concepts/impostor.md", _system_page("impostor", "Impostor"))
+        self.write_wiki("wiki/concepts/impostor.md", impostor_page())
         self.assertIn(
             "not tracked", self.outside_apply()["wiki/concepts/impostor.md"]
         )
 
     def test_replacing_a_seed_body_wholesale_is_reported(self) -> None:
-        # The frontmatter is kept byte-identical, `type: "system"` and all, and
-        # only the body is replaced. Writing a page with no frontmatter instead
-        # would be reported by the old rule too -- the first version of this
-        # test did exactly that and passed under the defect, pinning nothing.
         original = (self.root / "wiki" / "index.md").read_text(encoding="utf-8")
         _, body = parse_frontmatter(original)
         self.write_wiki(
@@ -1088,17 +1270,16 @@ class SeededSystemPageTest(ProjectionFixture):
         )
         self.assertIn("wiki/index.md", self.outside_apply())
 
-    def test_the_seeded_shape_tolerates_only_the_heading(self) -> None:
-        # Whitespace around the seeded heading is not an edit worth reporting;
-        # anything with a second line of content is.
-        self.assertTrue(_is_seeded_shape("\n\n# Brainskit index\n\n"))
-        self.assertFalse(_is_seeded_shape("# Brainskit index\n\nCorpo.\n"))
-        self.assertFalse(_is_seeded_shape(""))
+    def test_restoring_the_seed_clears_the_finding(self) -> None:
+        relative = "wiki/log.md"
+        original = (self.root / relative).read_text(encoding="utf-8")
+        self.write_wiki(relative, original + "\nAlterado.\n")
+        self.assertIn(relative, self.outside_apply())
+        self.write_wiki(relative, original)
+        self.assertEqual(self.outside_apply(), {})
 
-    def test_a_seed_that_gains_a_ledger_entry_is_hash_checked_instead(self) -> None:
-        # A page with a freshness entry never reaches the seeded branch at all,
-        # so making these two visible cannot make `bk apply` report findings
-        # against its own output.
+    def test_a_seed_that_gains_an_applied_entry_is_checked_against_it(self) -> None:
+        # Once the gate writes a seeded path, what it wrote is the newer claim.
         recorded = self.vault.wiki_version("wiki/index.md")
 
         def track(state: dict[str, Any]) -> dict[str, Any]:
@@ -1115,17 +1296,157 @@ class SeededSystemPageTest(ProjectionFixture):
         self.assertIn("wiki/index.md", self.outside_apply())
 
 
-class SeededPageDriftTest(unittest.TestCase):
-    """`SEEDED_SYSTEM_PAGES` must keep describing what `bk init` really writes.
+class SeededPageUpgradeTest(SeededSystemPageTest):
+    """A vault initialised before seeds were recorded.
 
-    A hard-coded path set that silently stops matching reality is how this
-    class of defect returns: a seed added to `Vault.initialize` and not added
-    here would be reported forever, and a seed removed there would leave a
-    permanent exemption for a path nothing writes. Both are read off a real
-    `initialize` rather than restated.
+    It has the two pages and no record of them. The first lint (or `status`,
+    which runs one) records a page equal to the template some release seeded --
+    the current title or the pre-rename `Brainkit` one -- and reports anything
+    else. Inherits every seeded-page test, so each also holds on this path.
     """
 
     def setUp(self) -> None:
+        super().setUp()
+        self.forget_seeds()
+
+    def forget_seeds(self) -> None:
+        def mutate(state: dict[str, Any]) -> dict[str, Any]:
+            state.pop("seeded", None)
+            return state
+
+        self.vault.mutate_state("freshness", mutate)
+
+    def test_the_seeded_bytes_are_recorded_before_init_returns(self) -> None:
+        self.assertNotIn("seeded", self.freshness())
+
+    def test_the_first_lint_records_an_untouched_seed(self) -> None:
+        self.assertEqual(self.outside_apply(), {})
+        seeded = self.freshness()["seeded"]
+        self.assertEqual(set(seeded), set(SEED_PAGES))
+        for relative in SEED_PAGES:
+            with self.subTest(path=relative):
+                self.assertEqual(
+                    seeded[relative]["hash"], self.vault.content_hash(relative)
+                )
+
+    def test_status_records_too(self) -> None:
+        self.service.status()
+        self.assertEqual(set(self.freshness()["seeded"]), set(SEED_PAGES))
+
+    def test_a_seed_from_before_the_rename_is_recorded(self) -> None:
+        for relative, (slug, _) in SEED_PAGES.items():
+            title = {"index": "Brainkit index", "log": "Brainkit log"}[slug]
+            self.write_wiki(
+                relative, render_seed_page(slug, title, "2026-08-11T20:14:38.507711+00:00")
+            )
+        self.assertEqual(self.outside_apply(), {})
+        self.assertEqual(set(self.freshness()["seeded"]), set(SEED_PAGES))
+
+    def test_an_edited_seed_is_reported_and_never_recorded(self) -> None:
+        relative = "wiki/index.md"
+        original = (self.root / relative).read_text(encoding="utf-8")
+        _, body = parse_frontmatter(original)
+        self.write_wiki(relative, original.replace(body, "# Outra coisa\n"))
+        for _ in range(2):
+            self.assertIn("changed outside", self.outside_apply()[relative])
+        self.assertNotIn(relative, self.freshness().get("seeded", {}))
+
+    def test_a_recorded_seed_is_hash_checked_afterwards(self) -> None:
+        self.assertEqual(self.outside_apply(), {})
+        relative = "wiki/log.md"
+        original = (self.root / relative).read_text(encoding="utf-8")
+        self.write_wiki(relative, original + "x")
+        self.assertIn(relative, self.outside_apply())
+
+
+class SeedTemplateTest(unittest.TestCase):
+    """`is_seed_template` is equality with a rendered seed, not a shape."""
+
+    STAMP = "2026-08-11T20:14:38.507711+00:00"
+
+    def test_every_title_a_release_seeded_is_recognised(self) -> None:
+        for path, slug, title in (
+            ("wiki/index.md", "index", "Brainskit index"),
+            ("wiki/index.md", "index", "Brainkit index"),
+            ("wiki/log.md", "log", "Brainskit log"),
+            ("wiki/log.md", "log", "Brainkit log"),
+        ):
+            with self.subTest(title=title):
+                self.assertTrue(
+                    is_seed_template(path, render_seed_page(slug, title, self.STAMP))
+                )
+
+    def test_anything_else_is_not(self) -> None:
+        seed = render_seed_page("index", "Brainskit index", self.STAMP)
+        for path, text in (
+            ("wiki/index.md", seed.replace("# Brainskit index", "# Outra coisa")),
+            ("wiki/index.md", seed + "\n"),
+            ("wiki/index.md", seed.replace('title: "Brainskit index"', 'title: "X"')),
+            ("wiki/index.md", render_seed_page("log", "Brainskit log", self.STAMP)),
+            ("wiki/concepts/index.md", seed),
+            ("wiki/index.md", ""),
+        ):
+            with self.subTest(path=path, text=text[-24:]):
+                self.assertFalse(is_seed_template(path, text))
+
+
+class InitLayoutTest(unittest.TestCase):
+    """`initialize` scaffolds exactly the layout `docs/getting-started.md` shows.
+
+    It used to create `output/reports`, which nothing writes, and not
+    `output/resurface`, which `bk resurface` does.
+    """
+
+    DOC = Path(__file__).resolve().parents[1] / "docs" / "getting-started.md"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        FileVault.initialize(self.root, policy())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_the_directories_are_the_documented_ones(self) -> None:
+        created = {
+            path.relative_to(self.root).as_posix()
+            for path in self.root.rglob("*")
+            if path.is_dir()
+        }
+        self.assertEqual(
+            created,
+            {
+                "raw", "raw/_inbox", "raw/_assets", "raw/20-research",
+                "wiki", "wiki/sources", "wiki/entities", "wiki/concepts",
+                "wiki/syntheses",
+                "views", "views/map", "views/domains",
+                "graph",
+                "output", "output/digests", "output/resurface", "output/answers",
+                ".brain",
+            },
+        )
+
+    def test_every_output_directory_is_in_the_documented_layout(self) -> None:
+        text = self.DOC.read_text(encoding="utf-8")
+        layout = text[text.index("## Vault layout") :]
+        layout = layout[: layout.index("```", layout.index("```text") + 1)]
+        for path in sorted((self.root / "output").iterdir()):
+            with self.subTest(directory=path.name):
+                self.assertIn(f"── {path.name}/", layout)
+
+
+class SeededPageDriftTest(unittest.TestCase):
+    """What `bk init` writes and what lint recognises must be the same pages.
+
+    Read off a real `initialize` rather than restated: a seed added to
+    `SEED_PAGES` is written from the template lint compares against, so this
+    pins that the loop, the template and the record agree.
+    """
+
+    def setUp(self) -> None:
+        # Every test below loops over the constant; were it empty they would all
+        # pass against an init that seeds nothing.
+        self.assertEqual(set(SEED_PAGES), {"wiki/index.md", "wiki/log.md"})
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())
@@ -1133,37 +1454,39 @@ class SeededPageDriftTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_init_writes_exactly_the_exempted_paths(self) -> None:
-        self.assertEqual(set(self.vault.wiki_pages()), set(SEEDED_SYSTEM_PAGES))
+    def test_init_writes_exactly_the_seeded_paths(self) -> None:
+        self.assertEqual(set(self.vault.wiki_pages()), set(SEED_PAGES))
 
-    def test_every_seeded_page_passes_the_shape_check(self) -> None:
-        # The exemption is worth nothing if the shape check rejects the very
-        # bytes init writes -- a fresh vault would report itself.
-        for path in sorted(SEEDED_SYSTEM_PAGES):
+    def test_every_seeded_page_is_the_template(self) -> None:
+        for path in sorted(SEED_PAGES):
             with self.subTest(path=path):
                 text = (self.root / path).read_text(encoding="utf-8")
-                _, body = parse_frontmatter(text)
-                self.assertTrue(_is_seeded_shape(body))
+                self.assertTrue(is_seed_template(path, text))
 
-    def test_the_seeded_pages_really_do_declare_type_system(self) -> None:
-        # Pins the premise of the whole fix. If init stopped writing
-        # `type: "system"`, the old frontmatter rule would have exempted
-        # nothing and this fix would be solving a defect that no longer
-        # existed -- worth knowing either way.
-        for path in sorted(SEEDED_SYSTEM_PAGES):
+    def test_the_seeded_pages_declare_type_system(self) -> None:
+        # Pins the premise of the frontmatter fix: the seeds really do carry
+        # the claim that used to buy an exemption.
+        for path in sorted(SEED_PAGES):
             with self.subTest(path=path):
                 metadata, _ = parse_frontmatter(
                     (self.root / path).read_text(encoding="utf-8")
                 )
                 self.assertEqual(metadata.get("type"), "system")
 
-    def test_no_seeded_page_carries_a_freshness_entry(self) -> None:
-        # The reason they need an exemption at all. If init started recording
-        # them, the exemption would be dead code rather than a guard.
-        pages = self.vault.read_state("freshness").get("pages", {})
-        for path in sorted(SEEDED_SYSTEM_PAGES):
+    def test_initialize_alone_records_nothing(self) -> None:
+        # Infrastructure does not reach into the ledger; the record is lint's.
+        self.assertNotIn("seeded", self.vault.read_state("freshness"))
+
+    def test_the_first_lint_records_every_seed_as_written(self) -> None:
+        service = BrainskitService(self.vault, SqliteFtsIndex(self.vault.index_path))
+        self.assertEqual(
+            [f for f in service.lint()["findings"] if f["code"] == "wiki.outside_apply"],
+            [],
+        )
+        seeded = self.vault.read_state("freshness")["seeded"]
+        for path in sorted(SEED_PAGES):
             with self.subTest(path=path):
-                self.assertNotIn(path, pages)
+                self.assertEqual(seeded[path]["hash"], self.vault.content_hash(path))
 
 
 if __name__ == "__main__":

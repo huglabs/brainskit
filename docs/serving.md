@@ -45,6 +45,43 @@ right trade for a single-user local viewer and the wrong one for anything else.
 Naming a token is what makes a non-loopback bind possible at all, so the two
 decisions are the same decision.
 
+## An MCP server declares its consumer
+
+MCP hands every answer to a model, and the server cannot see where that model
+runs. So both transports answer under the consumer the operator starts them
+with:
+
+```bash
+bk --vault ./my-vault serve --mcp --transport stdio                    # cloud, the default
+bk --vault ./my-vault serve --mcp --transport stdio --consumer local   # an agent on this machine
+```
+
+- **`cloud` is the default**, because it is the only boundary safe to forward
+  anywhere. `--consumer local` is the operator stating that the client runs on
+  this machine. `human` is refused with `policy_denied` before the server reads
+  a request: a model is never the reader `human` means.
+- **The declared consumer is a ceiling, and a call can only narrow it.** Every
+  tool and resource answers under it. `search` and `context` still require a
+  `consumer` argument; `cloud` under a `local` server is answered, and anything
+  wider than the server's is refused with `policy_denied` (with
+  `server_consumer` and `allowed` in the details) rather than silently answered
+  narrower. `tools/list` offers only the values the server will answer.
+- **`capture` of a file path is confined.** Text and `http(s)` URLs are
+  unchanged; a file is accepted only inside the vault's project (its code root
+  or a workspace `bk hooks install --root` recorded), outside the vault itself,
+  and never a credential file such as `.env*`, a private key, or anything under
+  `~/.ssh`. `bk capture <path>` is not restricted.
+- **A `cloud` server does not operate integrations.** `integration_configure`,
+  `integration_up`, `integration_down` and `integration_sync` are refused with
+  `policy_denied` and left out of `tools/list`; the refusal names `bk
+  integration <verb> <name>` and `--consumer local` as the ways to run them.
+  `integration_status` stays available. A `local` server runs all four, with
+  machine layout (paths, container names, env-var names) scrubbed from the
+  response.
+
+See [the privacy boundary](./privacy.md#an-mcp-server-declares-its-consumer)
+and [ADR 0010](./knowledge/decisions/architecture/0010-mcp-declares-its-consumer.md).
+
 ## MCP over the network
 
 The stdio transport remains the zero-network default. Network clients use the
@@ -57,6 +94,8 @@ export BRAINKIT_MCP_TOKEN='use-a-secret-manager-in-production'
 bk --vault ./my-vault serve --mcp --transport http \
   --host 127.0.0.1 --port 8766 --token-env BRAINKIT_MCP_TOKEN
 ```
+
+The HTTP transport takes the same `--consumer`, with the same `cloud` default.
 
 A direct initialization request looks like this:
 
@@ -86,6 +125,9 @@ as the CLI:
 | Review | `proposals`, `approve`, `reject` |
 | Operations | `status`, `lint` |
 | Integrations | `integration_configure`, `integration_status`, `integration_up`, `integration_down`, `integration_sync` |
+
+A `cloud` server lists and answers every row except the four integration
+lifecycle tools; only `integration_status` remains in that group.
 
 `bk vaults` is deliberately absent from that list: an MCP server is started for
 one vault and answers under that vault's declared boundary, so a tool that

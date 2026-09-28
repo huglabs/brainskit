@@ -25,6 +25,11 @@ inside the vendored code but a wiring choice one layer up, in
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import contextlib
 import io
 import tempfile
@@ -118,6 +123,7 @@ class PersistenceTest(CodeCacheFixture):
     def test_a_changed_file_is_reparsed_while_unchanged_ones_are_not(self) -> None:
         self.build(cache_root=self.vault.code_cache_dir)
         before = {p: p.stat().st_mtime_ns for p in self.ast_entries()}
+        self.assertEqual(len(before), 3, "one entry per fixture file")
 
         (self.repo / "src" / "c.py").write_text(
             "def helper(x):\n    return x * 3  # changed\n", encoding="utf-8"
@@ -132,7 +138,7 @@ class PersistenceTest(CodeCacheFixture):
             self.assertEqual(after.get(path), mtime, f"{path} was rewritten unnecessarily")
         # And a new entry appeared for c.py's new content hash — proof it WAS
         # reparsed rather than silently reusing a.py/b.py's cache freshness.
-        self.assertGreater(len(after), len(before))
+        self.assertEqual(len(after), len(before) + 1)
 
 
 class CorruptionTest(CodeCacheFixture):

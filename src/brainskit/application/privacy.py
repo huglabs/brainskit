@@ -151,6 +151,17 @@ class PrivacyBoundary:
     def branch_privacy(self, branch: str) -> PrivacyMode:
         return branch_privacy(self._config, branch)
 
+    def installation_facts(self, **facts: str) -> dict[str, str]:
+        """`facts` for a consumer that may see them, nothing for one that may not.
+
+        Spread into a response (`**boundary.installation_facts(vault=...)`) so
+        the key is omitted rather than blanked, the way a redacted source is
+        counted rather than described: there is no placeholder for a client to
+        test for, and no stable label that would itself identify the machine.
+        """
+
+        return dict(facts) if self.consumer.sees_installation() else {}
+
     def split_records(self) -> tuple[dict[str, SourceRecord], int]:
         """The records this consumer may see, and how many were redacted.
 

@@ -33,7 +33,9 @@ because a writer and a reader of the same file drifted apart.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from pathlib import Path, PurePosixPath
@@ -41,6 +43,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from brainskit.application.freshness import FreshnessLedger
+from brainskit.application.install import adapter_path, installed_agents
 from brainskit.application.pages import (
     _content_tokens,
     _is_salient_term,
@@ -50,7 +53,10 @@ from brainskit.application.pages import (
 from brainskit.application.ports import SearchIndexPort, VaultPort
 from brainskit.domain.model import (
     BrainskitError,
+    ForgottenSourceError,
     NotConfiguredError,
+    NotFoundError,
+    PolicyError,
     SourceRecord,
     ValidationError,
     is_ignored,
@@ -64,6 +70,22 @@ _RELATED_CANDIDATES = 20
 _RELATED_PAGE_LIMIT = 5
 _RELATED_MIN_SHARED_TERMS = 2
 _RELATED_TEXT_LIMIT = 20_000
+
+# What a confined capture -- one a model asked for, over MCP -- never copies in,
+# wherever it sits (ADR 0010). Small on purpose: each entry is a file whose
+# whole content is a credential, and the operator can still capture any of them
+# with `bk capture`, which is the point. A model is the reader most likely to
+# be told to fetch one by text it should not be obeying.
+_SECRET_NAMES = frozenset({".netrc", ".npmrc", ".pypirc"})
+_SECRET_SUFFIXES = frozenset({".pem", ".key"})
+_ENV_TEMPLATES = frozenset(
+    {".env.example", ".env.sample", ".env.template", ".env.dist"}
+)
+_PRIVATE_KEY = re.compile(r"id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?")
+_SECRET_HOME_DIRECTORIES = (".ssh", ".aws", ".config/gcloud")
+# Not a credential file, but git's own: `.git/config` is where a token pasted
+# into a remote URL ends up, and nothing under `.git` is evidence.
+_SECRET_DIRECTORY_NAMES = frozenset({".git"})
 
 
 class Ingestion:
@@ -80,8 +102,21 @@ class Ingestion:
         self.ledger = ledger
 
     def capture(
-        self, source: str | None, *, text: str | None = None, title: str | None = None
+        self,
+        source: str | None,
+        *,
+        text: str | None = None,
+        title: str | None = None,
+        revive: bool = True,
+        confined: bool = False,
     ) -> dict[str, Any]:
+        """Capture text, a URL, or a file.
+
+        `confined` is a model asking rather than the operator typing: a file
+        path must then resolve inside the project and must not be a
+        credential file. See `_confine`.
+        """
+
         if text is not None:
             record, created = self.vault.capture_text(
                 text, title or "captured-note", ".md"
@@ -91,12 +126,80 @@ class Ingestion:
             body = f"# {url_title}\n\n{source}\n"
             record, created = self.vault.capture_text(body, url_title, ".md")
         elif source:
-            record, created = self.vault.capture_file(Path(source))
+            path = self._confine(source) if confined else Path(source)
+            record, created = self.vault.capture_file(path, revive=revive)
         else:
             raise ValidationError("capture requires a source path, URL, or --text")
         self.index.upsert_raw(self.vault, record)
         self._mark_related_pages_for_review(record)
         return {"created": created, "source": record.to_dict()}
+
+    def _confine(self, source: str) -> Path:
+        """`source` resolved, if a model may have it captured; a refusal if not.
+
+        Allowed: a file under the code root or a workspace an agent was
+        installed into, and outside the vault itself -- the vault's `.brain/`
+        holds the search index and extracted text of every source, never-ingest
+        included, so capturing it back in would launder it into a readable
+        branch. Refused before the file is looked at, so the answer never says
+        whether something exists outside the project, and never carries its
+        content. Symlinks are resolved first, and the secret check reads both
+        the name asked for and the name it resolves to.
+        """
+
+        given = Path(source).expanduser()
+        resolved = given.resolve()
+        if _secret_shaped(given) or _secret_shaped(resolved):
+            raise _capture_refusal(
+                "MCP capture never reads a credential file",
+                reason="secret_shaped",
+            )
+        vault_root = self.vault.root.resolve()
+        inside_project = any(
+            resolved.is_relative_to(root) for root in self._project_roots()
+        )
+        if not inside_project or resolved.is_relative_to(vault_root):
+            raise _capture_refusal(
+                "MCP capture reads files only inside this vault's project",
+                reason="outside_project",
+            )
+        if not resolved.is_file():
+            # The caller's own spelling, not the resolved path: a relative
+            # source would otherwise come back naming the project's location.
+            raise NotFoundError(
+                "Capture source is not a file", details={"source": source}
+            )
+        return resolved
+
+    def _project_roots(self) -> list[Path]:
+        """Where a confined capture may read: the code root and agent workspaces.
+
+        The code root is already bounded below the home directory by
+        `code_root_reason`. A workspace is whatever `bk hooks install --root`
+        recorded, so the same bound is applied here: a root at or above home
+        would confine nothing.
+        """
+
+        vault_root = self.vault.root
+        candidates = [self.vault.code_root()]
+        for agent in installed_agents(vault_root):
+            try:
+                adapter = json.loads(
+                    (vault_root / adapter_path(agent)).read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                continue
+            workspace = adapter.get("workspace") if isinstance(adapter, dict) else None
+            if isinstance(workspace, str) and workspace:
+                candidates.append(Path(workspace))
+        home = Path.home().resolve()
+        roots = []
+        for candidate in candidates:
+            root = candidate.resolve()
+            if root == Path(root.anchor) or home.is_relative_to(root):
+                continue
+            roots.append(root)
+        return roots
 
     def watch_once(self) -> dict[str, Any]:
         """Capture every eligible file under the configured source folders.
@@ -150,6 +253,7 @@ class Ingestion:
         created = 0
         duplicates = 0
         ignored = 0
+        forgotten = 0
         failures: list[dict[str, str]] = [
             {
                 "path": str(root),
@@ -165,15 +269,18 @@ class Ingestion:
                 if candidate is None:
                     continue
                 try:
-                    result = self.capture(str(candidate))
+                    result = self.capture(str(candidate), revive=False)
                     created += int(result["created"])
                     duplicates += int(not result["created"])
+                except ForgottenSourceError:
+                    forgotten += 1
                 except (BrainskitError, OSError) as exc:
                     failures.append({"path": str(candidate), "error": str(exc)})
         return {
             "created": created,
             "duplicates": duplicates,
             "ignored": ignored,
+            "forgotten": forgotten,
             "failures": failures,
         }
 
@@ -258,6 +365,43 @@ class Ingestion:
 
 def _is_url(value: str) -> bool:
     return urlparse(value).scheme in {"http", "https"}
+
+
+def _secret_shaped(path: Path) -> bool:
+    name = path.name
+    if name.startswith(".env") and name not in _ENV_TEMPLATES:
+        return True
+    if name in _SECRET_NAMES or path.suffix in _SECRET_SUFFIXES:
+        return True
+    if _PRIVATE_KEY.fullmatch(name):
+        return True
+    if _SECRET_DIRECTORY_NAMES.intersection(path.parts[:-1]):
+        return True
+    home = Path.home()
+    return any(
+        path.is_relative_to(home / directory)
+        or path.is_relative_to(home.resolve() / directory)
+        for directory in _SECRET_HOME_DIRECTORIES
+    )
+
+
+def _capture_refusal(message: str, *, reason: str) -> PolicyError:
+    # No path and no root in the details: the path is the caller's own input,
+    # and the project roots are installation facts (ADR 0009).
+    return PolicyError(
+        message,
+        details={
+            "reason": reason,
+            "allowed": (
+                "literal text, an http(s) URL, or a file inside this vault's "
+                "project that is not a credential file"
+            ),
+            "hint": (
+                "Send the content as text instead, or ask the operator to run "
+                "bk capture with the path"
+            ),
+        },
+    )
 
 
 def _missing_source(value: str, root: Path) -> dict[str, str]:

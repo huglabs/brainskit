@@ -26,6 +26,11 @@ harness stepped around it.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import importlib.util
 import sys
 import unittest

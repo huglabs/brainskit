@@ -19,6 +19,11 @@ a second instance of it would otherwise ship exactly as quietly as the first.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import inspect
 import unittest
 from dataclasses import fields

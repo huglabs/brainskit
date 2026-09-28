@@ -9,9 +9,9 @@ boundary.
 Three properties carry it:
 
 - **The import is a boundary, not a copy.** Prose nodes are dropped, dangling
-  edges are dropped, and the vault is excluded from its own graph. Trusting the
-  caller to have passed `--code-only` would make that a property of a command
-  line instead of a property of the vault.
+  edges are dropped, and the vault is excluded from its own graph. There is no
+  `--code-only` flag to trust the caller with: that would make the boundary a
+  property of a command line instead of a property of the vault.
 - **Freshness is content, not time.** The graph records the hash of every file
   it indexed, and `status` re-reads them. A stored git revision would miss
   uncommitted edits; mtime would break on `git checkout`.
@@ -21,12 +21,19 @@ Three properties carry it:
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -39,7 +46,8 @@ from brainskit.infrastructure.extractor import GraphifyExtractor
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.vault import FileVault
-from brainskit.interfaces.cli import _render, _render_auto
+from brainskit.interfaces import console
+from brainskit.interfaces.cli import _emit, _render
 
 
 def _code_extra_installed() -> bool:
@@ -160,7 +168,13 @@ class ImportBoundaryTest(CodeGraphFixture):
             self.service.code_import(
                 {"nodes": [node("d", "R", "README.md", 1, "document")], "links": []}
             )
-        self.assertIn("code-only", caught.exception.details["hint"])
+        # `--code-only` is the flag the module docstring says deliberately does
+        # not exist; a hint naming it was a dead end. The hint must name
+        # something the operator can actually run.
+        hint = caught.exception.details["hint"]
+        self.assertNotIn("--code-only", hint)
+        self.assertIn("bk code build", hint)
+        self.assertEqual(caught.exception.details["dropped_non_code_nodes"], 1)
 
     def test_deduplicates_repeated_edges(self) -> None:
         payload = self.payload()
@@ -211,6 +225,7 @@ class FreshnessTest(CodeGraphFixture):
         report = self.service.code_status()
         self.assertEqual(report["state"], "missing")
         self.assertFalse(report["stale"])
+        self.assertEqual(report["command"], "bk code build")
 
     def test_a_freshly_imported_graph_is_fresh(self) -> None:
         self.service.code_import(self.payload())
@@ -226,7 +241,7 @@ class FreshnessTest(CodeGraphFixture):
         self.assertEqual(report["state"], "stale")
         self.assertTrue(report["stale"])
         self.assertEqual(report["changed"], ["src/db.ts"])
-        self.assertIn("bk code import", report["command"])
+        self.assertEqual(report["command"], "bk code build")
 
     def test_deleting_an_indexed_file_is_reported_separately(self) -> None:
         self.service.code_import(self.payload())
@@ -368,7 +383,8 @@ class BoundaryTest(CodeGraphFixture):
     def test_querying_without_a_graph_says_how_to_build_one(self) -> None:
         with self.assertRaises(NotFoundError) as caught:
             self.service.code_hubs()
-        self.assertIn("bk code import", caught.exception.details["hint"])
+        # A fresh vault has no graph.json to import; extracting one is the route.
+        self.assertEqual(caught.exception.details["hint"], "Build one with bk code build")
 
 
 class MalformedFixture(CodeGraphFixture):
@@ -563,6 +579,28 @@ class MalformedStatusTest(MalformedFixture):
         self.corrupt("an edge with no type")
         self.assertIs(self.service.code_status()["stale"], True)
 
+    def test_a_graph_with_no_readable_input_set_is_stale(self) -> None:
+        # Traversable, so not malformed, but with nothing to compare against
+        # the tree it cannot be verified -- and the one answer it must not give
+        # a terse caller is `stale: False`.
+        # A missing key is the same situation as an unreadable one: `import`
+        # always writes `files`, so its absence means the artefact was altered.
+        absent = object()
+        for files in (absent, None, ["src/db.ts"], "src/db.ts"):
+            with self.subTest(files="<absent>" if files is absent else files):
+                self.service.code_import(self.payload())
+                stored = self.graph_file()
+                if files is absent:
+                    del stored["files"]
+                else:
+                    stored["files"] = files
+                (self.vault.root / CODE_PROJECTION).write_text(
+                    json.dumps(stored), encoding="utf-8"
+                )
+                verdict = self.service.code_status()
+                self.assertEqual(verdict["state"], "stale")
+                self.assertIs(verdict["stale"], True)
+
     def test_a_sound_graph_still_reports_fresh(self) -> None:
         # The control. A detector that fired on everything would satisfy every
         # assertion above while making `status` useless.
@@ -611,16 +649,55 @@ class MalformedStatusTest(MalformedFixture):
                 self.assertIn("refuses this graph", rendered)
                 self.assertIn("bk code build", rendered)
 
-    def test_the_other_states_render_exactly_as_they_did(self) -> None:
-        # The control that keeps this change additive: `fresh`, `stale` and
-        # `missing` are drawn by `_render_auto`, untouched, byte for byte.
+    def test_the_other_states_render_exactly_as_pinned(self) -> None:
+        # These used to be pinned to `_render_auto` byte for byte, which was the
+        # defect: `fresh` and `stale` carry two lists, and `_render_auto` answers
+        # that shape with a raw JSON dump. Pinned to exact text now, so the
+        # renderer still cannot drift -- and never interrupts outside `malformed`.
         (self.vault.root / CODE_PROJECTION).unlink(missing_ok=True)
         for expected in ("missing", "fresh", "stale"):
             with self.subTest(state=expected):
                 verdict = self.service.code_status()
                 self.assertEqual(verdict["state"], expected)
-                self.assertEqual(self.render(), _render_auto(verdict))
+                built = verdict["generated_at"]
+                pinned = {
+                    "missing": [
+                        "no code graph yet",
+                        "",
+                        "state         missing",
+                        "generated_at  -",
+                        "next          bk code build",
+                    ],
+                    "fresh": [
+                        "✓ code graph fresh — 2 file(s)",
+                        "",
+                        "state         fresh",
+                        f"generated_at  {built}",
+                        "files         2",
+                    ],
+                    "stale": [
+                        "! code graph stale — 1 changed, 0 removed",
+                        "",
+                        "state         stale",
+                        f"generated_at  {built}",
+                        "files         2",
+                        "next          bk code build",
+                        "",
+                        console.rule("changed (1)"),
+                        "• src/db.ts",
+                    ],
+                }[expected]
+                self.assertEqual(self.render(), "\n".join(pinned))
                 self.assertNotIn("refuses this graph", self.render())
+                self.assertNotIn("{", self.render())
+                # `--json` is untouched by any of this: the verdict, verbatim.
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    _emit(verdict, "code", code_command="status", ok=True, json_mode=True)
+                self.assertEqual(
+                    out.getvalue(),
+                    json.dumps({"ok": True, "result": verdict}, ensure_ascii=False) + "\n",
+                )
                 if expected == "missing":
                     self.service.code_import(self.payload())
                 elif expected == "fresh":
@@ -893,3 +970,53 @@ class BuildTest(CodeBuildFixture):
             {(e["source"], e["target"], e["type"]) for e in imported_graph["edges"]},
             {(e["source"], e["target"], e["type"]) for e in built_graph["edges"]},
         )
+
+
+@unittest.skipUnless(_HAS_CODE_EXTRA, "requires the `code` extra (tree-sitter + grammars)")
+class VaultIsTheCodeRootTest(unittest.TestCase):
+    """A vault outside any repository, so `code_root` falls back to the vault.
+
+    The vault's own prefix inside the code root is then empty, and an empty
+    prefix once meant "exclude nothing": `bk hooks install` wrote its scripts,
+    bootstrapped the graph, and the graph held nothing but those scripts.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        vault = FileVault.initialize(Path(self.temporary.name) / "vault", policy())
+        self.vault = vault
+        self.service = BrainskitService(
+            vault,
+            SqliteFtsIndex(vault.index_path),
+            graph=MarkdownGraph(),
+            extractor=GraphifyExtractor(),
+        )
+        self.service.install_agent("claude")
+        self.assertEqual(self.vault.code_root().resolve(), self.vault.root.resolve())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_excludes_the_vault_s_own_files_when_the_vault_is_the_code_root(self) -> None:
+        root = self.vault.root
+        (root / "tool.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+        for owned in ("raw/_inbox/note.py", "wiki/page.py", "graph/built.py", ".brain/x.py"):
+            (root / owned).parent.mkdir(parents=True, exist_ok=True)
+            (root / owned).write_text("def owned():\n    return 0\n", encoding="utf-8")
+
+        self.service.code_build()
+
+        graph = json.loads((root / CODE_PROJECTION).read_text("utf-8"))
+        self.assertEqual({node["path"] for node in graph["nodes"]}, {"tool.py"})
+        # Excluded on purpose is not unexplained: the vault's files must not
+        # leave the graph reported as `partial`.
+        self.assertEqual(self.service.code_status()["state"], "fresh")
+
+    def test_a_vault_with_nothing_but_itself_is_refused_with_a_next_step(self) -> None:
+        with self.assertRaises(ValidationError) as caught:
+            self.service.code_build()
+        details = caught.exception.details
+        self.assertNotIn("--code-only", details["hint"])
+        self.assertIn("code_root", details["hint"])
+        self.assertIn("bk code build", details["hint"])
+        self.assertEqual(details["code_root"], str(self.vault.code_root()))

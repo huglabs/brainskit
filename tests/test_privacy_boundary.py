@@ -9,6 +9,11 @@ executable: a boundary built before a write answers from before the write.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import inspect
 import tempfile
 import unittest
@@ -250,6 +255,19 @@ class BoundaryDecisionTest(BoundaryFixture):
         visible, _ = for_consumer("cloud", self.vault).split_records()
         self.assertEqual({self.cloud_hash}, set(visible))
 
+    def test_installation_facts_are_withheld_from_cloud_only(self) -> None:
+        """ADR 0009: where the vault lives is inside the boundary."""
+
+        root = str(self.vault.root)
+        expectations = {"human": {"vault": root}, "local": {"vault": root}, "cloud": {}}
+        for consumer, expected in expectations.items():
+            with self.subTest(consumer=consumer):
+                boundary = for_consumer(consumer, self.vault)
+                self.assertEqual(expected, boundary.installation_facts(vault=root))
+                self.assertIs(
+                    bool(expected), Consumer.parse(consumer).sees_installation()
+                )
+
 
 class EvidenceTest(BoundaryFixture):
     def test_evidence_privacy_short_circuits_on_a_registered_hash(self) -> None:
@@ -267,6 +285,39 @@ class EvidenceTest(BoundaryFixture):
         self.assertIs(PrivacyMode.NEVER_INGEST, boundary.evidence_privacy(hit))
         self.assertFalse(boundary.allows_evidence(hit))
         self.assertTrue(for_consumer("human", self.vault).allows_evidence(hit))
+
+    def test_a_partially_resolving_page_is_never_ingest(self) -> None:
+        """The hash that went missing could have been the restricted one.
+
+        With every hash unresolved the empty fold already answers
+        never-ingest, so only a page whose *other* sources are cloud tells
+        this rule apart from folding over what did resolve.
+        """
+
+        forgotten = "f" * 64
+        page = (
+            "---\ntitle: Page\nsources:\n"
+            f"  - {self.cloud_hash}\n  - {forgotten}\n---\n\nBody.\n"
+        )
+        boundary = for_consumer("cloud", self.vault)
+        hit = {"path": "wiki/concepts/mixed.md"}
+        self.assertIs(PrivacyMode.NEVER_INGEST, boundary.evidence_privacy(hit, page))
+        self.assertFalse(for_consumer("local", self.vault).allows_evidence(hit, page))
+        resolved_only = page.replace(f"  - {forgotten}\n", "")
+        self.assertIs(PrivacyMode.CLOUD, boundary.evidence_privacy(hit, resolved_only))
+
+    def test_unreadable_provenance_is_never_ingest(self) -> None:
+        """`sources` present but not a list is declared provenance nobody can
+        read, which is not the same page as one that declares none."""
+
+        boundary = for_consumer("cloud", self.vault)
+        hit = {"path": "wiki/concepts/odd.md"}
+        unreadable = f"---\ntitle: Page\nsources: {self.cloud_hash}\n---\n\nBody.\n"
+        undeclared = "---\ntitle: Page\n---\n\nBody.\n"
+        self.assertIs(
+            PrivacyMode.NEVER_INGEST, boundary.evidence_privacy(hit, unreadable)
+        )
+        self.assertIs(PrivacyMode.CLOUD, boundary.evidence_privacy(hit, undeclared))
 
     def test_evidence_branches_resolves_cited_sources(self) -> None:
         boundary = for_consumer("local", self.vault)

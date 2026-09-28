@@ -111,10 +111,11 @@ def documents(raw):
     return found
 
 
+# Keyed on `result`, never on `ok`: lint that finds an error answers
+# {"ok": false, "result": {...}}, and that result is the one this summary is
+# for. An error envelope carries `error` and no `result`, so it still reads {}.
 def result(document):
-    if isinstance(document, dict) and document.get("ok") and isinstance(
-        document.get("result"), dict
-    ):
+    if isinstance(document, dict) and isinstance(document.get("result"), dict):
         return document["result"]
     return {}
 
@@ -214,6 +215,24 @@ if parts:
     lines.append("  enforcement " + " - ".join(parts))
 else:
     lines.append("  enforcement not reported by this bk")
+
+# A hook script older than the installed bk: the gate may enforce old rules and
+# this summary may misreport. Named with the fix `bk status` gave for it.
+outdated = enforcement.get("outdated") if isinstance(enforcement, dict) else None
+if isinstance(outdated, list) and outdated:
+    hint = next(
+        (
+            entry.get("hint")
+            for entry in (reported if isinstance(reported, list) else [])
+            if isinstance(entry, dict) and entry.get("outdated") and entry.get("hint")
+        ),
+        "bk hooks install",
+    )
+    lines.append(
+        "  hooks outdated: {} - refresh with: {}".format(
+            ", ".join(LABELS.get(name, str(name)) for name in outdated), hint
+        )
+    )
 lines.append("  evidence: bk context \"QUERY\" --consumer local --json - writes: bk apply")
 print("\n".join(lines))
 '

@@ -8,8 +8,11 @@ stdlib-only and hermetic while still asserting the whole decision tree.
 
 from __future__ import annotations
 
-import contextlib
-import io
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import json
 import unittest
 import unittest.mock
@@ -121,17 +124,12 @@ class UpdateFlowTest(unittest.TestCase):
     """The decision tree, end to end through `main` with the edges stubbed."""
 
     def run_cli(self, argv: list[str]) -> tuple[int, dict, str]:
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = cli.main(argv)
-            except SystemExit as exit_:  # argparse's own failures
-                code = int(exit_.code or 0)
+        run = _harness.run_cli(argv)
         try:
-            payload = json.loads(out.getvalue())
+            payload = run.json()
         except Exception:
             payload = {}
-        return code, payload, out.getvalue() + err.getvalue()
+        return run.code, payload, run.output
 
     def setUp(self) -> None:
         self.runs: list[list[str]] = []
@@ -195,9 +193,12 @@ class UpdateFlowTest(unittest.TestCase):
     def test_an_unreachable_pypi_answers_unavailable(self) -> None:
         fetch, runner, env, which = self._patched(None)
         with fetch, runner, env, which:
-            _, payload, _ = self.run_cli(["update", "--json"])
+            code, payload, _ = self.run_cli(["update", "--json"])
         self.assertEqual(payload["result"]["state"], "unavailable")
         self.assertEqual(self.runs, [])
+        # Not reaching PyPI is a report about the network, not a failed
+        # command: nothing was attempted, so nothing failed.
+        self.assertEqual((code, payload["ok"]), (0, True))
 
     def test_a_failed_upgrade_names_the_cause(self) -> None:
         fetch = unittest.mock.patch.object(
@@ -213,9 +214,12 @@ class UpdateFlowTest(unittest.TestCase):
             return Failed()
 
         with fetch, unittest.mock.patch.object(cli.subprocess, "run", boom):
-            _, payload, _ = self.run_cli(["update", "--yes", "--json"])
+            code, payload, _ = self.run_cli(["update", "--yes", "--json"])
         self.assertEqual(payload["result"]["state"], "failed")
         self.assertIn("resolution failed", payload["result"]["stderr_tail"])
+        # The upgrade was asked for and did not happen: the envelope and the
+        # exit status say so together.
+        self.assertEqual((code, payload["ok"]), (1, False))
 
 
 class RegistrationTest(unittest.TestCase):

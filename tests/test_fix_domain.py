@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import hashlib
 import io
 import json
@@ -8,7 +13,7 @@ import tempfile
 import unittest
 import urllib.error
 from collections.abc import Callable
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
@@ -188,6 +193,15 @@ class PageDirectoryTest(unittest.TestCase):
         self.assertNotEqual(PageKind.ENTITY.directory, "entitys")
 
     def test_relative_path_targets_the_scaffolded_directory(self) -> None:
+        self.assertEqual(
+            {kind.value: directory for kind, directory in PAGE_DIRECTORIES.items()},
+            {
+                "source": "sources",
+                "entity": "entities",
+                "concept": "concepts",
+                "synthesis": "syntheses",
+            },
+        )
         for kind, directory in PAGE_DIRECTORIES.items():
             operation = PageOperation.from_dict(
                 {
@@ -226,6 +240,10 @@ class VaultScaffoldGuardTest(unittest.TestCase):
         self.assertEqual(scaffolded, set(WIKI_DIRECTORIES))
 
     def test_every_page_kind_directory_is_scaffolded_by_init(self) -> None:
+        self.assertEqual(
+            {kind.value for kind in PageKind},
+            {"source", "entity", "concept", "synthesis"},
+        )
         for kind in PageKind:
             self.assertTrue(
                 (self.root / "wiki" / kind.directory).is_dir(),
@@ -700,7 +718,7 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         self.assertIn("not_found", str(caught.exception.details))
 
     def test_a_refusal_is_a_policy_denial_not_an_empty_answer(self) -> None:
-        sent, fake_urlopen = _wire_sequence(
+        _sent, fake_urlopen = _wire_sequence(
             {
                 "content": [],
                 "stop_reason": "refusal",
@@ -713,7 +731,7 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         self.assertEqual(caught.exception.details["category"], "cyber")
 
     def test_truncated_output_names_the_budget_that_truncated_it(self) -> None:
-        sent, fake_urlopen = _wire_sequence(
+        _sent, fake_urlopen = _wire_sequence(
             {
                 "content": [{"type": "text", "text": '{"answer": "half'}],
                 "stop_reason": "max_tokens",
@@ -728,7 +746,7 @@ class AnthropicRequestShapeTest(unittest.TestCase):
         self.assertIn("max_tokens", str(caught.exception))
 
     def test_an_answer_with_no_text_is_rejected(self) -> None:
-        sent, fake_urlopen = _wire_sequence(
+        _sent, fake_urlopen = _wire_sequence(
             {"content": [{"type": "thinking", "thinking": ""}], "stop_reason": "end_turn"}
         )
         with mock.patch("urllib.request.urlopen", fake_urlopen):
@@ -784,10 +802,22 @@ class StructuredSchemaProjectionTest(unittest.TestCase):
                 yield from self.objects(value)
 
     def test_every_shipped_schema_projects_to_a_closed_object_graph(self) -> None:
-        for job in ("ingest", "query", "digest", "resurface", "lint-semantic"):
+        # The object count per job is pinned so a projection that yields no
+        # object nodes cannot pass the loop below by running it zero times.
+        expected_objects = {
+            "ingest": 2,
+            "query": 1,
+            "digest": 1,
+            "resurface": 1,
+            "lint-semantic": 2,
+        }
+        for job, count in expected_objects.items():
             with self.subTest(job=job):
                 projected = _structured_schema(JobSpecs().schema(job))
-                for node in self.objects(projected):
+                nodes = list(self.objects(projected))
+                self.assertEqual(len(nodes), count)
+                self.assertIs(nodes[0], projected)
+                for node in nodes:
                     self.assertIs(node["additionalProperties"], False)
                     self.assertEqual(
                         sorted(node["required"]), sorted(node["properties"])
@@ -1297,29 +1327,22 @@ class ErrorExitCodeTest(unittest.TestCase):
             ModelResponseError,
         ):
             with self.subTest(error=error.__name__):
-                buffer = io.StringIO()
-                with mock.patch.object(
-                    cli, "_dispatch", side_effect=error("boom")
-                ), redirect_stderr(buffer):
-                    status = cli.main(["status"])
-                self.assertEqual(status, 2)
+                with mock.patch.object(cli, "_dispatch", side_effect=error("boom")):
+                    run = _harness.run_cli(["status"])
+                self.assertEqual(run.code, 2)
 
     def test_a_policy_error_still_exits_three(self) -> None:
         """The one code that does carry a different status keeps it."""
-        buffer = io.StringIO()
-        with mock.patch.object(
-            cli, "_dispatch", side_effect=PolicyError("nope")
-        ), redirect_stderr(buffer):
-            self.assertEqual(cli.main(["status"]), 3)
+        with mock.patch.object(cli, "_dispatch", side_effect=PolicyError("nope")):
+            self.assertEqual(_harness.run_cli(["status"]).code, 3)
 
     def test_the_code_reaches_the_json_envelope(self) -> None:
         """What an agent actually reads is the serialised envelope."""
-        out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(
             cli, "_dispatch", side_effect=ConflictError("stale", details={"a": 1})
-        ), redirect_stdout(out), redirect_stderr(err):
-            cli.main(["--json", "status"])
-        payload = json.loads(out.getvalue() or err.getvalue())
+        ):
+            run = _harness.run_cli(["--json", "status"])
+        payload = json.loads(run.stdout or run.stderr)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "conflict")
         self.assertEqual(payload["error"]["details"], {"a": 1})

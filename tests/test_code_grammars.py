@@ -17,6 +17,11 @@ extracting nothing.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import re
 import tomllib
 import unittest
@@ -125,16 +130,10 @@ class InstallHintTest(unittest.TestCase):
     Upstream pointed every missing-grammar message at a `graphifyy` extra.
     brainskit vendors this code and does not depend on graphifyy, so following
     that instruction installed an unrelated distribution and the file still
-    contributed nothing.
+    contributed nothing. The scan for any vendored string naming graphifyy, and
+    the control proving it fires on what upstream shipped, is
+    `test_vendoring.InstallHintTest`.
     """
-
-    def test_no_user_facing_message_tells_anyone_to_install_graphifyy(self) -> None:
-        offenders = []
-        for path in CODEANALYSIS.rglob("*.py"):
-            for number, line in enumerate(path.read_text("utf-8").splitlines(), 1):
-                if "graphifyy[" in line and not line.lstrip().startswith("#"):
-                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{number}")
-        self.assertEqual(offenders, [], f"still advertising graphifyy: {offenders}")
 
     def test_the_hint_is_derived_from_the_module_the_error_names(self) -> None:
         """Derived, not tabulated, so every grammar gets a correct hint."""
@@ -235,30 +234,52 @@ class DeliberateSkipTest(unittest.TestCase):
         self.assertNotIn("produced zero nodes", stderr.getvalue())
 
     def test_a_genuinely_empty_source_is_still_reported(self) -> None:
-        """The warning must keep firing for what it was actually built for."""
+        """The warning must keep firing for what it was actually built for.
+
+        This used to extract a real `.py` and assert the warning was *absent*,
+        the opposite of its name, and it passed with the warning deleted. No
+        shipped extractor returns an empty, unmarked result for a real file,
+        which is why #1666 calls it an anomaly, so the extractor is replaced
+        with one that does. The unpatched run first is the control: it proves
+        the warning is caused by the empty result and not by the file.
+        """
 
         import io
         import tempfile
         from contextlib import redirect_stderr
+        from unittest import mock
 
-        from graphify.extract import extract
+        import graphify.extract as extract_module
 
-        with tempfile.TemporaryDirectory() as name:
-            root = Path(name)
-            # An extractor accepts .py and emits at least a file node for any
-            # real source, so a result with no nodes and no `skipped` marker is
-            # the anomaly #1666 exists to surface.
-            (root / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        def build(root: Path, cache: str) -> tuple[dict, str]:
             stderr = io.StringIO()
             with redirect_stderr(stderr):
-                result = extract(
+                result = extract_module.extract(
                     [root / "app.py"],
-                    cache_root=root / "cache",
+                    cache_root=root / cache,
                     root=root,
                     parallel=False,
                 )
-        self.assertTrue(result.get("nodes"), "a .py file must produce nodes")
-        self.assertNotIn("produced zero nodes", stderr.getvalue())
+            return result, stderr.getvalue()
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            result, warned = build(root, "control-cache")
+            self.assertTrue(result.get("nodes"), "a .py file must produce nodes")
+            self.assertNotIn("produced zero nodes", warned)
+
+            # A fresh cache: the control's cached nodes would otherwise be
+            # served without the extractor ever being called.
+            with mock.patch.object(
+                extract_module,
+                "_safe_extract_with_xaml_root",
+                return_value={"nodes": [], "edges": []},
+            ):
+                result, warned = build(root, "empty-cache")
+        self.assertEqual(result.get("nodes"), [])
+        self.assertIn("1 source file(s) produced zero nodes", warned)
+        self.assertIn("app.py", warned)
 
 
 class SkipCachingTest(unittest.TestCase):
@@ -332,6 +353,13 @@ class SkipCachingTest(unittest.TestCase):
             _PARALLEL_THRESHOLD,
             extract,
         )
+
+        from brainskit.infrastructure.extractor import _enable_parallel_workers
+
+        # Spawned workers resolve `graphify` only through the shim, which the
+        # production path installs. Run alone, nothing else here had installed
+        # it, every worker died on import, and this failed for that reason.
+        self.assertTrue(_enable_parallel_workers(), "no import shim was installed")
 
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

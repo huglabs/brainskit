@@ -111,7 +111,7 @@ File targets default to `--consumer local`, so an export never emits
 `never-ingest` evidence unless `human` is named deliberately:
 
 ```bash
-bk --vault {{vault}} export --target json      # also graphml, cypher, kuzu, llms-txt
+bk --vault {{vault_arg}} export --target json      # also graphml, cypher, kuzu, llms-txt
 ```
 
 Persistent integrations carry their own configured consumer, and passing

@@ -16,11 +16,18 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from brainskit.application.ports import JobSpecPort, JudgmentPort
+from brainskit.application.ports import (
+    JobSpecPort,
+    JudgmentPort,
+    JudgmentRoute,
+    JudgmentRoutePort,
+)
 from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
+    BrainskitError,
     ModelResponseError,
     NotConfiguredError,
+    PolicyError,
 )
 
 
@@ -105,8 +112,97 @@ class JudgmentRunner:
                 "job": job,
                 "attempts": max_attempts,
                 "failures": last_failures,
+                **self._exhausted_remedy(job=job, branches=branches, attempts=max_attempts),
             },
         )
+
+    def _exhausted_remedy(
+        self, *, job: str, branches: list[str], attempts: int
+    ) -> dict[str, Any]:
+        """Which model kept failing, and the config key that replaces it.
+
+        A small local model is the usual cause: it holds the citation contract
+        on a short source and loses it on a long one, identically on every
+        attempt, so "retry" alone repeats the failure. The route is the one
+        `run` just used; a port that cannot say leaves the hint unnamed.
+        """
+
+        try:
+            route = self.route_for(job=job, branches=branches)
+        except BrainskitError:
+            route = None
+        reroute = (
+            f"route job_models.{job} in .brain/config.json to a larger model"
+        )
+        if route is None:
+            return {"hint": f"The model failed validation {attempts} times; {reroute}"}
+        return {
+            "provider": route.provider,
+            "model": route.model,
+            "hint": (
+                f"{route.provider} model {route.model} failed validation "
+                f"{attempts} times; {reroute}"
+            ),
+        }
+
+    def route_for(self, *, job: str, branches: list[str]) -> JudgmentRoute | None:
+        """Where the configured provider would route `job`, if it can say.
+
+        None for a port that only runs (a substitute), which a caller treats
+        as the strictest route. Refusals propagate: they are the ones `run`
+        would raise for the same arguments.
+        """
+
+        judgment = self.require()
+        if not isinstance(judgment, JudgmentRoutePort):
+            return None
+        return judgment.route_for(job=job, branches=branches)
+
+    def refuse_without_evidence(
+        self, *, job: str, branches: list[str], withheld: int, nothing: str, next_step: str
+    ) -> None:
+        """The router's refusal of an empty bundle, in words that fit it.
+
+        With no evidence, `branches` is the `_inbox` fallback, so a cloud-mapped
+        job on a vault whose inbox is `local-only` was refused as "Local-only
+        content can only be routed to Ollama" -- about content that does not
+        exist. The refusal stands; only what it says changes. A route that
+        accepts the empty bundle returns, and the job runs as it always has.
+        """
+
+        try:
+            self.route_for(job=job, branches=branches)
+        except PolicyError as exc:
+            hint = next_step
+            if exc.details.get("privacy") == "local-only":
+                hint += (
+                    "; with no evidence the job routes under the _inbox policy, "
+                    "which is local-only, so to run it anyway map "
+                    f"job_models.{job}.local-only to a local provider"
+                )
+            raise PolicyError(
+                f"{nothing}, and nothing was sent to any model",
+                details={"job": job, "withheld_sources": withheld, "hint": hint},
+            ) from exc
+
+    def consumer_for(self, *, job: str, branches: list[str]) -> str:
+        """The boundary of the model `job` reaches over `local`-visible branches.
+
+        The router answers, not a copy of it: `local` only when it routes those
+        branches to a model on this machine. Its privacy refusal means the job
+        is mapped to a cloud provider for this evidence, and a port that cannot
+        say is assumed to be one -- both answer `cloud`, which only ever
+        narrows. A caller reads its evidence again under the answer, and `run`
+        routes that narrower bundle itself, so the refusal still stands behind
+        it. Refusals that are not about privacy (`NotConfiguredError`)
+        propagate before any prompt exists.
+        """
+
+        try:
+            route = self.route_for(job=job, branches=branches)
+        except PolicyError:
+            return "cloud"
+        return "local" if route is not None and route.local else "cloud"
 
     def require(self) -> JudgmentPort:
         """The configured provider, or a clear error naming what is missing."""

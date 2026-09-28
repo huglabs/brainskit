@@ -16,6 +16,11 @@ pinned here:
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import unittest
 from pathlib import Path

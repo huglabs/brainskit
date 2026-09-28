@@ -37,6 +37,24 @@ uv tool install 'brainskit[code-all]'   # every language, a much larger download
 The split is deliberate — grammars are compiled wheels, and `code-all` roughly
 triples an already large install for languages most repositories do not contain.
 
+`bk doctor` judges the grammars by the same split. It reports
+`code.grammars_state` as one of three values:
+
+| `grammars_state` | Meaning | Counts against `healthy` |
+|---|---|---|
+| `absent` | no grammar installed — the extra is optional | no |
+| `complete` | every `[code]` grammar is present; any subset of the `code-all` ones is fine, because `bk code build` installs those one at a time | no |
+| `partial` | some `[code]` grammars present and some not, listed in `grammars_broken` | yes |
+
+A grammar outside its pinned version range (`grammars_outdated`) also makes
+the install unhealthy, because both are ways a build that reports success
+loses a language. A vault that uses a code graph (built, or `code_root`
+configured) on a machine with no grammar is reported as
+`code.graph_without_grammars`, not as unhealthy. `bk code build` refuses loudly
+there with the install command, and the stored graph still answers queries.
+`extras_complete` names the extras that are fully installed, and the human
+output shows it beside the count (`13/29 (code extra complete)`).
+
 ## Commands
 
 ```bash
@@ -58,8 +76,8 @@ Five states, and only three of them are about freshness:
 | state | meaning | remedy |
 |---|---|---|
 | `fresh` | the recorded file digests all still match | — |
-| `stale` | a file the graph indexed changed or was removed | `bk code import <graph.json>` |
-| `missing` | there is no graph on disk, or what is there is not a JSON object | `bk code import <graph.json>` |
+| `stale` | a file the graph indexed changed or was removed | `bk code build` (or `bk code import` again, if an external extractor produced it) |
+| `missing` | there is no graph on disk, or what is there is not a JSON object | `bk code build` |
 | `partial` | fresh, but a grammar was absent so a whole language went unindexed | install the named grammar, then rebuild |
 | `malformed` | the graph parses but cannot be traversed | `bk code build` |
 
@@ -79,8 +97,11 @@ no graph, from the same two functions.
 
 It is a report, not a failure. `bk code status` exits 0 and its `--json`
 envelope is `{"ok": true, ...}` in every state, the same as `stale` and
-`missing` — `ok` says the command answered, and the answer is in `state`. Only
-`bk lint` and `bk vaults sync` turn a finding into a non-zero exit.
+`missing` — `ok` says the command succeeded, and a report that answered has
+succeeded; the answer is in `state`. Only `bk lint`, `bk vaults sync` and a
+failed `bk update --yes` turn their result into a failure, and for those the
+envelope's `ok` is `false` and the exit status is 1 together — both are read
+from one rule, `succeeded()` in `interfaces/errors.py`.
 
 The remedy for `malformed` is a **full** `bk code build`, never a scoped one: a
 scoped build merges into the stored graph and would carry the fault forward,
@@ -95,7 +116,12 @@ for a vault that sits at the top of the repository it documents — the same
 absent-versus-empty rule the `ignore` patterns follow. The vault's own
 directories are excluded from the graph: an extractor pointed at the repository
 has no idea one of those folders is the vault asking the question, and left in
-they arrive as the most connected nodes in it.
+they arrive as the most connected nodes in it. When the vault *is* the code root
+— a vault outside any repository, or one configured with `code_root: ""` — its
+own directories (`raw/`, `wiki/`, `views/`, `graph/`, `output/`, `.brain/`) and
+the hook scripts `bk hooks install` wrote beside them are excluded by name, so a
+vault with nothing else in it builds nothing and says where to point
+`code_root`.
 
 Given explicit `PATH`s, `build` merges that subset into the stored graph
 instead of replacing it, so a scoped re-extraction does not shrink the graph to
@@ -149,3 +175,4 @@ Coverage numbers are in [Benchmarks](./benchmarks.md).
 - Created: 2026-08-13 11:32
 - Updated: 2026-08-13 13:04
 - Updated: 2026-08-13 13:05
+- Updated: 2026-09-27

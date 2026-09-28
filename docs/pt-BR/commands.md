@@ -33,7 +33,7 @@ muda para saída legível por máquina.
 | `integration configure\|status\|up\|down\|sync NAME` | Ciclo de vida de integração persistente |
 | `vaults register\|list\|forget\|sync` | Os vaults nesta máquina, sincronizados em um armazenamento compartilhado |
 | `web serve [--host H] [--port P] [--consumer C] [--token-env V]` | Visualizador web em primeiro plano |
-| `serve --mcp [--transport stdio\|http] …` | Transportes MCP |
+| `serve --mcp [--transport stdio\|http] [--consumer cloud\|local] …` | Transportes MCP; toda chamada responde sob `--consumer` (padrão `cloud`, `human` recusado) |
 | `watch [--once] [--interval S]` | Capturar novos arquivos nas pastas de origem configuradas, menos `ignore` |
 | `schedule` | Mostrar registros de trabalho de hábito configurados |
 | `hooks install --agent claude\|codex\|gemini\|opencode [--force]` | Instalar o contrato do agente |
