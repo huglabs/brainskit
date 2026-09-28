@@ -1,0 +1,26 @@
+# Brainskit owns the vault and its policy. DSH owns this stdio child lifecycle.
+- insert:
+    - id: memory-brainskit-policy
+      name: dsh-brainskit
+
+    - id: memory-brainskit
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: brainskit
+        transport: stdio
+        command: !!js process.env.BRAINSKIT_COMMAND || 'bk'
+        args:
+          - --vault
+          - !!js process.env.BRAINSKIT_VAULT || process.cwd() + '/.brainkit'
+          - serve
+          - --mcp
+          - --transport
+          - stdio
+        cwd: !!js process.cwd()
+        toolCallTimeoutMs: 120000
+        failOnStartupError: !!js process.env.BRAINSKIT_FAIL_ON_STARTUP_ERROR === '1'
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10

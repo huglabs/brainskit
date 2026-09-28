@@ -225,6 +225,7 @@ se um arquivo está rodando.
 | [Enriquecimento](./docs/pt-BR/enrichment.md) | Arestas propostas pelo modelo, e as regras que tornam uma admissível |
 | [Integrações persistentes](./docs/pt-BR/integrations.md) | Obsidian, Neo4j, PostgreSQL, muitos vaults em uma loja |
 | [Servindo um vault](./docs/pt-BR/serving.md) | O visualizador web local, e MCP sobre stdio ou HTTP |
+| [Plugin do DeepSeek Harness](./plugins/dsh-brainskit/README.pt-BR.md) | Conecte um vault local ao DSH pelo cliente MCP oficial |
 | [Agentes de codificação](./docs/pt-BR/agents.md) | `bk hooks install`, e provando que o portão de escrita realmente guarda |
 | [Arquitetura](./docs/pt-BR/architecture.md) | Camadas, módulos da aplicação, roteamento de julgamento |
 | [Benchmarks](./docs/pt-BR/benchmarks.md) | Cobertura de código-grafo e recuperação LOCOMO |
