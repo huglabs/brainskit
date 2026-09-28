@@ -31,6 +31,7 @@ Stdlib only, like the gate: the write gate imports `adapter_path` from here.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -256,3 +257,17 @@ def redirected_git_hooks_path(root: Path) -> Path | None:
     except OSError:
         same = hooks == default
     return None if same else hooks
+
+
+def redirected_hooks_hint(vault: Path, hooks: Path) -> str:
+    """What to do when `core.hooksPath` sends git to `hooks`.
+
+    A reinstall writes nothing there, so the lint has to be merged into the
+    hook git does run. One wording, shared by the installer's refusal, `bk
+    status` and `bk doctor`, so the three cannot drift apart.
+    """
+
+    return (
+        f"Add `bk --vault {shlex.quote(str(vault))} lint --changed` to "
+        f"{hooks / 'pre-commit'} and commit it"
+    )

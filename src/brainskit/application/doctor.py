@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from brainskit.application.codegraph import CODE_PROJECTION
-from brainskit.application.install import COMMIT_LINT, WRITE_GATE
+from brainskit.application.install import COMMIT_LINT, DEFAULT_GIT_HOOKS, WRITE_GATE
 from brainskit.application.installer import (
     is_generated_pre_commit,
     pre_commit_lints,
@@ -369,14 +369,18 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
     if entry is not None and entry.get("workspace_missing"):
         return _workspace_missing(entry)
     script = Path(entry["script"]) if entry and entry.get("script") else None
-    if entry is None or script is None or not script.is_file():
+    registration = entry.get("registration") if entry else None
+    registered = isinstance(registration, dict) and bool(registration.get("command"))
+    # "Absent" means nothing will run: no script and no registration. A deleted
+    # script whose registration remains is still run by the agent -- and fails.
+    if entry is None or script is None or not (script.is_file() or registered):
         return {
             "state": "absent",
             "detail": "no write-gate hook is installed; nothing to exercise",
         }
+    missing = not script.is_file()
 
-    registration = entry.get("registration")
-    if isinstance(registration, dict) and registration.get("command"):
+    if isinstance(registration, dict) and registered:
         argv = _registered_argv(registration)
         exercised = "registered_command"
     else:
@@ -403,7 +407,16 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
     denies_gated = denied_status == 2
     allows_ordinary = allowed_status == 0
 
-    if denied_status is None or allowed_status is None:
+    if missing and not denies_gated:
+        # Claude Code treats neither a shell's 127 nor a spawn failure as a
+        # block, so an unrunnable registration fails open rather than unknown.
+        state = "not_enforcing"
+        said = _first_line(denied_note) or f"exit {denied_status}"
+        detail = (
+            f"{script.name} is missing but still registered, so the registered "
+            f"command cannot run ({said}); every write to wiki/ goes through"
+        )
+    elif denied_status is None or allowed_status is None:
         state, detail = "unknown", f"the hook could not be run: {denied_note or allowed_note}"
     elif denies_gated and allows_ordinary:
         state, detail = "enforcing", f"a write to wiki/ is refused (exit {denied_status})"
@@ -433,6 +446,8 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
     note = denied_note or allowed_note
     if note and state != "enforcing":
         report["hook_said"] = note
+    if entry.get("hint") and state != "enforcing":
+        report["hint"] = entry["hint"]
     if isinstance(registration, dict) and exercised == "registered_command":
         report["command"] = str(registration["command"])
     return report
@@ -491,6 +506,9 @@ def probe_commit_lint(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[st
         return _workspace_missing(entry)
     hook = Path(entry["script"]) if entry else None
     if entry is None or hook is None or not hook.is_file():
+        stranded = _stranded_pre_commit(entry, hook)
+        if stranded is not None:
+            return stranded
         return {
             "state": "absent",
             "detail": "no pre-commit hook is installed; nothing to exercise",
@@ -556,6 +574,45 @@ def probe_commit_lint(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[st
             report["hook_said"] = said
         if entry.get("hint"):
             report["hint"] = entry["hint"]
+    return report
+
+
+def _stranded_pre_commit(
+    entry: Mapping[str, Any] | None, hook: Path | None
+) -> dict[str, Any] | None:
+    """A brainskit hook in `.git/hooks` that `core.hooksPath` leaves unrun.
+
+    Git runs `hook`, which is missing; the generated hook sits in the default
+    directory git no longer reads. `bk status` reads that layer inactive, so
+    calling it `absent` here would make the two reports disagree.
+    """
+
+    if entry is None or hook is None or not entry.get("workspace"):
+        return None
+    workspace = Path(entry["workspace"])
+    default = workspace / DEFAULT_GIT_HOOKS / "pre-commit"
+    try:
+        if hook.parent.resolve() == default.parent.resolve():
+            return None
+        content = default.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not is_generated_pre_commit(content):
+        return None
+    try:
+        shown: Path = hook.parent.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        shown = hook.parent
+    report: dict[str, Any] = {
+        "script": str(default),
+        "state": "not_enforcing",
+        "detail": (
+            f"git runs hooks from {shown}, which has no pre-commit; "
+            f"brainskit's hook in {DEFAULT_GIT_HOOKS} is never run"
+        ),
+    }
+    if entry.get("hint"):
+        report["hint"] = entry["hint"]
     return report
 
 

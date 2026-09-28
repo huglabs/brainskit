@@ -340,6 +340,7 @@ class RegistryFilePermissionsTest(RegistryFixture):
             (self.config_home / "brainskit" / "vaults.json").read_text(encoding="utf-8")
         )
         self.assertEqual(raw["version"], 1)
+        self.assertEqual([entry["path"] for entry in raw["vaults"]], [str(root)])
         for entry in raw["vaults"]:
             self.assertEqual(sorted(entry), ["label", "path"])
 

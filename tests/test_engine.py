@@ -358,6 +358,24 @@ class EngineTest(unittest.TestCase):
             {finding["code"] for finding in result["findings"]},
         )
 
+    def test_lint_reports_an_unregistered_raw_file_until_reconciled(self) -> None:
+        """Also the control for the forget tests above, which assert this
+        finding is *absent*: without it they pass with the check deleted."""
+
+        dropped = self.root / "raw/20-research/dropped-in.md"
+        dropped.write_text("Arrived without bk capture.", encoding="utf-8")
+        findings = [
+            (finding["code"], finding.get("path"))
+            for finding in self.service.lint()["findings"]
+        ]
+        self.assertIn(
+            ("registry.untracked_file", "raw/20-research/dropped-in.md"), findings
+        )
+
+        self.assertEqual(self.service.reconcile()["added"], 1)
+        codes = {finding["code"] for finding in self.service.lint()["findings"]}
+        self.assertNotIn("registry.untracked_file", codes)
+
     def test_apply_honors_human_owned_schema(self) -> None:
         schema_path = self.root / ".brain/schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -560,6 +578,34 @@ class EngineTest(unittest.TestCase):
         update["operations"][0]["base_hash"] = current_hash
         applied = self.service.apply(update)
         self.assertEqual(applied["applied"], 1)
+
+    def test_apply_refuses_a_source_that_was_never_captured(self) -> None:
+        # Declared and cited consistently, so the citation check is satisfied
+        # and only the registry lookup stands between this and a page whose
+        # provenance nothing can re-verify.
+        uncaptured = "a" * 64
+        proposal = {
+            "operations": [
+                {
+                    "action": "upsert",
+                    "kind": "concept",
+                    "slug": "unbacked",
+                    "title": "Unbacked",
+                    "aliases": [],
+                    "source_hashes": [uncaptured],
+                    "body": f"A claim.[^source:{uncaptured}]",
+                    "links": [],
+                }
+            ],
+        }
+        with self.assertRaises(ValidationError) as refused:
+            self.service.apply(proposal)
+        failures = refused.exception.details["failures"]
+        self.assertEqual(
+            [(failure["code"], failure.get("values")) for failure in failures],
+            [("unknown_sources", [uncaptured])],
+        )
+        self.assertIsNone(self.vault.wiki_version("wiki/concepts/unbacked.md"))
 
     def test_incomplete_apply_journal_rolls_back_on_open(self) -> None:
         captured = self.service.capture(None, text="Evidence", title="Evidence")
@@ -3262,6 +3308,150 @@ class JudgmentReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
         result = service.ask("platform team")
         self.assertEqual(result["withheld_sources"], 1)
         self._assert_no_local_only(json.dumps(fake.variables, ensure_ascii=False))
+
+
+class EmptyEvidenceRefusalSaysWhyTest(unittest.TestCase):
+    """A cloud-mapped job with no evidence is refused in words that fit it.
+
+    With nothing to route, the router falls back to the `_inbox` policy, and
+    on a vault whose inbox is `local-only` it refused with "Local-only content
+    can only be routed to Ollama" -- about content that does not exist. The
+    refusal stands (no privacy semantics change); it now says nothing matched
+    or nothing permissible remained, that no model was reached, and what to do.
+    `_inbox` was already named by the old refusal's `branches` detail.
+    """
+
+    PRIVATE_TEXT = "Unrelated local-only memo xylophone-delta."
+    PRIVATE_TITLE = "Quarterly memo"
+    CLOUD: ClassVar[dict] = {"provider": "openai", "model": "m"}
+
+    def _vault(self, job: str, *, seed_private: bool = True) -> BrainskitService:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        raw = policy()
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"][job] = self.CLOUD
+        vault = FileVault.initialize(Path(temporary.name), raw)
+        index = SqliteFtsIndex(vault.index_path)
+        seed = BrainskitService(vault, index, graph=MarkdownGraph())
+        self.private_hash = ""
+        if seed_private:
+            captured = seed.capture(None, text=self.PRIVATE_TEXT, title=self.PRIVATE_TITLE)
+            self.private_hash = captured["source"]["content_hash"]
+            seed.file(self.private_hash, "20-research")
+        return BrainskitService(
+            vault,
+            index,
+            judgment=PolicyJudgmentRouter(vault.config(), JobSpecs()),
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+
+    def _refusal(self, service: BrainskitService, call) -> tuple[PolicyError, list[str]]:
+        providers: list[str] = []
+
+        def create_driver(name, config):
+            providers.append(name)
+            return _RecordingDriver({})
+
+        with (
+            mock.patch("brainskit.infrastructure.llm._create_driver", create_driver),
+            self.assertRaises(PolicyError) as caught,
+        ):
+            call(service)
+        return caught.exception, providers
+
+    def _assert_actionable(self, error: PolicyError, job: str, opening: str) -> None:
+        self.assertEqual(error.code, "policy_denied")
+        message = str(error)
+        self.assertTrue(message.startswith(opening), message)
+        self.assertIn("nothing was sent to any model", message)
+        self.assertNotIn("Ollama", message)
+        hint = error.details["hint"]
+        self.assertIn(f"job_models.{job}.local-only", hint)
+        self.assertIn("_inbox policy, which is local-only", hint)
+        disclosed = json.dumps(
+            {"message": message, "details": error.details}, ensure_ascii=False
+        )
+        for private in ("xylophone-delta", self.PRIVATE_TITLE, "20-research"):
+            self.assertNotIn(private, disclosed)
+        if self.private_hash:
+            self.assertNotIn(self.private_hash, disclosed)
+
+    def test_ask_with_nothing_matched(self) -> None:
+        error, providers = self._refusal(
+            self._vault("query"), lambda service: service.ask("kubernetes autoscaling")
+        )
+        self.assertEqual(providers, [])
+        self._assert_actionable(error, "query", "Nothing in the vault matched")
+        self.assertEqual(error.details["withheld_sources"], 0)
+        self.assertIn("Rephrase", error.details["hint"])
+        self.assertIn("bk search", error.details["hint"])
+
+    def test_resurface_with_nothing_matched(self) -> None:
+        error, providers = self._refusal(
+            self._vault("resurface"), lambda service: service.jobs_runner.resurface()
+        )
+        self.assertEqual(providers, [])
+        self._assert_actionable(error, "resurface", "Nothing in the vault matched")
+        self.assertIn("bk search", error.details["hint"])
+
+    def test_semantic_lint_with_nothing_matched(self) -> None:
+        error, providers = self._refusal(
+            self._vault("lint-semantic"), lambda service: service.lint(semantic=True)
+        )
+        self.assertEqual(providers, [])
+        self._assert_actionable(error, "lint-semantic", "No page in the vault matched")
+        self.assertIn("without --semantic", error.details["hint"])
+
+    def test_digest_of_an_empty_vault(self) -> None:
+        error, providers = self._refusal(
+            self._vault("digest", seed_private=False), lambda service: service.digest()
+        )
+        self.assertEqual(providers, [])
+        self._assert_actionable(error, "digest", "The vault has no recent source")
+        self.assertEqual(error.details["withheld_sources"], 0)
+
+    def test_digest_whose_recent_sources_are_all_local_only(self) -> None:
+        error, providers = self._refusal(
+            self._vault("digest"), lambda service: service.digest()
+        )
+        self.assertEqual(providers, [])
+        self._assert_actionable(
+            error, "digest", "No recent source a model may read remained"
+        )
+        self.assertEqual(error.details["withheld_sources"], 1)
+        self.assertIn("bk search", error.details["hint"])
+
+    def test_a_cloud_inbox_still_lets_the_model_say_nothing_matched(self) -> None:
+        """Control: the refusal is the router's, not a new one."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        raw = policy()
+        raw["inbox_policy"]["privacy"] = "cloud"
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"]["query"] = self.CLOUD
+        vault = FileVault.initialize(Path(temporary.name), raw)
+        service = BrainskitService(
+            vault,
+            SqliteFtsIndex(vault.index_path),
+            judgment=PolicyJudgmentRouter(vault.config(), JobSpecs()),
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+        driver = _RecordingDriver({"answer": "x", "citations": [], "uncertainty": ""})
+        with mock.patch(
+            "brainskit.infrastructure.llm._create_driver", return_value=driver
+        ):
+            result = service.ask("kubernetes autoscaling")
+        self.assertEqual(result["answer"], "x")
+        self.assertEqual(len(driver.prompts), 1)
 
 
 class WebAskHistoryTest(unittest.TestCase):

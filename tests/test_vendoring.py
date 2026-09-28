@@ -59,12 +59,14 @@ except ImportError:
 
 import fnmatch
 import hashlib
+import io
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import textwrap
+import tokenize
 import tomllib
 import types
 import unittest
@@ -452,16 +454,96 @@ class CacheMarkerTest(unittest.TestCase):
         self.assertNotEqual(before, after)
 
 
+#: The strings upstream actually shipped, as vendored in 2c7d1fb and removed in
+#: f2c3779. A re-vendor brings them back verbatim, so they are the regression.
+UPSTREAM_GRAPHIFYY_HINTS = (
+    'skipped_sensitive.append(str(p) + " [office conversion failed - pip install graphifyy[office]]")',
+    "_hint = f' Install it with: pip install \"graphifyy[{_extra}]\"'",
+    'raise RuntimeError("Google Sheets export requires the office extra: pip install graphifyy[office,google]")',
+)
+
+#: String literals that name the distribution without telling anyone to install
+#: it: `cache.py` asks `importlib.metadata` for its version, which is a lookup.
+GRAPHIFYY_LOOKUPS = {("cache.py", '"graphifyy"')}
+
+
+def _graphifyy_literals(path: Path) -> list[tuple[int, str]]:
+    """Every string-literal token in `path` that mentions graphifyy.
+
+    Tokens rather than lines, so a trailing comment is not an offender and a
+    string is one wherever it sits on its line. On 3.12+ an f-string's literal
+    text arrives as FSTRING_MIDDLE; on 3.11 the whole f-string is one STRING.
+    """
+
+    kinds = {tokenize.STRING}
+    if hasattr(tokenize, "FSTRING_MIDDLE"):
+        kinds.add(tokenize.FSTRING_MIDDLE)
+    source = path.read_text(encoding="utf-8")
+    return [
+        (token.start[0], token.string)
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type in kinds and "graphifyy" in token.string.lower()
+    ]
+
+
+def _graphifyy_offenders(root: Path) -> tuple[list[str], int]:
+    offenders = []
+    scanned = 0
+    for path in sorted(root.rglob("*.py")):
+        scanned += 1
+        for number, literal in _graphifyy_literals(path):
+            if (path.name, literal) not in GRAPHIFYY_LOOKUPS:
+                offenders.append(f"{path.relative_to(root).as_posix()}:{number}")
+    return offenders, scanned
+
+
 class InstallHintTest(unittest.TestCase):
+    """No vendored string may send a brainskit user to `graphifyy`.
+
+    brainskit does not depend on that distribution, so following such a hint
+    installs something unrelated while the grammar or extra stays missing. The
+    old needle, `"graphifyy["`, did match all three upstream strings, but it
+    was never shown to: absent from the tree, it passed whatever the scan did.
+    The control below runs the same scan over those strings, so the guard is
+    known to fire, and the needle is any string literal naming the package,
+    which also covers an unbracketed `pip install graphifyy`.
+    """
+
     def test_no_vendored_string_points_at_graphifyy(self) -> None:
-        offenders = []
-        for path in sorted(VENDORED.rglob("*.py")):
-            for number, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), 1
-            ):
-                if "graphifyy[" in line and not line.lstrip().startswith("#"):
-                    offenders.append(f"{path.name}:{number}")
+        offenders, scanned = _graphifyy_offenders(VENDORED)
+        self.assertEqual(scanned, len(VENDORED_SOURCE))
         self.assertEqual(offenders, [], f"still advertising graphifyy: {offenders}")
+
+    def test_the_scan_catches_every_string_upstream_shipped(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for index, line in enumerate(UPSTREAM_GRAPHIFYY_HINTS):
+                (root / f"hint_{index}.py").write_text(line + "\n", encoding="utf-8")
+            (root / "bare.py").write_text(
+                'print("pip install graphifyy")\n', encoding="utf-8"
+            )
+            (root / "comment.py").write_text(
+                "x = 1  # upstream said pip install graphifyy[office]\n",
+                encoding="utf-8",
+            )
+            offenders, scanned = _graphifyy_offenders(root)
+        self.assertEqual(scanned, len(UPSTREAM_GRAPHIFYY_HINTS) + 2)
+        self.assertEqual(
+            sorted(offenders),
+            sorted(
+                [f"hint_{index}.py:1" for index in range(len(UPSTREAM_GRAPHIFYY_HINTS))]
+                + ["bare.py:1"]
+            ),
+        )
+
+    def test_every_allowed_lookup_is_still_in_the_tree(self) -> None:
+        # A stale exemption is a hole the next edit can walk through unseen.
+        present = {
+            (path.name, literal)
+            for path in VENDORED.rglob("*.py")
+            for _, literal in _graphifyy_literals(path)
+        }
+        self.assertEqual(GRAPHIFYY_LOOKUPS - present, set())
 
 
 class VendoredAnalysisIsUnreachableTest(unittest.TestCase):

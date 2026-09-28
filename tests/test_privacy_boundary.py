@@ -286,6 +286,39 @@ class EvidenceTest(BoundaryFixture):
         self.assertFalse(boundary.allows_evidence(hit))
         self.assertTrue(for_consumer("human", self.vault).allows_evidence(hit))
 
+    def test_a_partially_resolving_page_is_never_ingest(self) -> None:
+        """The hash that went missing could have been the restricted one.
+
+        With every hash unresolved the empty fold already answers
+        never-ingest, so only a page whose *other* sources are cloud tells
+        this rule apart from folding over what did resolve.
+        """
+
+        forgotten = "f" * 64
+        page = (
+            "---\ntitle: Page\nsources:\n"
+            f"  - {self.cloud_hash}\n  - {forgotten}\n---\n\nBody.\n"
+        )
+        boundary = for_consumer("cloud", self.vault)
+        hit = {"path": "wiki/concepts/mixed.md"}
+        self.assertIs(PrivacyMode.NEVER_INGEST, boundary.evidence_privacy(hit, page))
+        self.assertFalse(for_consumer("local", self.vault).allows_evidence(hit, page))
+        resolved_only = page.replace(f"  - {forgotten}\n", "")
+        self.assertIs(PrivacyMode.CLOUD, boundary.evidence_privacy(hit, resolved_only))
+
+    def test_unreadable_provenance_is_never_ingest(self) -> None:
+        """`sources` present but not a list is declared provenance nobody can
+        read, which is not the same page as one that declares none."""
+
+        boundary = for_consumer("cloud", self.vault)
+        hit = {"path": "wiki/concepts/odd.md"}
+        unreadable = f"---\ntitle: Page\nsources: {self.cloud_hash}\n---\n\nBody.\n"
+        undeclared = "---\ntitle: Page\n---\n\nBody.\n"
+        self.assertIs(
+            PrivacyMode.NEVER_INGEST, boundary.evidence_privacy(hit, unreadable)
+        )
+        self.assertIs(PrivacyMode.CLOUD, boundary.evidence_privacy(hit, undeclared))
+
     def test_evidence_branches_resolves_cited_sources(self) -> None:
         boundary = for_consumer("local", self.vault)
         hit = {"content_hash": self.local_hash, "path": "raw/20-research/x.md"}

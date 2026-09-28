@@ -935,7 +935,11 @@ class StatusBlockTest(ProjectionFixture):
 
     def test_each_entry_carries_the_contracted_fields(self) -> None:
         self.service.graph()
-        for artifact, report in self.projections().items():
+        projections = self.projections()
+        self.assertEqual(
+            set(projections), {GRAPH_PROJECTION, VIEWS_PROJECTION, CODE_PROJECTION}
+        )
+        for artifact, report in projections.items():
             with self.subTest(artifact=artifact):
                 self.assertIn("generated_at", report)
                 self.assertIn("stale", report)
@@ -1131,6 +1135,9 @@ class SeededPageDriftTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        # Every test below loops over the constant; were it empty they would all
+        # pass, and so would the drift check, against an init that seeds nothing.
+        self.assertEqual(SEEDED_SYSTEM_PAGES, {"wiki/index.md", "wiki/log.md"})
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.vault = FileVault.initialize(self.root, policy())

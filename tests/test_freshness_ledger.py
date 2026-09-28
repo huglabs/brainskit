@@ -24,6 +24,7 @@ except ImportError:
 
 import sys
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,61 @@ class NeverDowngradeTest(FreshnessLedgerFixture):
         )
         self.capture_related()
         self.assertEqual(self.entry(fresh)["status"], "review")
+
+
+class ReviewIsNotAgedTest(FreshnessLedgerFixture):
+    """A page a human was asked to look at stays in that queue.
+
+    Ageing it would overwrite the request: past the threshold `review` became
+    `stale` and the `review_reason` stopped describing the page's status.
+    """
+
+    def test_an_old_page_under_review_stays_under_review(self) -> None:
+        page = self.upsert_page(
+            "memoria-compilada",
+            "Memoria compilada",
+            f"{_SHARED_PROSE} ",
+            self.source,
+        )
+        self.capture_related()
+        self.assertEqual(self.entry(page)["status"], "review")
+
+        def backdate(state: dict[str, Any]) -> dict[str, Any]:
+            state["pages"][page]["updated_at"] = "2000-01-01T00:00:00+00:00"
+            return state
+
+        self.vault.mutate_state("freshness", backdate)
+        self.service.lint()
+        self.assertEqual(self.entry(page)["status"], "review")
+
+
+class StaleThresholdTest(FreshnessLedgerFixture):
+    """`stale_after_days: N` means a page N days old is stale, not N + 1."""
+
+    def test_the_threshold_day_is_stale_and_the_day_before_is_fresh(self) -> None:
+        page = self.upsert_page(
+            "memoria-compilada",
+            "Memoria compilada",
+            f"{_SHARED_PROSE} ",
+            self.source,
+        )
+        threshold = self.vault.config().novelty.stale_after_days
+        for age, expected in ((threshold - 1, "fresh"), (threshold, "stale")):
+            with self.subTest(age_days=age):
+                # An hour past the day boundary, so the clock moving during
+                # the test cannot change the whole-day count.
+                updated = datetime.now(UTC) - timedelta(days=age, hours=1)
+
+                def backdate(
+                    state: dict[str, Any], stamp: str = updated.isoformat()
+                ) -> dict[str, Any]:
+                    state["pages"][page]["updated_at"] = stamp
+                    return state
+
+                self.vault.mutate_state("freshness", backdate)
+                self.service.lint()
+                self.assertEqual(self.entry(page)["age_days"], age)
+                self.assertEqual(self.entry(page)["status"], expected)
 
 
 class AnnotationDoesNotLaunderTest(FreshnessLedgerFixture):

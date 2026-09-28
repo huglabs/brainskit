@@ -209,7 +209,11 @@ class PolicyJudgmentRouter:
         if effective_privacy == PrivacyMode.LOCAL_ONLY and not local:
             raise PolicyError(
                 "Local-only content can only be routed to Ollama",
-                details={"branches": sorted(policies), "provider": provider_name},
+                details={
+                    "branches": sorted(policies),
+                    "provider": provider_name,
+                    "privacy": effective_privacy.value,
+                },
             )
         return JudgmentRoute(provider=str(provider_name), model=str(model), local=local)
 

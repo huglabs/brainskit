@@ -50,7 +50,14 @@ whole call. A privacy-keyed mapping (`job_models.<job>.local-only` → Ollama)
 still sends `local-only` evidence to the local model. The result carries
 `withheld_sources` — a count, never a name. When every match was withheld, the
 job refuses with `policy_denied` and a hint instead of calling a model; the
-router's own refusal remains as the last line of defence. For `digest` the
+router's own refusal remains as the last line of defence. When nothing matched
+at all, there is no branch to route by, and the router falls back to the
+`_inbox` policy. If that route is refused (a cloud-mapped job on a vault whose
+inbox is `local-only`), `ask`, `resurface`, `digest` and `lint --semantic` say
+so: nothing in the vault matched, or nothing a model may read remained, and
+nothing was sent to any model. The refusal is still `policy_denied`, and its
+hint suggests rephrasing, `bk search`, or mapping `job_models.<job>.local-only`
+to a local provider. For `digest` the
 same boundary also governs the metadata it sends: branch names, freshness
 entries for pages compiled from withheld or unresolvable sources, and filing
 proposals for such sources are dropped and counted in `withheld_sources`; on a

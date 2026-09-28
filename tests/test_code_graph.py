@@ -574,6 +574,28 @@ class MalformedStatusTest(MalformedFixture):
         self.corrupt("an edge with no type")
         self.assertIs(self.service.code_status()["stale"], True)
 
+    def test_a_graph_with_no_readable_input_set_is_stale(self) -> None:
+        # Traversable, so not malformed, but with nothing to compare against
+        # the tree it cannot be verified -- and the one answer it must not give
+        # a terse caller is `stale: False`.
+        # A missing key is the same situation as an unreadable one: `import`
+        # always writes `files`, so its absence means the artefact was altered.
+        absent = object()
+        for files in (absent, None, ["src/db.ts"], "src/db.ts"):
+            with self.subTest(files="<absent>" if files is absent else files):
+                self.service.code_import(self.payload())
+                stored = self.graph_file()
+                if files is absent:
+                    del stored["files"]
+                else:
+                    stored["files"] = files
+                (self.vault.root / CODE_PROJECTION).write_text(
+                    json.dumps(stored), encoding="utf-8"
+                )
+                verdict = self.service.code_status()
+                self.assertEqual(verdict["state"], "stale")
+                self.assertIs(verdict["stale"], True)
+
     def test_a_sound_graph_still_reports_fresh(self) -> None:
         # The control. A detector that fired on everything would satisfy every
         # assertion above while making `status` useless.

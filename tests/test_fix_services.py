@@ -447,7 +447,9 @@ class RelatedCaptureFreshnessTest(ServiceFixture):
             "Memoria compilada e recuperacao incremental organizam o "
             "conhecimento e o indice antes da consulta.\n",
         )
-        for path in self.marked_for_review():
+        marked = self.marked_for_review()
+        self.assertEqual(set(marked), {self.memoria, self.recuperacao})
+        for path in marked:
             self.assertTrue(path.startswith("wiki/"))
 
     def test_the_marked_page_count_is_capped(self) -> None:
@@ -779,8 +781,7 @@ class WatchIgnoreTest(unittest.TestCase):
         service.watch_once()
         first = service.watch_once()
         self.assertEqual(first["created"], 0)
-        for record in vault.registry().values():
-            self.assertNotIn("/brain/", record.original_name)
+        self.assertEqual(self.captured(service), ["README.md", "note.md"])
 
     def test_a_configured_file_is_captured_directly(self) -> None:
         raw = policy()
@@ -1058,6 +1059,8 @@ class UnconfiguredBranchRaisesPolicyErrorTest(ServiceFixture):
                     self.assertIn("personal", json.dumps(policy_error.details))
                 except KeyError as leaked:  # pragma: no cover - the defect
                     self.fail(f"{name} leaked a bare KeyError: {leaked!r}")
+                else:
+                    self.fail(f"{name} read the unconfigured branch without refusing")
 
     def test_the_error_is_a_brainskit_error_so_the_envelope_holds(self) -> None:
         """The point of the fix: it must reach the JSON envelope and exit codes."""
@@ -1188,12 +1191,23 @@ class SearchHonoursItsLimitTest(ServiceFixture):
                 result = self.service.search("produto", limit, consumer="human")
                 self.assertEqual(result["count"], limit)
                 self.assertEqual(len(result["hits"]), limit)
+                # Below 4 no slot is reserved for expansion. Reserving one
+                # anyway keeps the count right at 2 and 3 while trading a
+                # direct match for a neighbour, so the count alone cannot tell.
+                self.assertEqual(
+                    [hit["kind"] for hit in result["hits"] if hit["kind"] == "wiki-neighbor"],
+                    [],
+                )
 
     def test_a_larger_limit_still_leaves_room_for_graph_expansion(self) -> None:
         """Control: the fix must bound the expansion, not delete it."""
 
         result = self.service.search("produto", 6, consumer="human")
-        self.assertLessEqual(result["count"], 6)
+        self.assertEqual(result["count"], 6)
+        self.assertEqual(
+            [hit["path"] for hit in result["hits"] if hit["kind"] == "wiki-neighbor"],
+            ["wiki/concepts/produto-0.md"],
+        )
 
 
 class GraphArtifactCarriesItsBoundaryTest(ServiceFixture):
@@ -1462,7 +1476,7 @@ class ReaderStatusMatchesCanonicalTest(ServiceFixture):
                 self.install(**state)
                 canonical = self.service.status()["healthy"]
                 self.assertEqual(canonical, all(state.values()))
-                for consumer in ("human", *self.FILTERED):
+                for consumer in ("human", *self.FILTERED):  # non-vacuous: literals
                     value = self.service.reader_status(consumer=consumer)
                     self.assertEqual(value["healthy"], canonical)
                     self.assertEqual(value["lint_errors"], 0)
@@ -1516,6 +1530,10 @@ class ReaderStatusMatchesCanonicalTest(ServiceFixture):
                 blob = json.dumps(enforcement)
                 self.assertNotIn(str(self.root), blob)
                 self.assertNotIn(".claude/hooks", blob)
+                self.assertEqual(
+                    [layer["layer"] for layer in enforcement["layers"]],
+                    ["write_gate", "session_status", "commit_lint", "instructions"],
+                )
                 for layer in enforcement["layers"]:
                     self.assertNotIn("detail", layer)
                     self.assertNotIn("script", layer)
@@ -1610,7 +1628,7 @@ class InstallationFactsStayInsideTheBoundaryTest(ServiceFixture):
         for name, response in self.cloud_responses().items():
             with self.subTest(response=name):
                 blob = json.dumps(response, ensure_ascii=False)
-                for marker in self.markers:
+                for marker in self.markers:  # non-vacuous: setUp binds a literal set
                     self.assertNotIn(marker, blob)
 
     def test_the_key_is_omitted_rather_than_blanked(self) -> None:

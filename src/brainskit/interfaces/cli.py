@@ -2650,7 +2650,8 @@ def _enforcement_section(layers: Sequence[dict[str, Any]]) -> list[str]:
     )
     for hint in repairs:
         if hint not in hints:
-            parts.append(console.style(f"  reinstall: {hint}", console.WARN))
+            label = "reinstall" if hint.startswith("bk hooks install") else "repair"
+            parts.append(console.style(f"  {label}: {hint}", console.WARN))
     return parts
 
 

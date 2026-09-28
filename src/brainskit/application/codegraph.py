@@ -926,7 +926,9 @@ class CodeGraph:
                 "command": CODE_REBUILD_COMMAND,
             }
 
-        files = graph.get("files", {})
+        # No default: `_write` always records `files`, so a missing key is an
+        # altered artefact, not an empty input set that trivially verifies.
+        files = graph.get("files")
         if not isinstance(files, dict):
             return {
                 "state": "stale",

@@ -49,6 +49,7 @@ from brainskit.application.install import (
     AgentHook,
     agent_install,
     redirected_git_hooks_path,
+    redirected_hooks_hint,
 )
 from brainskit.application.ports import VaultPort
 from brainskit.domain.model import NotConfiguredError, ValidationError
@@ -413,11 +414,7 @@ def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, An
                 f"git runs hooks from {redirected_hooks}, not .git/hooks, "
                 "because core.hooksPath is set"
             ),
-            "hint": (
-                "Add `bk --vault "
-                f"{shlex.quote(str(vault))} lint --changed` to "
-                f"{redirected_hooks / 'pre-commit'} and commit it"
-            ),
+            "hint": redirected_hooks_hint(vault, redirected_hooks),
             "enforcement": "off",
             "consequence": COMMIT_LINT_OFF,
         }

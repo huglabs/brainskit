@@ -93,9 +93,12 @@ class PolicyAssemblyTest(unittest.TestCase):
         from brainskit.domain.model import VaultConfig
 
         options = ["agent", "obsidian", "web"]
-        every = chain.from_iterable(
-            combinations(options, n) for n in range(len(options) + 1)
+        every = list(
+            chain.from_iterable(
+                combinations(options, n) for n in range(len(options) + 1)
+            )
         )
+        self.assertEqual(len(every), 2 ** len(options))
         with tempfile.TemporaryDirectory() as name:
             for extras in every:
                 policy = self.assemble(Path(name), list(extras))
@@ -124,6 +127,10 @@ class PolicyAssemblyTest(unittest.TestCase):
         got this wrong would be unfixable after the fact.
         """
 
+        self.assertEqual(
+            [preset.key for preset in onboarding.PRESETS],
+            ["work", "personal", "research"],
+        )
         for preset in onboarding.PRESETS:
             private = [
                 name
@@ -715,13 +722,31 @@ raise SystemExit(cli.main([]))
 
         from brainskit.interfaces import cli
 
-        self.assertIn("forget", cli._DESTRUCTIVE)
-        for command in cli._DESTRUCTIVE:
-            self.assertIn(
-                command,
-                {name for _, names in cli.HELP_CATEGORIES for name in names},
-                "a destructive command must still be reachable to be shown",
-            )
+        self.assertEqual(cli._DESTRUCTIVE, {"forget", "reject", "apply"})
+        parser = cli.build_parser()
+        reachable = {name for _, names in cli.HELP_CATEGORIES for name in names}
+
+        def offered(command: str) -> list[str]:
+            seen: list[list[str]] = []
+
+            def select(_question: str, choices: list, **_: object) -> str:
+                seen.append([choice.value for choice in choices])
+                raise prompt.Cancelled
+
+            with patch.object(cli.prompt, "select", select):
+                cli._offer_to_run(parser, command)
+            (values,) = seen
+            return values
+
+        self.assertIn("run", offered("status"))
+        for command in sorted(cli._DESTRUCTIVE):
+            with self.subTest(command=command):
+                self.assertIn(
+                    command,
+                    reachable,
+                    "a destructive command must still be reachable to be shown",
+                )
+                self.assertEqual(offered(command), ["compose", "back"])
 
 
 class SubcommandHelpTest(unittest.TestCase):
@@ -822,10 +847,14 @@ class RowFittingTest(unittest.TestCase):
         return rendered
 
     def test_no_real_command_row_can_overflow_any_plausible_terminal(self) -> None:
-        from brainskit.interfaces import console
+        from brainskit.interfaces import cli, console
 
+        commands = sum(len(names) for _, names in cli.HELP_CATEGORIES)
         for width in (40, 60, 80, 100, 120):
-            for row in self.rows_for_every_group(width):
+            rows = self.rows_for_every_group(width)
+            self.assertEqual(len(rows), commands)
+            self.assertTrue(any("forget" in row for row in rows))
+            for row in rows:
                 self.assertLess(
                     console._visible_len(row),
                     width,
@@ -918,8 +947,8 @@ raise SystemExit(cli.main([]))
     def test_each_command_appears_exactly_once(self) -> None:
         screen = self.screen_after_browsing(24, 80)
         for command in ("capture", "status", "reconcile", "watch", "lint"):
-            self.assertLessEqual(
+            self.assertEqual(
                 screen.count(f"◇ {command}") + screen.count(f"◆ {command}"),
                 1,
-                f"{command} was painted more than once",
+                f"{command} was not painted exactly once",
             )

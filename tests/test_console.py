@@ -260,6 +260,7 @@ class TableTests(unittest.TestCase):
         rows = [["short", "1"], ["a moderately long title here", "22"]]
         for width in (20, 40, 80, 120):
             text = console.table(["title", "n"], rows, width=width, stream=PIPE)
+            self.assertEqual(len(text.splitlines()), 2 + len(rows))
             for line in text.splitlines():
                 self.assertLessEqual(len(line), width)
 

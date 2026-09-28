@@ -106,6 +106,15 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   `wiki/` is refused". `bk doctor` runs the gate hook on one path it must deny
   and one it must allow (`enforcing` / `not_enforcing` / `over_blocking` /
   `unknown` / `absent`), because the hook fails open by design in eight places.
+  What it runs is the command `settings.json` registers, through `sh -c` as
+  Claude Code runs it, not the script path: a registration that does not
+  survive the shell fails open while the script it names works by hand. The
+  same goes for the `commit_lint` probe: doctor runs the pre-commit hook
+  brainskit installed, from the workspace as git does, and a hook that exits
+  anything but a lint verdict is `not_enforcing`. `absent` means nothing will
+  run: no registration and no script. A registered gate whose script is gone is
+  `not_enforcing`, because the agent still runs the command, the shell exits
+  127, and Claude Code does not treat that as a block.
   It lives in `application/doctor.py`, apart from the installer whose output it
   refuses to take on trust.
 - **decide here, say it there** — where `interfaces/cli.py` ends. Writing an

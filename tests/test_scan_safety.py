@@ -285,6 +285,7 @@ class VaultGitignoreTest(unittest.TestCase):
         # derived output -- here a 683 MB `graph/code.json`.
         vault = FileVault.initialize(self.root / "vault", policy())
         ignored = (vault.root / ".gitignore").read_text()
+        self.assertEqual(set(DERIVED_DIRECTORIES), {"graph", "output", "views"})
         for name in DERIVED_DIRECTORIES:
             self.assertIn(f"{name}/", ignored, f"{name}/ is generated but tracked")
 
@@ -882,15 +883,16 @@ class CommandDeadEndTest(unittest.TestCase):
         self.assertTrue(any(not o.takes_value for o in ingest_options))
 
     def test_declared_alternatives_name_real_flags(self) -> None:
-        for command, (_, options) in self.cli._ALTERNATIVES.items():
+        declared = [
+            (command, option.flag)
+            for command, (_, options) in self.cli._ALTERNATIVES.items()
+            for option in options
+            if option.flag
+        ]
+        self.assertEqual(declared, [("capture", "--text"), ("ingest", "--all")])
+        for command, flag in declared:
             rendered = self.cli._subcommand_help(self.parser, command)
-            for option in options:
-                if option.flag:
-                    self.assertIn(
-                        option.flag,
-                        rendered,
-                        f"{command} has no {option.flag}",
-                    )
+            self.assertIn(flag, rendered, f"{command} has no {flag}")
 
 
 class PastedValueTest(unittest.TestCase):

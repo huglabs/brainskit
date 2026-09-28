@@ -69,6 +69,12 @@ _BACKUP_TARGETS = [
 
 _PHASES = ["prepared", "wiki-written", "state-written", "index-written"]
 
+_STATE_FILES = (
+    ".brain/registry.json",
+    ".brain/applied.json",
+    ".brain/freshness.json",
+)
+
 
 class _Interrupted(RuntimeError):
     """Stands in for the power cut, the SIGKILL or the full disk."""
@@ -321,27 +327,21 @@ class StateBackupRestoreTest(ApplyJournalFixture):
         proposal["operations"][0]["source_hashes"] = [self.source, second]
         proposal["operations"][0]["body"] += f" Mais uma.[^source:{second}]"
 
-        before = {
-            relative: self.state_bytes(relative)
-            for relative in (
-                ".brain/registry.json",
-                ".brain/applied.json",
-                ".brain/freshness.json",
-            )
-        }
+        before = {relative: self.state_bytes(relative) for relative in _STATE_FILES}
+        self.assertNotIn(None, before.values())
         self.interrupt(
             after_applied_state("late-crash"),
             lambda: self.service.apply(proposal),
         )
         # The crash really did leave new bytes behind, in all three.
-        for relative, original in before.items():
-            self.assertNotEqual(original, self.state_bytes(relative), relative)
+        for relative in _STATE_FILES:
+            self.assertNotEqual(before[relative], self.state_bytes(relative), relative)
         self.assertNotEqual(self.original_page, self.page_path.read_bytes())
 
         self.reopen()
 
-        for relative, original in before.items():
-            self.assertEqual(original, self.state_bytes(relative), relative)
+        for relative in _STATE_FILES:
+            self.assertEqual(before[relative], self.state_bytes(relative), relative)
         self.assertEqual(self.original_page, self.page_path.read_bytes())
         self.assertNotIn(
             "late-crash",
@@ -738,14 +738,8 @@ class RecoveryIdempotenceTest(ApplyJournalFixture):
 
         self.reopen()
 
-        snapshot = {
-            relative: self.state_bytes(relative)
-            for relative in (
-                ".brain/registry.json",
-                ".brain/applied.json",
-                ".brain/freshness.json",
-            )
-        }
+        snapshot = {relative: self.state_bytes(relative) for relative in _STATE_FILES}
+        self.assertNotIn(None, snapshot.values())
         page_after_first = self.page_path.read_bytes()
         self.assertEqual(self.original_page, page_after_first)
         self.assertFalse(self.journal_path.exists())
@@ -753,8 +747,8 @@ class RecoveryIdempotenceTest(ApplyJournalFixture):
         self.reopen()
 
         self.assertEqual(page_after_first, self.page_path.read_bytes())
-        for relative, expected in snapshot.items():
-            self.assertEqual(expected, self.state_bytes(relative), relative)
+        for relative in _STATE_FILES:
+            self.assertEqual(snapshot[relative], self.state_bytes(relative), relative)
         self.assertFalse(self.journal_path.exists())
 
 

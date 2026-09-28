@@ -127,6 +127,33 @@ class JudgmentRunner:
             return None
         return judgment.route_for(job=job, branches=branches)
 
+    def refuse_without_evidence(
+        self, *, job: str, branches: list[str], withheld: int, nothing: str, next_step: str
+    ) -> None:
+        """The router's refusal of an empty bundle, in words that fit it.
+
+        With no evidence, `branches` is the `_inbox` fallback, so a cloud-mapped
+        job on a vault whose inbox is `local-only` was refused as "Local-only
+        content can only be routed to Ollama" -- about content that does not
+        exist. The refusal stands; only what it says changes. A route that
+        accepts the empty bundle returns, and the job runs as it always has.
+        """
+
+        try:
+            self.route_for(job=job, branches=branches)
+        except PolicyError as exc:
+            hint = next_step
+            if exc.details.get("privacy") == "local-only":
+                hint += (
+                    "; with no evidence the job routes under the _inbox policy, "
+                    "which is local-only, so to run it anyway map "
+                    f"job_models.{job}.local-only to a local provider"
+                )
+            raise PolicyError(
+                f"{nothing}, and nothing was sent to any model",
+                details={"job": job, "withheld_sources": withheld, "hint": hint},
+            ) from exc
+
     def consumer_for(self, *, job: str, branches: list[str]) -> str:
         """The boundary of the model `job` reaches over `local`-visible branches.
 

@@ -14,10 +14,12 @@ except ImportError:
 
 import ast
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
 
@@ -48,6 +50,126 @@ def _is_harness_import(node: ast.stmt) -> bool:
     )
     caught = isinstance(handler.type, ast.Name) and handler.type.id == "ImportError"
     return relative and plain and caught
+
+
+NON_VACUOUS = re.compile(r"#\s*non-vacuous:\s*\S")
+_VIEWS = frozenset({"items", "keys", "values"})
+_WRAPPERS = frozenset(
+    {"enumerate", "zip", "sorted", "reversed", "list", "tuple", "set"}
+)
+
+
+def _asserted(node: ast.stmt) -> ast.expr | None:
+    """What `assert x` or `self.assertX(...)` checks; None for any other statement."""
+
+    if isinstance(node, ast.Assert):
+        return node.test
+    if (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr.startswith("assert")
+    ):
+        return node.value
+    return None
+
+
+def _is_literal(node: ast.expr, bound: Mapping[str, ast.expr]) -> bool:
+    """A collection whose size the test source fixes, whatever production does."""
+
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return not any(isinstance(element, ast.Starred) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return None not in node.keys
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "range":
+            return all(isinstance(argument, ast.Constant) for argument in node.args)
+        if isinstance(func, ast.Name) and func.id in _WRAPPERS:
+            return bool(node.args) and all(_is_literal(a, bound) for a in node.args)
+        if isinstance(func, ast.Attribute) and func.attr in _VIEWS:
+            return _is_literal(func.value, bound)
+        return False
+    name = ast.unparse(node)
+    if name not in bound:
+        return False
+    rest = {key: value for key, value in bound.items() if key != name}
+    return _is_literal(bound[name], rest)
+
+
+def _cores(node: ast.expr) -> set[str]:
+    """The iterable as written, and the collections under `sorted(x.items())`."""
+
+    found = {ast.unparse(node)}
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _VIEWS:
+            found |= _cores(func.value)
+        elif isinstance(func, ast.Name) and func.id in _WRAPPERS:
+            for argument in node.args:
+                found |= _cores(argument)
+    return found
+
+
+def _bindings(body: list[ast.stmt], *prefixes: str) -> dict[str, ast.expr]:
+    bound: dict[str, ast.expr] = {}
+    for statement in body:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target, value = statement.targets[0], statement.value
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            target, value = statement.target, statement.value
+        else:
+            continue
+        if isinstance(target, ast.Name):
+            for prefix in prefixes:
+                bound[prefix + target.id] = value
+    return bound
+
+
+def vacuity_prone_loops(source: str, name: str) -> list[str]:
+    """`name:line` of each `for` whose assertions may never run. See the test."""
+
+    lines = source.splitlines()
+    tree = ast.parse(source)
+    module = _bindings(tree.body, "")
+    scopes: list[tuple[ast.AST, dict[str, ast.expr]]] = [(tree, module)]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            members = _bindings(node.body, "self.", f"{node.name}.")
+            scopes.append((node, {**module, **members}))
+    offenders: set[int] = set()
+    for scope, bound in scopes:
+        for function in ast.iter_child_nodes(scope):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            statements = sorted(
+                (node for node in ast.walk(function) if isinstance(node, ast.stmt)),
+                key=lambda node: (node.lineno, node.col_offset),
+            )
+            local = dict(bound)
+            checked: set[str] = set()
+            for statement in statements:
+                local.update(_bindings([statement], ""))
+                asserted = _asserted(statement)
+                if asserted is not None:
+                    mentioned = ast.walk(asserted)
+                    checked |= {
+                        ast.unparse(n) for n in mentioned if isinstance(n, ast.expr)
+                    }
+                if not isinstance(statement, ast.For | ast.AsyncFor):
+                    continue
+                if not any(_asserted(inner) is not None for inner in statement.body):
+                    continue
+                end = max(statement.body[0].lineno - 1, statement.lineno)
+                header = lines[statement.lineno - 1 : end]
+                if (
+                    _is_literal(statement.iter, local)
+                    or _cores(statement.iter) & checked
+                    or any(NON_VACUOUS.search(line) for line in header)
+                ):
+                    continue
+                offenders.add(statement.lineno)
+    return [f"{name}:{line}" for line in sorted(offenders)]
 
 
 class EveryModuleImportsTheHarnessFirstTest(unittest.TestCase):
@@ -100,6 +222,100 @@ class EveryModuleImportsTheHarnessFirstTest(unittest.TestCase):
         skipped = ast.parse("import os\ntry:\n    import x\nexcept ImportError:\n    pass\n")
         self.assertFalse(_is_harness_import(skipped.body[0]))
         self.assertFalse(_is_harness_import(skipped.body[1]))
+
+
+class NoAssertionHidesInAnEmptyLoopTest(unittest.TestCase):
+    """A loop that never runs is a test that cannot fail (TQ2, issue #19).
+
+    The scan flags a `for` with an assertion (`assert`, `self.assert*`)
+    directly in its body, unless one of these shows the loop runs:
+
+    - the iterable is a literal: a list/tuple/set/dict display, `range(<const>)`,
+      a name the module, class (`self.X`) or function binds to one, or
+      `enumerate`/`zip`/`sorted`/`.items()`/... of those;
+    - an earlier assertion in the same function mentions the iterable, or the
+      collection under `sorted(x.items())` -- `assertEqual(len(x), 3)`,
+      `assertTrue(x)`, `assertEqual(set(X), {...})`;
+    - the `for` line carries `# non-vacuous: <reason>`.
+
+    The mention is not proof: `assertEqual(ys, [f(x) for x in xs])` mentions
+    `xs` without pinning its size. The scan makes the question visible; the
+    precondition still has to answer it. Assertions nested one block deeper
+    (`with self.subTest():`, `if ...:`) are outside the rule.
+    """
+
+    maxDiff = None
+
+    def test_no_test_module_asserts_in_a_loop_that_may_never_run(self) -> None:
+        modules = sorted(TESTS.glob("test_*.py"))
+        self.assertGreater(len(modules), 40, "the scan found the test modules")
+        offenders = [
+            site
+            for module in modules
+            for site in vacuity_prone_loops(
+                module.read_text(encoding="utf-8"), module.name
+            )
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "these loops assert over a collection nothing shows is non-empty: "
+            "pin its size or contents first, or mark the `for` line "
+            "`# non-vacuous: <reason>`",
+        )
+
+    def test_the_scan_tells_a_vacuous_loop_from_a_proven_one(self) -> None:
+        """Control: the rule flags the shape it names and nothing it exempts."""
+
+        flagged = (
+            "def test(self):\n"
+            "    for item in produce():\n"
+            "        self.assertTrue(item)\n"
+        )
+        self.assertEqual(vacuity_prone_loops(flagged, "m"), ["m:2"])
+        exempt = {
+            "display": "def t(self):\n    for x in (a(), b()):\n        assert x\n",
+            "range": "def t(self):\n    for i in range(3):\n        assert f(i)\n",
+            "module constant": (
+                "XS = [1, 2]\n"
+                "def t(self):\n    for x in sorted(XS):\n        assert x\n"
+            ),
+            "class constant": (
+                "class C:\n    XS = {'a': 1}\n    def t(self):\n"
+                "        for k, v in self.XS.items():\n            assert v\n"
+            ),
+            "local literal": (
+                "def t(self):\n    cases = [1]\n    for c in cases:\n        assert c\n"
+            ),
+            "precondition": (
+                "def t(self):\n    xs = produce()\n    self.assertEqual(len(xs), 2)\n"
+                "    for x in xs:\n        self.assertTrue(x)\n"
+            ),
+            "precondition on the collection": (
+                "def t(self):\n    self.assertIn('a', TABLE)\n"
+                "    for k, v in TABLE.items():\n        assert v\n"
+            ),
+            "opt-out": (
+                "def t(self):\n"
+                "    for x in produce():  # non-vacuous: fixture has two\n"
+                "        assert x\n"
+            ),
+            "opt-out on a one-line loop": (
+                "def t(self):\n    for x in produce(): assert x  # non-vacuous: two\n"
+            ),
+        }
+        for shape, source in exempt.items():
+            with self.subTest(shape=shape):
+                self.assertEqual(vacuity_prone_loops(source, "m"), [])
+        rebound = (
+            "def t(self):\n    xs = [1]\n    xs = produce()\n"
+            "    for x in xs:\n        assert x\n"
+        )
+        self.assertEqual(vacuity_prone_loops(rebound, "m"), ["m:4"])
+        bare_opt_out = (
+            "def t(self):\n    for x in produce():  # non-vacuous:\n        assert x\n"
+        )
+        self.assertEqual(vacuity_prone_loops(bare_opt_out, "m"), ["m:2"])
 
 
 class StandaloneRunnerIsolationTest(unittest.TestCase):

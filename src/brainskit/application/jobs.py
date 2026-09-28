@@ -239,7 +239,7 @@ class Jobs:
         self.ledger = ledger
 
     def _judgment_context(
-        self, job: str, query: str, **kwargs: Any
+        self, job: str, query: str, *, next_step: str, **kwargs: Any
     ) -> tuple[dict[str, Any], int]:
         """Evidence the model on `job`'s route may read, and how much was withheld.
 
@@ -280,6 +280,14 @@ class Jobs:
                 "by its branch privacy policy",
                 details={"withheld_sources": withheld, "hint": hint},
             )
+        if not context["evidence"]:
+            self.judgment_runner.refuse_without_evidence(
+                job=job,
+                branches=context_branches(context),
+                withheld=withheld,
+                nothing="Nothing in the vault matched this request",
+                next_step=next_step,
+            )
         return context, withheld
 
     def ask(
@@ -297,7 +305,11 @@ class Jobs:
         # would pollute BM25 term matching with every word already discussed,
         # burying the terms this question is actually about. History is model
         # context for *interpreting* the question, and rides only the prompt.
-        context, withheld = self._judgment_context("query", question)
+        context, withheld = self._judgment_context(
+            "query",
+            question,
+            next_step="Rephrase the question, or look for what the vault holds with bk search",
+        )
         branches = context_branches(context)
         response = self.judgment_runner.run(
             job="query",
@@ -364,6 +376,26 @@ class Jobs:
         withheld = (
             len(recent) - len(allowed_recent) + withheld_pages + withheld_proposals
         )
+        if not allowed_recent:
+            if recent:
+                nothing = (
+                    "No recent source a model may read remained once branch "
+                    "privacy policy withheld the rest"
+                )
+                next_step = (
+                    "Read the recent sources yourself with bk search -- they "
+                    "are withheld from models, not from you"
+                )
+            else:
+                nothing = "The vault has no recent source for a digest to read"
+                next_step = "Capture sources first, or check the vault with bk status"
+            self.judgment_runner.refuse_without_evidence(
+                job="digest",
+                branches=digest_branches,
+                withheld=withheld,
+                nothing=nothing,
+                next_step=next_step,
+            )
         digest_payload = self.judgment_runner.run(
             job="digest",
             branches=digest_branches,
@@ -394,7 +426,13 @@ class Jobs:
         # `resurface` only ever reads (see `ask`, above, for why the apply
         # contract stays off).
         context, withheld = self._judgment_context(
-            "resurface", "durable insight worth revisiting", limit=20
+            "resurface",
+            "durable insight worth revisiting",
+            next_step=(
+                "Capture and apply sources first, or look for what the vault "
+                "holds with bk search"
+            ),
+            limit=20,
         )
         result = self.judgment_runner.run(
             job="resurface",

@@ -196,7 +196,9 @@ class ClaudeInstallIsUnchangedTest(InstalledAgentCase):
         """The field exists to disambiguate; there is nothing to disambiguate."""
 
         self.install("claude")
-        for entry in self.enforcement()["layers"]:
+        layers = self.enforcement()["layers"]
+        self.assertEqual(len(layers), 4)
+        for entry in layers:
             self.assertNotIn("agent", entry)
 
 
@@ -308,6 +310,7 @@ class AdapterPathHasOneSpellingTest(unittest.TestCase):
     """
 
     def test_the_registry_and_the_install_shape_agree(self) -> None:
+        self.assertEqual(set(install.AGENTS), {"claude", "codex", "gemini", "opencode"})
         for name, shape in install.AGENTS.items():
             with self.subTest(agent=name):
                 self.assertEqual(install.adapter_path(name), shape.adapter)

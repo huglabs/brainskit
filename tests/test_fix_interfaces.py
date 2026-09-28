@@ -1225,7 +1225,7 @@ class CloudTransportsNameNoLocalPathTest(unittest.TestCase):
     def test_no_web_response_to_a_cloud_viewer_names_a_local_path(self) -> None:
         for path, (_status, body) in self.fetch_all("cloud").items():
             with self.subTest(path=path):
-                for marker in self.markers:
+                for marker in self.markers:  # non-vacuous: setUp binds a literal set
                     self.assertNotIn(marker, body)
 
     def test_a_local_viewer_is_still_told_where_the_vault_is(self) -> None:
@@ -1249,7 +1249,7 @@ class CloudTransportsNameNoLocalPathTest(unittest.TestCase):
                     },
                 )
                 blob = json.dumps(response, ensure_ascii=False)
-                for marker in self.markers:
+                for marker in self.markers:  # non-vacuous: setUp binds a literal set
                     self.assertNotIn(marker, blob)
 
 

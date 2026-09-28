@@ -71,6 +71,8 @@ class MediaTypeTest(unittest.TestCase):
     def test_every_code_type_is_a_text_type(self) -> None:
         # The `text/*` fallback in `extract_document` is only coherent if this
         # holds: anything the table names is text by construction.
+        self.assertIn(".py", SOURCE_CODE_TYPES)
+        self.assertIn("Dockerfile", SOURCE_CODE_NAMES)
         for suffix, media_type in SOURCE_CODE_TYPES.items():
             self.assertTrue(
                 media_type.startswith("text/"), f"{suffix} -> {media_type}"

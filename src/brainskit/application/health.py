@@ -45,6 +45,7 @@ from brainskit.application.install import (
     agent_install,
     installed_agents,
     redirected_git_hooks_path,
+    redirected_hooks_hint,
 )
 from brainskit.application.installer import (
     command_script,
@@ -221,6 +222,17 @@ class Health:
                     "Every page semantic lint would read is withheld from models "
                     "by its branch privacy policy",
                     details={"withheld_sources": withheld, "hint": hint},
+                )
+            if not context["evidence"]:
+                self.judgment_runner.refuse_without_evidence(
+                    job="lint-semantic",
+                    branches=context_branches(context),
+                    withheld=withheld,
+                    nothing="No page in the vault matched what semantic lint reads",
+                    next_step=(
+                        "Run bk lint without --semantic, which checks every page, "
+                        "or look for pages with bk search"
+                    ),
                 )
             semantic_report = self.judgment_runner.run(
                 job="lint-semantic",
@@ -891,7 +903,18 @@ class Health:
             registration = registered_under(hook.event, path)
             active = path.is_file() and registration is not None
             detail = "active"
-            if not path.is_file():
+            # A registration naming a missing script is not "not installed":
+            # the agent still runs the command, the shell exits 127, and
+            # Claude Code does not treat that as a block.
+            dangling = registration is not None and not path.is_file()
+            if dangling:
+                detail = (
+                    f"{hook.script} is not installed but is still registered under "
+                    f"{hook.event}, so the registered command cannot run"
+                )
+                if hook.layer == WRITE_GATE:
+                    detail += " and every write goes through"
+            elif not path.is_file():
                 detail = f"{hook.script} is not installed"
             elif not active:
                 detail = (
@@ -910,6 +933,8 @@ class Health:
             }
             if registration is not None:
                 layer["registration"] = registration
+            if dangling:
+                layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
             if recorded and self._hook_outdated(hook, path, root):
                 layer["outdated"] = True
                 layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
@@ -989,6 +1014,8 @@ class Health:
             "script": str((redirected_hooks or root / DEFAULT_GIT_HOOKS) / "pre-commit"),
             "workspace": str(root),
         }
+        if redirected_hooks is not None and not (redirected_hooks / "pre-commit").exists():
+            commit_layer["hint"] = redirected_hooks_hint(self.vault.root, redirected_hooks)
         if lints_elsewhere and pre_commit_text is not None:
             named = pre_commit_vault(pre_commit_text, root)
             consequence = (

@@ -53,10 +53,16 @@ registered command or, when nothing registers the gate, the script itself.
 | `state` | Meaning |
 |---|---|
 | `enforcing` | a write to `wiki/` was refused and an ordinary write was not |
-| `not_enforcing` | the hook is installed and let a gated write through |
+| `not_enforcing` | the hook is installed and let a gated write through, or its script is gone while `settings.json` still registers it |
 | `over_blocking` | it refused an ordinary write outside the vault too |
 | `unknown` | the hook could not be executed at all, or its recorded workspace is gone |
-| `absent` | no gate is installed — a choice, not a fault |
+| `absent` | no gate is registered and no script is installed — a choice, not a fault |
+
+A deleted gate script whose registration remains is not `absent`. Claude Code
+still runs the registered command, `sh -c` exits 127, and Claude Code does not
+treat that as a block, so every write goes through. `doctor` runs the command,
+quotes the shell's error in `detail` and `hook_said`, and gives the reinstall
+command as `hint`; `bk status` reads the layer inactive and says the same.
 
 Both probes are decisions only: `gate check-write` writes nothing, and no probe
 file is ever created. When the hook fails open it explains itself on stderr, and
@@ -75,7 +81,10 @@ honoured) is executed from the workspace with nothing on stdin. `bk lint` exits
 126/127 from the shell, or 2 from a `bk` error such as `Not a brainskit vault`.
 Such a hook refuses every commit without checking one. A hook naming another
 vault is reported without being run, and one without its executable bit is
-`not_enforcing` because git skips it. A hook brainskit did not write is
+`not_enforcing` because git skips it, as is a brainskit hook left in
+`.git/hooks` while `core.hooksPath` points at a directory with no pre-commit;
+the hint says to add `bk lint --changed` to the redirected hook, as the
+installer does. A hook brainskit did not write is
 `not_judged` and never executed. `not_enforcing` and `unknown` make `healthy`
 false, as they do for the gate; `gated` is unaffected, because commit-time lint
 catches a bypass after the fact. The lint refreshes page ages in the freshness

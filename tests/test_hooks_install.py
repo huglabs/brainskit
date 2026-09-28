@@ -492,9 +492,17 @@ class StaleHookReplacementTest(VaultCase):
     def test_an_entry_left_empty_by_pruning_is_dropped_not_left_as_debris(self) -> None:
         self.seed_stale_hooks()
         self.install()
-        for event in ("PreToolUse", "SessionStart"):
-            for entry in self.settings()["hooks"][event]:
-                self.assertTrue(entry.get("hooks"), f"{event} kept an emptied entry")
+        expected = (
+            ("PreToolUse", str(self.script("brainskit-gate"))),
+            ("SessionStart", str(self.script("brainskit-status"))),
+        )
+        for event, command in expected:
+            entries = self.settings()["hooks"][event]
+            self.assertEqual(
+                [[item["command"] for item in entry.get("hooks", [])] for entry in entries],
+                [[command]],
+                f"{event} kept an emptied entry",
+            )
 
     def test_reinstalling_at_the_same_path_prunes_nothing_and_stays_idempotent(
         self,
@@ -1352,11 +1360,51 @@ class DoctorGateProbeTest(ShellHookCase):
         self.assertIn("ermission denied", report["hook_said"])
         self.assertFalse(self.doctor()["healthy"])
 
+    def unregister_gate(self) -> None:
+        settings = self.settings()
+        settings["hooks"]["PreToolUse"] = []
+        self.settings_path().write_text(json.dumps(settings), encoding="utf-8")
+
     def test_no_installed_gate_is_reported_without_failing_the_install(self) -> None:
-        """A vault with no agent is a choice, not a fault."""
+        """No registration and no script: a choice, not a fault."""
         self.script("brainskit-gate").unlink()
+        self.unregister_gate()
         self.assertEqual(self.probe()["state"], "absent")
         self.assertTrue(self.doctor()["healthy"])
+
+    def test_a_deleted_gate_that_is_still_registered_fails_open_and_is_caught(
+        self,
+    ) -> None:
+        """Claude Code still runs the registered command; `sh -c` exits 127,
+        which is not a block, so every write goes through."""
+        self.script("brainskit-gate").unlink()
+        value = self.doctor()
+        probe = value["enforcement"]["write_gate_probe"]
+        self.assertEqual(probe["state"], "not_enforcing")
+        self.assertIn("registered command cannot run", probe["detail"])
+        self.assertIn("No such file", probe["detail"])
+        self.assertRegex(probe["hook_said"], "No such file")
+        self.assertEqual(probe["hint"], "bk hooks install --agent claude")
+        self.assertFalse(probe["denies_a_gated_write"])
+        self.assertFalse(value["enforcement"]["gated"])
+        self.assertFalse(value["healthy"])
+        self.assertIn("write gate not_enforcing", cli._doctor_headline(value))
+
+    def test_status_does_not_read_a_deleted_registered_gate_as_active(self) -> None:
+        self.script("brainskit-gate").unlink()
+        status = self.service.status()
+        gate = [
+            layer
+            for layer in status["enforcement"]["layers"]
+            if layer["layer"] == "write_gate"
+        ]
+        self.assertEqual(len(gate), 1)
+        self.assertFalse(gate[0]["active"])
+        self.assertIn("registered under PreToolUse", gate[0]["detail"])
+        self.assertIn("every write goes through", gate[0]["detail"])
+        self.assertEqual(gate[0]["hint"], "bk hooks install --agent claude")
+        self.assertFalse(status["enforcement"]["gated"])
+        self.assertFalse(status["healthy"])
 
     def test_the_probe_writes_nothing(self) -> None:
         """Both probes are decisions. Neither may leave a file behind."""
@@ -2401,6 +2449,46 @@ class DoctorCommitLintProbeTest(ShellHookCase):
         report = self.probe(lint="not_a_vault")
         self.assertEqual(Path(report["script"]).resolve(), redirected.resolve())
         self.assertEqual(report["state"], "not_enforcing")
+
+    def redirect(self) -> None:
+        subprocess.run(
+            ["git", "config", "core.hooksPath", ".githooks"], cwd=self.root, check=True
+        )
+
+    def test_a_hook_stranded_by_core_hooks_path_is_not_enforcing(self) -> None:
+        """Status reads it inactive; doctor used to call it absent and healthy."""
+        self.redirect()
+        self.assertTrue(self.hook.is_file())
+        value = self.doctor()
+        report = value["enforcement"]["commit_lint_probe"]
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertEqual(
+            report["detail"],
+            "git runs hooks from .githooks, which has no pre-commit; "
+            "brainskit's hook in .git/hooks is never run",
+        )
+        self.assertIn("lint --changed", report["hint"])
+        self.assertIn(str(Path(".githooks") / "pre-commit"), report["hint"])
+        self.assertFalse(value["healthy"])
+        layer = [
+            entry
+            for entry in self.service.status()["enforcement"]["layers"]
+            if entry["layer"] == "commit_lint"
+        ]
+        self.assertEqual(len(layer), 1)
+        self.assertFalse(layer[0]["active"])
+        refusal = self.install(skip_code_build=True)["pre_commit"]
+        self.assertEqual(refusal["state"], "skipped")
+        self.assertEqual(
+            {"status": layer[0]["hint"], "doctor": report["hint"]},
+            {"status": refusal["hint"], "doctor": refusal["hint"]},
+        )
+
+    def test_a_redirect_with_no_brainskit_hook_anywhere_is_absent(self) -> None:
+        self.hook.unlink()
+        self.redirect()
+        self.assertEqual(self.probe()["state"], "absent")
+        self.assertTrue(self.doctor()["healthy"])
 
     def test_no_repository_is_absent_not_a_fault(self) -> None:
         shutil.rmtree(self.root / ".git")

@@ -64,6 +64,8 @@ artifact was built from is the durable record of what shipped.
 
 ### Fixed
 
+- **`bk code status` no longer calls a code graph with no `files` key `fresh`**:
+  a missing input set is now `stale` ("cannot be verified"), like a non-map one.
 - **The Claude Code SessionStart hook counted lint errors as 0** once
   `bk lint --json` began reporting `ok: false`: it read `result` only from an
   `ok` document. It now reads any document that carries a `result`.
@@ -235,6 +237,29 @@ artifact was built from is the durable record of what shipped.
   same hint, and `healthy` is false. The reinstall itself works without
   `--force`: an unedited skill file rendered for the old vault path is now
   recognised as brainskit's and rewritten, where it used to refuse.
+- **A deleted gate script that is still registered no longer reads as
+  healthy.** With `.claude/hooks/brainskit-gate.sh` gone but its
+  `.claude/settings.json` entry left in place, `bk doctor` reported the gate
+  `absent`, a state it treats as healthy. Claude Code still runs the registered
+  command, `sh -c` exits 127, and Claude Code does not treat that as a block,
+  so every write went through. Doctor now runs the registered command and
+  reports `not_enforcing`: "the registered command cannot run", with the
+  shell's error quoted and `bk hooks install --agent <agent>` as the hint.
+  `healthy` is false. `bk status` reads the layer inactive, says it is
+  registered but missing, and carries the same hint. `absent` now means no
+  registration and no script. Likewise, a brainskit pre-commit hook that
+  `core.hooksPath` leaves unrun is now `not_enforcing` in doctor rather than
+  `absent`, which matches `bk status`. Both give the installer's `lint --changed`
+  hint.
+- **An empty-evidence refusal says what happened.** When a cloud-mapped `ask`,
+  `resurface`, `digest` or `lint --semantic` has no evidence, the router falls
+  back to the `_inbox` policy. On a vault whose inbox is `local-only`, it
+  refused with "Local-only content can only be routed to Ollama", about content
+  that did not exist. The refusal stands and is still `policy_denied`, but the
+  message now says nothing in the vault matched (or, for `digest`, that nothing
+  a model may read remained) and that nothing was sent to any model. The hint
+  suggests rephrasing, `bk search`, or mapping `job_models.<job>.local-only` to
+  a local provider.
 
 - `providers.<name>.reasoning` on the OpenAI-compatible driver, forwarded
   verbatim to the provider. Absent by default, so a model that reasons keeps

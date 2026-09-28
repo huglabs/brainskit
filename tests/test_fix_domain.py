@@ -193,6 +193,15 @@ class PageDirectoryTest(unittest.TestCase):
         self.assertNotEqual(PageKind.ENTITY.directory, "entitys")
 
     def test_relative_path_targets_the_scaffolded_directory(self) -> None:
+        self.assertEqual(
+            {kind.value: directory for kind, directory in PAGE_DIRECTORIES.items()},
+            {
+                "source": "sources",
+                "entity": "entities",
+                "concept": "concepts",
+                "synthesis": "syntheses",
+            },
+        )
         for kind, directory in PAGE_DIRECTORIES.items():
             operation = PageOperation.from_dict(
                 {
@@ -231,6 +240,10 @@ class VaultScaffoldGuardTest(unittest.TestCase):
         self.assertEqual(scaffolded, set(WIKI_DIRECTORIES))
 
     def test_every_page_kind_directory_is_scaffolded_by_init(self) -> None:
+        self.assertEqual(
+            {kind.value for kind in PageKind},
+            {"source", "entity", "concept", "synthesis"},
+        )
         for kind in PageKind:
             self.assertTrue(
                 (self.root / "wiki" / kind.directory).is_dir(),
@@ -789,10 +802,22 @@ class StructuredSchemaProjectionTest(unittest.TestCase):
                 yield from self.objects(value)
 
     def test_every_shipped_schema_projects_to_a_closed_object_graph(self) -> None:
-        for job in ("ingest", "query", "digest", "resurface", "lint-semantic"):
+        # The object count per job is pinned so a projection that yields no
+        # object nodes cannot pass the loop below by running it zero times.
+        expected_objects = {
+            "ingest": 2,
+            "query": 1,
+            "digest": 1,
+            "resurface": 1,
+            "lint-semantic": 2,
+        }
+        for job, count in expected_objects.items():
             with self.subTest(job=job):
                 projected = _structured_schema(JobSpecs().schema(job))
-                for node in self.objects(projected):
+                nodes = list(self.objects(projected))
+                self.assertEqual(len(nodes), count)
+                self.assertIs(nodes[0], projected)
+                for node in nodes:
                     self.assertIs(node["additionalProperties"], False)
                     self.assertEqual(
                         sorted(node["required"]), sorted(node["properties"])

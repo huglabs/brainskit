@@ -164,6 +164,7 @@ class CommunitiesTest(AnalysisFixture):
         # not seeing the graph brainskit thinks it built.
         self.service.code_import(clustered_payload())
         result = self.service.code_communities()
+        self.assertEqual(len(result["communities"]), 2)
         for community in result["communities"]:
             paths = {member["path"] for member in community["members"]}
             self.assertEqual(len(paths), 1)
@@ -171,6 +172,7 @@ class CommunitiesTest(AnalysisFixture):
     def test_reports_a_cohesion_score_in_range(self) -> None:
         self.service.code_import(clustered_payload())
         result = self.service.code_communities()
+        self.assertEqual(len(result["communities"]), 2)
         for community in result["communities"]:
             self.assertIn("cohesion", community)
             self.assertGreaterEqual(community["cohesion"], 0.0)

@@ -13,7 +13,7 @@ from __future__ import annotations
 try:
     from . import _harness
 except ImportError:
-    import _harness  # noqa: F401
+    import _harness
 
 import json
 import subprocess
@@ -102,12 +102,19 @@ class EnforcementStatusTest(unittest.TestCase):
         )
 
     def test_every_inactive_layer_explains_itself(self) -> None:
-        for entry in self.enforcement()["layers"]:
-            self.assertNotEqual(
-                entry["detail"],
-                "active",
-                f"{entry['layer']} is off but offers no reason",
-            )
+        layers = self.enforcement()["layers"]
+        self.assertEqual(
+            [entry["layer"] for entry in layers],
+            ["write_gate", "session_status", "commit_lint", "instructions"],
+        )
+        for entry in layers:
+            with self.subTest(layer=entry["layer"]):
+                self.assertFalse(entry["active"])
+                self.assertTrue(
+                    str(entry["detail"]).strip(),
+                    f"{entry['layer']} is off but offers no reason",
+                )
+                self.assertNotEqual(entry["detail"], "active")
 
     # the divergence cases ----------------------------------------------------
 
@@ -213,6 +220,28 @@ class EnforcementStatusTest(unittest.TestCase):
         report = self.service.status()
         for key in ("vault", "sources", "wiki_pages", "freshness", "projections"):
             self.assertIn(key, report)
+
+    def test_status_counts_every_source_and_each_branch(self) -> None:
+        """The counts themselves, not just their keys, through `bk status`."""
+
+        def capture(text: str, branch: str | None) -> None:
+            content_hash = self.service.capture(None, text=text, title=text)["source"][
+                "content_hash"
+            ]
+            if branch is not None:
+                self.service.file(content_hash, branch)
+
+        capture("first work note", "10-work")
+        capture("second work note", "10-work")
+        capture("one research note", "20-research")
+        capture("still in the inbox", None)
+        run = _harness.run_cli(["--vault", str(self.root), "--json", "status"])
+        self.assertEqual(run.code, 0, run.output)
+        result = run.json()["result"]
+        self.assertEqual(result["sources"], 4)
+        self.assertEqual(
+            result["by_branch"], {"10-work": 2, "20-research": 1, "_inbox": 1}
+        )
 
 
 class HealthyHeadlineMeansEnforcementTooTest(EnforcementStatusTest):
