@@ -117,9 +117,9 @@ bk = "brainskit.interfaces.cli:main"
 
 [dependency-groups]
 dev = [
-  "pytest>=8,<9",
-  "ruff>=0.11,<0.13",
-  "mypy>=1.15,<2",
+  "pytest>=8,<10",
+  "ruff>=0.11,<0.17",
+  "mypy>=1.15,<3",
 ]
 
 [tool.setuptools]
