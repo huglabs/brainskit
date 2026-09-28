@@ -20,6 +20,11 @@ them is a regression test for a bug that made every arrow key read as "cancel".
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import fcntl
 import os
 import pty
@@ -405,13 +410,20 @@ def _drive(
         process.kill()
         process.wait(timeout=10)
         os.close(master)
-        return "".join(chunks)
+        return _reached("".join(chunks))
     while time.time() < deadline and process.poll() is None:
         pump(0.3)
     pump(0.3)
     process.wait(timeout=10)
     os.close(master)
-    return "".join(chunks)
+    return _reached("".join(chunks))
+
+
+def _reached(transcript: str) -> str:
+    """A child that crashed painted a traceback, not the screen under test."""
+
+    _harness.refuse_vacuous(transcript)
+    return transcript
 
 
 _RAW_PRELUDE = """
@@ -499,17 +511,8 @@ class TopLevelHelpTest(unittest.TestCase):
     """
 
     def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
-        from contextlib import redirect_stderr, redirect_stdout
-
-        from brainskit.interfaces import cli
-
-        out, err = StringIO(), StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            try:
-                code = cli.main(argv)
-            except SystemExit as exit_:  # argparse's own failures
-                code = int(exit_.code or 0)
-        return code, out.getvalue(), err.getvalue()
+        run = _harness.run_cli(argv)
+        return run.code, run.stdout, run.stderr
 
     def test_a_bare_bk_prints_the_grouped_help_and_succeeds(self) -> None:
         code, out, _ = self.run_cli([])

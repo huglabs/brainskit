@@ -149,14 +149,39 @@ def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
     }
 
 
-def _agent_template(name: str, vault: Path) -> str:
+def _agent_template_text(name: str) -> str:
     resource = files("brainskit").joinpath("templates", "agents", f"{name}.md")
     if not resource.is_file():
         raise NotConfiguredError(
             "Agent template is missing from the installation",
             details={"template": name},
         )
-    return resource.read_text(encoding="utf-8").replace("{{vault}}", str(vault))
+    return resource.read_text(encoding="utf-8")
+
+
+def _agent_template(name: str, vault: Path) -> str:
+    return _agent_template_text(name).replace("{{vault}}", str(vault))
+
+
+def _rendered_for_some_vault(name: str, existing: str) -> bool:
+    """Whether `existing` is this template, unedited, rendered for any one vault.
+
+    A moved repository leaves the skill naming the old vault path, and refusing
+    to replace it without `--force` made the reinstall a moved install needs
+    fail -- while `--force` would also clobber an operator's own pre-commit
+    hook. Only a byte-for-byte render with a different path qualifies; any edit
+    still makes the file the operator's.
+    """
+    pieces = _agent_template_text(name).split("{{vault}}")
+    if len(pieces) < 2:
+        return False
+    pattern = (
+        re.escape(pieces[0])
+        + r"(?P<vault>[^\n]+?)"
+        + "".join(f"{re.escape(piece)}(?P=vault)" for piece in pieces[1:-1])
+        + re.escape(pieces[-1])
+    )
+    return re.fullmatch(pattern, existing) is not None
 
 
 def render_hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
@@ -199,12 +224,14 @@ def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
     content = _agent_template("claude-skill", vault)
     legacy = _legacy_skill_dirs(root)
     if skill.is_file() and not force:
-        if skill.read_text(encoding="utf-8") == content:
+        existing = skill.read_text(encoding="utf-8")
+        if existing == content:
             return {"path": str(skill), "state": "current", **_legacy(legacy)}
-        raise ValidationError(
-            "A brainskit skill already exists; re-run with --force to replace it",
-            details={"path": str(skill)},
-        )
+        if not _rendered_for_some_vault("claude-skill", existing):
+            raise ValidationError(
+                "A brainskit skill already exists; re-run with --force to replace it",
+                details={"path": str(skill)},
+            )
     updated = skill.is_file()
     skill.parent.mkdir(parents=True, exist_ok=True)
     skill.write_text(content, encoding="utf-8")
@@ -308,6 +335,45 @@ def is_generated_pre_commit(content: str) -> bool:
         HOOK_SENTINEL in content
         or _LEGACY_PRE_COMMIT.fullmatch(content.strip()) is not None
     )
+
+
+def pre_commit_vault(content: str, workspace: Path) -> Path | None:
+    """The vault a generated pre-commit hook lints, read the way sh reads it.
+
+    `shlex` in POSIX mode keeps a backslash inside double quotes literal, as sh
+    does, so the JSON-quoted `Opera\\u00e7\\u00e3o` of a pre-0.8.0 hook comes back
+    as the directory sh actually looked for -- one that does not exist. Git runs
+    a hook from the top of the work tree, so a relative path resolves there.
+    None when no `exec … --vault` line can be read.
+    """
+    for line in content.splitlines():
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if tokens[:1] != ["exec"]:
+            continue
+        for position, word in enumerate(tokens):
+            named: str | None = None
+            if word == "--vault" and position + 1 < len(tokens):
+                named = tokens[position + 1]
+            elif word.startswith("--vault="):
+                named = word.partition("=")[2]
+            if named:
+                path = Path(named).expanduser()
+                return path if path.is_absolute() else workspace / path
+    return None
+
+
+def pre_commit_lints(content: str, workspace: Path, vault: Path) -> bool | None:
+    """Whether a generated pre-commit hook's `--vault` is `vault`; None if unreadable."""
+    named = pre_commit_vault(content, workspace)
+    if named is None:
+        return None
+    try:
+        return named.resolve() == vault.resolve()
+    except OSError:
+        return named == vault
 
 
 def _install_pre_commit(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:

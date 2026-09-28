@@ -17,6 +17,11 @@ reader depends on lived in whichever writer happened to state them:
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import sys
 import unittest
 from pathlib import Path

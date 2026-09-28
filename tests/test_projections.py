@@ -17,6 +17,11 @@ Two properties carry the whole design, and each has its own failure mode:
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import os
 import subprocess

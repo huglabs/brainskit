@@ -10,6 +10,11 @@ operator's `settings.json`, and blocking a session when the gate itself breaks.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import json
 import os
 import shlex
@@ -19,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -35,10 +40,11 @@ from brainskit.application.gate import (
 )
 from brainskit.application.install import BRAND
 from brainskit.application.services import BrainskitService
-from brainskit.domain.model import ValidationError
+from brainskit.domain.model import PolicyError, ValidationError
 from brainskit.infrastructure.extractor import GraphifyExtractor
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
+from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces import cli, console
 
@@ -99,9 +105,14 @@ def policy() -> dict[str, Any]:
 class VaultCase(unittest.TestCase):
     """A real vault, because the installer bakes its resolved path into scripts."""
 
+    #: A directory under the temporary root to put the vault in, for a case
+    #: that needs a path the shell would split.
+    VAULT_DIR = ""
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name) / self.VAULT_DIR
+        self.root.mkdir(exist_ok=True)
         self.vault = FileVault.initialize(self.root, policy())
         self.service = BrainskitService(
             self.vault,
@@ -895,17 +906,15 @@ class GateCommandTest(VaultCase):
     """
 
     def run_cli(self, argv: list[str], decision: dict[str, Any]) -> tuple[int, str, str]:
-        out, err = StringIO(), StringIO()
         with patch.object(
             BrainskitService,
             "gate_check_write",
             create=True,
             return_value=decision,
         ) as stub:
-            with redirect_stdout(out), redirect_stderr(err):
-                code = cli.main(["--vault", str(self.root), *argv])
+            run = _harness.run_cli(["--vault", str(self.root), *argv])
         self.stub = stub
-        return code, out.getvalue(), err.getvalue()
+        return run.code, run.stdout, run.stderr
 
     def test_a_denied_write_exits_two_and_explains_itself_on_stderr(self) -> None:
         code, out, err = self.run_cli(
@@ -969,16 +978,14 @@ class GateCommandTest(VaultCase):
     ) -> None:
         # Exit 2 has to mean "denied" and nothing else, so a malformed decision
         # must not arrive at the hook wearing a denial's exit code by accident.
-        out, err = StringIO(), StringIO()
         with patch.object(
             BrainskitService, "gate_check_write", create=True, return_value={}
         ):
-            with redirect_stdout(out), redirect_stderr(err):
-                code = cli.main(
-                    ["--vault", str(self.root), "--json", "gate", "check-write", "x.md"]
-                )
-        self.assertEqual(code, 2)
-        payload = json.loads(out.getvalue())
+            run = _harness.run_cli(
+                ["--vault", str(self.root), "--json", "gate", "check-write", "x.md"]
+            )
+        self.assertEqual(run.code, 2)
+        payload = run.json()
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "internal_error")
 
@@ -988,6 +995,15 @@ class ShellHookCase(VaultCase):
 
     #: `bk` stand-in. FAKE_BK_MODE selects which failure is under test.
     FAKE_BK = """#!/bin/sh
+case " $* " in
+*" lint "*)
+    case "${FAKE_BK_LINT:-clean}" in
+    errors) exit 1 ;;
+    not_a_vault) printf 'bk: Not a brainskit vault\\n' >&2; exit 2 ;;
+    *) exit 0 ;;
+    esac
+    ;;
+esac
 MODE=${FAKE_BK_MODE:-decide}
 TARGET=
 for arg in "$@"; do
@@ -1325,9 +1341,15 @@ class DoctorGateProbeTest(ShellHookCase):
         self.assertFalse(self.doctor()["healthy"])
 
     def test_a_hook_that_cannot_be_executed_is_not_trusted(self) -> None:
-        """A lost executable bit disables a hook without changing a byte of it."""
+        """A lost executable bit disables a hook without changing a byte of it.
+
+        Run through `sh -c` as Claude Code runs it, the shell answers 126 --
+        not a denial, so the write goes through, which is what is reported.
+        """
         self.script("brainskit-gate").chmod(0o644)
-        self.assertEqual(self.probe()["state"], "unknown")
+        report = self.probe()
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertIn("ermission denied", report["hook_said"])
         self.assertFalse(self.doctor()["healthy"])
 
     def test_no_installed_gate_is_reported_without_failing_the_install(self) -> None:
@@ -2077,7 +2099,7 @@ class AwkwardPathHookTest(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertNotIn("Not a brainskit vault", done.stdout + done.stderr)
+        _harness.refuse_vacuous(done.stdout + done.stderr)
         self.assert_nothing_expanded()
 
     def test_the_pre_commit_hook_carries_the_generated_marker(self) -> None:
@@ -2112,6 +2134,21 @@ class AwkwardPathHookTest(unittest.TestCase):
         self.assertEqual(layer["hint"], "bk hooks install --agent claude")
         self.install()
         self.assertNotIn("outdated", self.commit_layer())
+
+    def test_a_pre_0_8_hook_naming_the_json_quoted_path_is_not_active(self) -> None:
+        """The incident: `status` said active while every commit failed."""
+        self.install()
+        self.hook.write_text(
+            f"#!/bin/sh\nexec bk --vault {json.dumps(str(self.root))} lint --changed\n",
+            encoding="utf-8",
+        )
+        layer = self.commit_layer()
+        self.assertFalse(layer["active"])
+        self.assertIn("does not exist", layer["detail"])
+        self.assertIn("\\u00e7", layer["detail"])
+        self.assertEqual(layer["hint"], "bk hooks install --agent claude")
+        self.install()
+        self.assertTrue(self.commit_layer()["active"])
 
     def test_a_hook_the_operator_wrote_is_neither_judged_nor_replaced(self) -> None:
         mine = "#!/bin/sh\nexec bk lint --changed\n"
@@ -2213,3 +2250,405 @@ class StandaloneVaultWorkspaceTest(VaultCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommitLintNamesThisVaultTest(VaultCase):
+    """`bk status` reads the `--vault` a generated hook will hand `bk lint`.
+
+    Content alone said `active` for a hook naming a vault that is not there, so
+    a repository moved since install, or a pre-0.8.0 hook's mangled path, read
+    as guarded while every commit failed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True)
+        self.install(skip_code_build=True)
+        self.hook = self.root / ".git" / "hooks" / "pre-commit"
+
+    def commit_layer(self) -> dict[str, Any]:
+        for layer in self.service.status()["enforcement"]["layers"]:
+            if layer["layer"] == "commit_lint":
+                return layer
+        raise AssertionError("no commit_lint layer reported")
+
+    def test_a_current_hook_is_active(self) -> None:
+        layer = self.commit_layer()
+        self.assertTrue(layer["active"])
+        self.assertEqual(layer["script"], str(self.hook))
+
+    def test_a_hook_naming_a_vault_that_is_gone_is_inactive(self) -> None:
+        gone = self.root.parent / "moved-away"
+        self.hook.write_text(installer.render_pre_commit(gone), encoding="utf-8")
+        layer = self.commit_layer()
+        self.assertFalse(layer["active"])
+        self.assertIn(str(gone), layer["detail"])
+        self.assertIn("does not exist", layer["detail"])
+        self.assertEqual(layer["hint"], "bk hooks install --agent claude")
+        status = self.service.status()
+        self.assertIn("commit_lint", status["enforcement"]["inactive"])
+        self.assertFalse(status["healthy"])
+        # A hook naming another path is also not what an install writes now,
+        # so the headline files it under outdated -- the fix is the reinstall.
+        self.assertIn("commit_lint", cli._status_headline(status))
+
+    def test_a_hook_linting_another_vault_is_inactive(self) -> None:
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        other = FileVault.initialize(Path(elsewhere.name), policy())
+        self.hook.write_text(installer.render_pre_commit(other.root), encoding="utf-8")
+        layer = self.commit_layer()
+        self.assertFalse(layer["active"])
+        self.assertIn("not this vault", layer["detail"])
+
+    def test_the_repair_is_printed_under_the_table(self) -> None:
+        self.hook.write_text(
+            installer.render_pre_commit(self.root.parent / "moved-away"),
+            encoding="utf-8",
+        )
+        rendered = cli._render_status(self.service.status())
+        self.assertIn("pre-commit lints", rendered)
+        self.assertIn(": bk hooks install --agent claude", rendered)
+
+
+class DoctorCommitLintProbeTest(ShellHookCase):
+    """`bk doctor` runs the pre-commit hook brainskit wrote, as git would."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True)
+        self.install(skip_code_build=True)
+        self.hook = self.root / ".git" / "hooks" / "pre-commit"
+
+    def doctor(
+        self, *, path: str | None = None, lint: str = "clean"
+    ) -> dict[str, Any]:
+        environment = dict(os.environ)
+        environment["PATH"] = (
+            path if path is not None else f"{self.bin}{os.pathsep}{os.environ['PATH']}"
+        )
+        environment["FAKE_BK_LINT"] = lint
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            cli, "grammar_inventory", return_value={"python": True}
+        ):
+            return cli._doctor(self.service)
+
+    def probe(self, **kwargs: Any) -> dict[str, Any]:
+        report = self.doctor(**kwargs)["enforcement"]["commit_lint_probe"]
+        assert isinstance(report, dict)
+        return report
+
+    def test_a_clean_lint_is_enforcing(self) -> None:
+        report = self.probe()
+        self.assertEqual(report["state"], "enforcing")
+        self.assertEqual(report["exit"], 0)
+        self.assertTrue(self.doctor()["healthy"])
+
+    def test_lint_finding_errors_is_the_hook_working(self) -> None:
+        report = self.probe(lint="errors")
+        self.assertEqual(report["state"], "enforcing")
+        self.assertEqual(report["exit"], 1)
+        self.assertTrue(self.doctor(lint="errors")["healthy"])
+
+    def test_a_bk_error_is_not_enforcing_and_quoted(self) -> None:
+        report = self.probe(lint="not_a_vault")
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertEqual(report["exit"], 2)
+        self.assertEqual(report["hook_said"], "bk: Not a brainskit vault")
+        value = self.doctor(lint="not_a_vault")
+        self.assertFalse(value["healthy"])
+        self.assertIn("pre-commit hook not_enforcing", cli._doctor_headline(value))
+
+    def test_a_missing_bk_is_exit_127(self) -> None:
+        report = self.probe(path="/usr/bin:/bin")
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertEqual(report["exit"], 127)
+        self.assertRegex(report["hook_said"], "not found|No such file")
+
+    def test_a_hook_naming_another_vault_is_not_run(self) -> None:
+        self.hook.write_text(
+            installer.render_pre_commit(self.root.parent / "moved-away"),
+            encoding="utf-8",
+        )
+        report = self.probe()
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertIn("not this vault", report["detail"])
+        self.assertNotIn("exit", report)
+        self.assertEqual(report["hint"], "bk hooks install --agent claude")
+
+    def test_a_non_executable_hook_is_one_git_skips(self) -> None:
+        self.hook.chmod(0o644)
+        report = self.probe()
+        self.assertEqual(report["state"], "not_enforcing")
+        self.assertIn("not executable", report["detail"])
+
+    def test_an_operator_hook_is_neither_run_nor_judged(self) -> None:
+        self.hook.write_text('#!/bin/sh\ntouch "$PWD/ran"\n', encoding="utf-8")
+        self.hook.chmod(0o755)
+        report = self.probe()
+        self.assertEqual(report["state"], "not_judged")
+        self.assertFalse((self.root / "ran").exists())
+        self.assertTrue(self.doctor()["healthy"])
+
+    def test_the_hook_git_runs_under_core_hooks_path_is_the_one_run(self) -> None:
+        subprocess.run(
+            ["git", "config", "core.hooksPath", ".githooks"], cwd=self.root, check=True
+        )
+        redirected = self.root / ".githooks" / "pre-commit"
+        redirected.parent.mkdir()
+        redirected.write_text(installer.render_pre_commit(self.root), encoding="utf-8")
+        redirected.chmod(0o755)
+        report = self.probe(lint="not_a_vault")
+        self.assertEqual(Path(report["script"]).resolve(), redirected.resolve())
+        self.assertEqual(report["state"], "not_enforcing")
+
+    def test_no_repository_is_absent_not_a_fault(self) -> None:
+        shutil.rmtree(self.root / ".git")
+        self.assertEqual(self.probe()["state"], "absent")
+        self.assertTrue(self.doctor()["healthy"])
+
+
+class DoctorRunsTheRegisteredCommandTest(ShellHookCase):
+    """The gate probe runs what settings.json registers, through `sh -c`.
+
+    Before 0.8.0 the command was the bare script path. Under a workspace whose
+    path has a space, sh splits it, exits 127, and Claude Code lets the write
+    through -- while the script, run by its own path, denies perfectly.
+    """
+
+    VAULT_DIR = "a project"
+
+    def doctor(self) -> dict[str, Any]:
+        environment = dict(os.environ)
+        environment["PATH"] = f"{self.bin}{os.pathsep}{os.environ['PATH']}"
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            cli, "grammar_inventory", return_value={"python": True}
+        ):
+            return cli._doctor(self.service)
+
+    def register_unquoted(self) -> str:
+        settings = self.settings()
+        script = str(self.script("brainskit-gate"))
+        for entry in settings["hooks"]["PreToolUse"]:
+            for item in entry["hooks"]:
+                if item["command"] == shlex.quote(script):
+                    item["command"] = script
+        self.settings_path().write_text(json.dumps(settings), encoding="utf-8")
+        return script
+
+    def test_a_quoted_registration_is_enforcing(self) -> None:
+        probe = self.doctor()["enforcement"]["write_gate_probe"]
+        self.assertEqual(probe["state"], "enforcing")
+        self.assertEqual(probe["exercised"], "registered_command")
+        self.assertEqual(probe["command"], shlex.quote(str(self.script("brainskit-gate"))))
+
+    def test_an_unquoted_registration_fails_open_and_is_caught(self) -> None:
+        script = self.register_unquoted()
+        self.assertEqual(self.drive("brainskit-gate", self.hook_payload(
+            str(self.root / "wiki" / "x.md"))).returncode, 2, "the script itself denies")
+        gate = next(
+            layer
+            for layer in self.service.status()["enforcement"]["layers"]
+            if layer["layer"] == "write_gate"
+        )
+        self.assertTrue(gate["active"], "status still reads it as registered")
+        value = self.doctor()
+        probe = value["enforcement"]["write_gate_probe"]
+        self.assertEqual(probe["state"], "not_enforcing")
+        self.assertEqual(probe["command"], script)
+        self.assertRegex(probe["hook_said"], "not found|No such file")
+        self.assertFalse(value["healthy"])
+
+    def test_an_unregistered_script_is_still_exercised_directly(self) -> None:
+        settings = self.settings()
+        settings["hooks"]["PreToolUse"] = []
+        self.settings_path().write_text(json.dumps(settings), encoding="utf-8")
+        value = self.doctor()
+        probe = value["enforcement"]["write_gate_probe"]
+        self.assertEqual(probe["exercised"], "script")
+        self.assertEqual(probe["state"], "enforcing")
+        self.assertFalse(value["enforcement"]["gated"])
+        self.assertFalse(value["healthy"])
+
+
+class MovedWorkspaceTest(unittest.TestCase):
+    """The adapter records a workspace; moving the repository leaves it pointing nowhere.
+
+    Every layer then read "not installed" / "not a git repository", and the
+    headline said `enforcement off` without a word about why, while doctor
+    found no gate script to run and called the install healthy.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name).resolve()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def moved(self, *, git: bool) -> tuple[BrainskitService, Path, Path]:
+        old = self.base / "old-project"
+        old.mkdir()
+        if git:
+            subprocess.run(["git", "init", "--quiet"], cwd=old, check=True)
+        vault = FileVault.initialize(old / "docs" / "brain", policy())
+        service = BrainskitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+        with redirect_stderr(StringIO()):
+            cli._install_hooks(service, "claude", root=str(old), skip_code_build=True)
+        new = self.base / "new-project"
+        shutil.move(str(old), str(new))
+        vault = FileVault(new / "docs" / "brain")
+        service = BrainskitService(
+            vault, SqliteFtsIndex(vault.index_path), graph=MarkdownGraph()
+        )
+        return service, old, new
+
+    def test_every_layer_says_the_workspace_is_gone(self) -> None:
+        service, old, new = self.moved(git=True)
+        status = service.status()
+        for layer in status["enforcement"]["layers"]:
+            with self.subTest(layer=layer["layer"]):
+                self.assertFalse(layer["active"])
+                self.assertTrue(layer["workspace_missing"])
+                self.assertIn(str(old), layer["detail"])
+                self.assertIn("no longer exists", layer["detail"])
+                self.assertEqual(
+                    layer["hint"],
+                    f"bk hooks install --agent claude --root {shlex.quote(str(new))}",
+                )
+        self.assertIn(
+            "(the recorded workspace no longer exists)", cli._status_headline(status)
+        )
+        self.assertIn("reinstall: bk hooks install", cli._render_status(status))
+
+    def test_without_a_repository_the_root_is_a_placeholder(self) -> None:
+        service, _, _ = self.moved(git=False)
+        layer = service.status()["enforcement"]["layers"][0]
+        self.assertEqual(
+            layer["hint"], "bk hooks install --agent claude --root <project>"
+        )
+
+    def test_doctor_does_not_call_a_moved_install_healthy(self) -> None:
+        service, _, new = self.moved(git=True)
+        with patch.object(cli, "grammar_inventory", return_value={"python": True}):
+            value = cli._doctor(service)
+        for probe in ("write_gate_probe", "commit_lint_probe"):
+            with self.subTest(probe=probe):
+                report = value["enforcement"][probe]
+                self.assertEqual(report["state"], "unknown")
+                self.assertIn("no longer exists", report["detail"])
+                self.assertIn(shlex.quote(str(new)), report["hint"])
+        self.assertFalse(value["healthy"])
+
+    def test_reinstalling_where_it_now_is_repairs_it(self) -> None:
+        service, _, new = self.moved(git=True)
+        with redirect_stderr(StringIO()):
+            cli._install_hooks(service, "claude", root=str(new), skip_code_build=True)
+        layers = service.status()["enforcement"]["layers"]
+        self.assertTrue(all(layer["active"] for layer in layers))
+        self.assertFalse(any(layer.get("workspace_missing") for layer in layers))
+
+
+class SemanticLintReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
+    """`bk lint --semantic` on a cloud route withholds `local-only` pages.
+
+    The twin of the `ask`/`resurface`/`digest` fix: semantic lint read as
+    `local`, which keeps `local-only` pages, and handed their branch to the
+    router, so with `lint-semantic` mapped to a cloud provider one local-only
+    page in recall refused the whole lint. The real router runs, so a
+    local-only branch reaching the cloud prompt would be refused there.
+
+    Here rather than beside `SemanticLintWithholdsNeverIngestEvidenceTest`
+    only because that file belongs to another change in flight.
+    """
+
+    LOCAL_ONLY_TEXT = "Contradictions unsupported claims about kappa-sigma pay bands."
+    LOCAL_ONLY_TITLE = "Pay bands"
+    CLOUD_TEXT = "Contradictions unsupported claims about the Friday release cadence."
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str, *, model: str, output_schema: Any = None) -> str:
+            self.prompts.append(prompt)
+            return json.dumps({"findings": []})
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        raw = policy()
+        raw["branches"]["30-public"] = {"privacy": "cloud", "filing": "approve-each"}
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"]["lint-semantic"] = {"provider": "openai", "model": "m"}
+        self.vault = FileVault.initialize(Path(temporary.name), raw)
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = self.seed.capture(
+            None, text=self.LOCAL_ONLY_TEXT, title=self.LOCAL_ONLY_TITLE
+        )
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = self.seed.file(self.private_hash, "20-research")[
+            "source"
+        ]["path"]
+
+    def lint(self) -> tuple[dict[str, Any], _Recorder, list[str]]:
+        driver = self._Recorder()
+        providers: list[str] = []
+
+        def create_driver(name: str, config: Any) -> SemanticLintReadsUnderTheRoutesBoundaryTest._Recorder:
+            providers.append(name)
+            return driver
+
+        service = BrainskitService(
+            self.vault,
+            self.index,
+            judgment=PolicyJudgmentRouter(self.vault.config(), JobSpecs()),
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+        with patch("brainskit.infrastructure.llm._create_driver", create_driver):
+            return service.lint(semantic=True), driver, providers
+
+    def assert_no_local_only(self, text: str) -> None:
+        for disclosure in (
+            "kappa-sigma",
+            self.LOCAL_ONLY_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "20-research",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def test_a_cloud_route_lints_the_cloud_pages_and_counts_the_rest(self) -> None:
+        public = self.seed.capture(None, text=self.CLOUD_TEXT, title="Cadence")
+        self.seed.file(public["source"]["content_hash"], "30-public")
+        result, driver, providers = self.lint()
+        self.assertEqual(providers, ["openai"])
+        self.assertEqual(result["semantic_report"], {"findings": []})
+        self.assertEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("Friday release cadence", driver.prompts[0])
+        self.assert_no_local_only(driver.prompts[0])
+        self.assert_no_local_only(json.dumps(result, ensure_ascii=False))
+
+    def test_only_local_only_pages_names_the_mapping_that_would_read_them(
+        self,
+    ) -> None:
+        with self.assertRaises(PolicyError) as caught:
+            self.lint()
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("job_models.lint-semantic.local-only", details["hint"])
+        self.assert_no_local_only(
+            json.dumps(
+                {"message": str(caught.exception), "details": details},
+                ensure_ascii=False,
+            )
+        )
+

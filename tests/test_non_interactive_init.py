@@ -14,15 +14,18 @@ The wizard could already assemble a valid policy; there was no way to get it out
 
 from __future__ import annotations
 
-import contextlib
-import io
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from brainskit.domain.model import ValidationError, VaultConfig
-from brainskit.interfaces import cli, onboarding
+from brainskit.interfaces import onboarding
 
 
 class PrintConfigTest(unittest.TestCase):
@@ -32,11 +35,9 @@ class PrintConfigTest(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
 
     def print_config(self, *extra: str) -> str:
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            code = cli.main(["init", str(self.root / "v"), "--print-config", *extra])
-        self.assertEqual(code, 0)
-        return buffer.getvalue()
+        run = _harness.run_cli(["init", str(self.root / "v"), "--print-config", *extra])
+        self.assertEqual(run.code, 0)
+        return run.stdout
 
     def test_the_printed_policy_is_raw_json_not_the_result_envelope(self) -> None:
         """`--config` reads a policy, so `--print-config` must emit a policy."""
@@ -56,7 +57,7 @@ class PrintConfigTest(unittest.TestCase):
 
         policy_path = self.root / "policy.json"
         policy_path.write_text(self.print_config(), encoding="utf-8")
-        code = cli.main(
+        run = _harness.run_cli(
             [
                 "init",
                 str(self.root / "v"),
@@ -66,7 +67,7 @@ class PrintConfigTest(unittest.TestCase):
                 "--json",
             ]
         )
-        self.assertEqual(code, 0)
+        self.assertEqual(run.code, 0, run.output)
         self.assertTrue((self.root / "v" / ".brain" / "config.json").is_file())
 
     def test_printing_creates_nothing(self) -> None:

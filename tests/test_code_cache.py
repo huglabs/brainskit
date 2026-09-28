@@ -25,6 +25,11 @@ inside the vendored code but a wiring choice one layer up, in
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import contextlib
 import io
 import tempfile

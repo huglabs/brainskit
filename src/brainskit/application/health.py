@@ -37,6 +37,7 @@ from brainskit.application.install import (
     COMMIT_LINT,
     COMMIT_LINT_MECHANISM,
     DEFAULT_AGENT,
+    DEFAULT_GIT_HOOKS,
     INSTRUCTIONS,
     WRITE_GATE,
     AgentHook,
@@ -48,6 +49,8 @@ from brainskit.application.install import (
 from brainskit.application.installer import (
     command_script,
     is_generated_pre_commit,
+    pre_commit_lints,
+    pre_commit_vault,
     render_hook_script,
     render_pre_commit,
 )
@@ -180,27 +183,44 @@ class Health:
             # router refuses, for the reason `Jobs._judgment_context` gives: as
             # `human`, one never-ingest page anywhere in recall refused the
             # whole lint, and a page whose provenance does not resolve went to
-            # the model. The router's refusal stays as the last defence.
-            context = self.retrieval.context(
-                "contradictions unsupported claims",
-                limit=20,
-                consumer="local",
-                include_apply_contract=False,
-            )
+            # the model. When the route those branches take is not local, read
+            # again as `cloud`: a `local-only` page is then withheld and counted
+            # instead of the router refusing the whole lint. The router's
+            # refusal stays as the last defence.
+            def read(consumer: str) -> dict[str, Any]:
+                return self.retrieval.context(
+                    "contradictions unsupported claims",
+                    limit=20,
+                    consumer=consumer,
+                    include_apply_contract=False,
+                )
+
+            context = read("local")
+            local_withheld = int(context["redacted"])
+            if (
+                self.judgment_runner.consumer_for(
+                    job="lint-semantic", branches=context_branches(context)
+                )
+                == "cloud"
+            ):
+                context = read("cloud")
             withheld = int(context["redacted"])
             if withheld and not context["evidence"]:
+                hint = (
+                    "Run bk lint without --semantic, which checks every "
+                    "page, or review the withheld pages yourself with "
+                    "bk search -- they are withheld from models, not "
+                    "from you"
+                )
+                if withheld > local_withheld:
+                    hint += (
+                        "; to let a model read local-only pages, map "
+                        "job_models.lint-semantic.local-only to a local provider"
+                    )
                 raise PolicyError(
                     "Every page semantic lint would read is withheld from models "
                     "by its branch privacy policy",
-                    details={
-                        "withheld_sources": withheld,
-                        "hint": (
-                            "Run bk lint without --semantic, which checks every "
-                            "page, or review the withheld pages yourself with "
-                            "bk search -- they are withheld from models, not "
-                            "from you"
-                        ),
-                    },
+                    details={"withheld_sources": withheld, "hint": hint},
                 )
             semantic_report = self.judgment_runner.run(
                 job="lint-semantic",
@@ -807,63 +827,69 @@ class Health:
         install = agent_install(agent)
         root = self._agent_workspace(agent)
         settings_path = root / ".claude" / "settings.json"
-        registered: set[str] = set()
-        events: dict[str, set[str]] = {}
+        events: dict[str, list[dict[str, Any]]] = {}
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
             hooks = settings.get("hooks")
             if isinstance(hooks, dict):
                 for event, groups in hooks.items():
-                    commands = {
-                        str(hook.get("command", ""))
+                    events[event] = [
+                        hook
                         for group in groups
                         if isinstance(group, dict)
                         for hook in group.get("hooks", [])
                         if isinstance(hook, dict)
-                    }
-                    events[event] = commands
-                    registered |= commands
+                    ]
         except (OSError, ValueError, AttributeError, TypeError):
             # An unreadable or malformed settings file means "nothing is
             # registered", never an exception out of `bk status`.
             pass
 
-        def registered_under(event: str, path: Path) -> bool:
-            """Is ``path`` the script some command on ``event`` actually runs?
+        def registered_under(event: str, path: Path) -> dict[str, Any] | None:
+            """The entry on ``event`` whose command runs ``path``, if any.
 
             Compared against the resolved path as well as the literal one: on
             macOS a vault under /var resolves to /private/var, so a settings
             file written with either spelling must still read as registered.
             A command may also wrap the script in a shell guard rather than
             naming it alone, so containment counts.
+
+            The entry itself is returned, not a yes: `bk doctor` runs the
+            command as registered, because a registration that does not survive
+            the shell fails open while the script it names works fine by hand.
             """
             try:
                 resolved = path.resolve()
             except OSError:
                 resolved = path
             candidates = {str(path), str(resolved)}
-            for command in events.get(event, set()):
+            for hook in events.get(event, []):
+                command = str(hook.get("command", ""))
+                entry = {
+                    key: hook[key] for key in ("command", "args", "shell") if key in hook
+                }
                 if command in candidates or any(c in command for c in candidates):
-                    return True
+                    return entry
                 # The installer shell-quotes the path, and a quoted `'` is no
                 # longer a substring of the command.
                 if command_script(command) in candidates:
-                    return True
+                    return entry
                 # The command may spell the same file a different way. Compare
                 # resolved forms, guarded because a command is often a shell
                 # snippet rather than a bare path.
                 try:
                     if Path(command).resolve() == resolved:
-                        return True
+                        return entry
                 except (OSError, ValueError):
                     continue
-            return False
+            return None
 
         recorded = (self.vault.root / install.adapter).is_file()
 
         def hook_layer(hook: AgentHook) -> dict[str, Any]:
             path = root / ".claude" / "hooks" / hook.script
-            active = path.is_file() and registered_under(hook.event, path)
+            registration = registered_under(hook.event, path)
+            active = path.is_file() and registration is not None
             detail = "active"
             if not path.is_file():
                 detail = f"{hook.script} is not installed"
@@ -880,7 +906,10 @@ class Health:
                 # reach the exact file this verdict is about instead of
                 # rebuilding the path from assumptions about the workspace.
                 "script": str(path),
+                "workspace": str(root),
             }
+            if registration is not None:
+                layer["registration"] = registration
             if recorded and self._hook_outdated(hook, path, root):
                 layer["outdated"] = True
                 layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
@@ -903,17 +932,31 @@ class Health:
                         )
             return layer
 
-        pre_commit = root / ".git" / "hooks" / "pre-commit"
+        pre_commit = root / DEFAULT_GIT_HOOKS / "pre-commit"
         # A redirected hooks directory disqualifies the layer no matter what the
         # file says: git will not run it, so its contents prove nothing.
         redirected_hooks = redirected_git_hooks_path(root)
         try:
-            commit_active = (
-                redirected_hooks is None
-                and pre_commit.is_file()
-                and "lint" in pre_commit.read_text(encoding="utf-8")
-            )
-        except OSError:
+            pre_commit_text = pre_commit.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            pre_commit_text = None
+        commit_active = (
+            redirected_hooks is None
+            and pre_commit_text is not None
+            and "lint" in pre_commit_text
+        )
+        # Judged by content alone, a generated hook naming a vault that does
+        # not exist read `active` while every commit failed: a pre-0.8.0 hook
+        # JSON-quoted a non-ASCII path, and a repository moved since install
+        # names its old location. Reading the `--vault` sh will see catches
+        # both without running anything.
+        lints_elsewhere = (
+            commit_active
+            and pre_commit_text is not None
+            and is_generated_pre_commit(pre_commit_text)
+            and pre_commit_lints(pre_commit_text, root, self.vault.root) is False
+        )
+        if lints_elsewhere:
             commit_active = False
         if commit_active:
             commit_detail = "active"
@@ -942,16 +985,34 @@ class Health:
             "mechanism": COMMIT_LINT_MECHANISM,
             "active": commit_active,
             "detail": commit_detail,
+            # The file git will actually run, so `bk doctor` can run it too.
+            "script": str((redirected_hooks or root / DEFAULT_GIT_HOOKS) / "pre-commit"),
+            "workspace": str(root),
         }
-        if recorded and commit_active and self._pre_commit_outdated(pre_commit):
-            # Stays active: the rules live in `bk lint`, not in the hook.
+        if lints_elsewhere and pre_commit_text is not None:
+            named = pre_commit_vault(pre_commit_text, root)
+            consequence = (
+                "which does not exist, so every commit fails"
+                if named is not None and not named.exists()
+                else "not this vault, so its wiki is never linted at commit time"
+            )
+            commit_layer["detail"] = f"pre-commit lints {named}, {consequence}"
+            commit_layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
+        if (
+            recorded
+            and (commit_active or lints_elsewhere)
+            and self._pre_commit_outdated(pre_commit)
+        ):
+            # An outdated hook that still lints this vault stays active: the
+            # rules live in `bk lint`, not in the hook.
             commit_layer["outdated"] = True
             commit_layer["hint"] = _reinstall_hint(agent, root, self.vault.root)
-            commit_layer["detail"] = (
-                "pre-commit is older than the one this version installs"
-            )
+            if commit_active:
+                commit_layer["detail"] = (
+                    "pre-commit is older than the one this version installs"
+                )
 
-        return [
+        layers = [
             *(hook_layer(hook) for hook in install.hooks),
             commit_layer,
             {
@@ -962,6 +1023,37 @@ class Health:
                 "detail": "active" if advisory_active else "no managed block found",
             },
         ]
+        if recorded and not root.exists():
+            # Every row above is off for the one reason none of them can see:
+            # the adapter names a workspace that is gone, usually because the
+            # repository was moved. Each row saying "not installed" sent the
+            # operator looking for files rather than at the adapter.
+            detail = (
+                f"the workspace {install.adapter} records, {root}, no longer "
+                "exists; was the project moved?"
+            )
+            hint = self._moved_workspace_hint(agent)
+            for layer in layers:
+                layer["detail"] = detail
+                layer["hint"] = hint
+                layer["workspace_missing"] = True
+        return layers
+
+    def _moved_workspace_hint(self, agent: str) -> str:
+        """The reinstall for an adapter whose workspace is gone.
+
+        `--root` is required rather than optional here: without it the install
+        lands beside the vault. The project the vault now sits in is named when
+        there is one to name -- the same enclosing repository an install with no
+        recorded workspace is reported against -- and left as a placeholder
+        otherwise, because guessing wrong writes hooks nobody loads.
+        """
+
+        project = self._enclosing_project_root()
+        root = (
+            shlex.quote(str(project)) if (project / ".git").exists() else "<project>"
+        )
+        return f"bk hooks install --agent {agent} --root {root}"
 
     def _hook_outdated(self, hook: AgentHook, path: Path, workspace: Path) -> bool:
         """Whether a brainskit-generated hook differs from what an install writes now.

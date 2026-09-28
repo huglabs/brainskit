@@ -8,8 +8,11 @@ stdlib-only and hermetic while still asserting the whole decision tree.
 
 from __future__ import annotations
 
-import contextlib
-import io
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import json
 import unittest
 import unittest.mock
@@ -121,17 +124,12 @@ class UpdateFlowTest(unittest.TestCase):
     """The decision tree, end to end through `main` with the edges stubbed."""
 
     def run_cli(self, argv: list[str]) -> tuple[int, dict, str]:
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = cli.main(argv)
-            except SystemExit as exit_:  # argparse's own failures
-                code = int(exit_.code or 0)
+        run = _harness.run_cli(argv)
         try:
-            payload = json.loads(out.getvalue())
+            payload = run.json()
         except Exception:
             payload = {}
-        return code, payload, out.getvalue() + err.getvalue()
+        return run.code, payload, run.output
 
     def setUp(self) -> None:
         self.runs: list[list[str]] = []

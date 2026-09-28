@@ -15,6 +15,11 @@ is a moving thing to point at, not evidence to preserve.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import hashlib
 import tempfile
 import unittest

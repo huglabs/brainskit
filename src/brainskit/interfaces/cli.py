@@ -2568,7 +2568,10 @@ def _status_headline(value: dict[str, Any]) -> str:
         and not layer.get("outdated")
     ]
     if inactive:
-        faults.append(f"enforcement off: {', '.join(inactive)}")
+        fault = f"enforcement off: {', '.join(inactive)}"
+        if any(layer.get("workspace_missing") for layer in layers):
+            fault += " (the recorded workspace no longer exists)"
+        faults.append(fault)
     # A stale gate is off for `healthy`, but "off" would send the operator
     # looking for a missing file when the fix is a reinstall.
     stale = [
@@ -2638,6 +2641,16 @@ def _enforcement_section(layers: Sequence[dict[str, Any]]) -> list[str]:
     )
     for hint in hints:
         parts.append(console.style(f"  refresh outdated hook scripts: {hint}", console.WARN))
+    # A layer off for a reason a reinstall fixes -- a moved workspace, a hook
+    # naming another vault -- carries the command too, and it is no use unsaid.
+    repairs = dict.fromkeys(
+        str(layer["hint"])
+        for layer in layers
+        if not layer.get("active") and not layer.get("outdated") and layer.get("hint")
+    )
+    for hint in repairs:
+        if hint not in hints:
+            parts.append(console.style(f"  reinstall: {hint}", console.WARN))
     return parts
 
 
@@ -3135,6 +3148,9 @@ def _doctor_headline(value: dict[str, Any]) -> str:
         )
     probe = enforcement.get("write_gate_probe") or {}
     state = probe.get("state")
+    commit_state = (enforcement.get("commit_lint_probe") or {}).get("state")
+    if commit_state not in {"enforcing", "absent", "not_judged", None}:
+        faults.append(f"pre-commit hook {commit_state}")
     if state not in {"enforcing", "absent", None}:
         faults.append(f"write gate {state}")
     elif state == "enforcing" and not enforcement.get("gated", True):
@@ -3246,6 +3262,21 @@ def _render_doctor(value: dict[str, Any]) -> str:
         )
         if probe.get("hook_said"):
             parts.append(console.style(f"  {probe['hook_said']}", console.MUTED))
+        if probe.get("hint"):
+            parts.append(console.style(f"  {probe['hint']}", console.WARN))
+    commit_probe = enforcement.get("commit_lint_probe")
+    if commit_probe:
+        parts += ["", console.rule("pre-commit hook, exercised")]
+        parts.append(
+            "  " + console.status_line(
+                commit_probe["state"] in {"enforcing", "absent", "not_judged"},
+                str(commit_probe.get("detail", "")),
+            )
+        )
+        if commit_probe.get("hook_said"):
+            parts.append(console.style(f"  {commit_probe['hook_said']}", console.MUTED))
+        if commit_probe.get("hint"):
+            parts.append(console.style(f"  {commit_probe['hint']}", console.WARN))
     return "\n".join(parts)
 
 

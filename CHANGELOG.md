@@ -55,6 +55,12 @@ artifact was built from is the durable record of what shipped.
   `withheld_sources` in their JSON — a count, never a name, branch or hash — and
   print "N source(s) withheld from the model by privacy policy" when it is
   above zero. The web viewer shows the same line under an ask answer.
+- Tests: the suite's machine isolation no longer depends on pytest —
+  `python -m unittest` or running a test file directly can no longer write the
+  operator's `~/.config/brainskit/vaults.json`
+  ([#20](https://github.com/huglabs/brainskit/issues/20)); every in-process CLI
+  call in the suite refuses a run that never reached the command under test
+  ([#21](https://github.com/huglabs/brainskit/issues/21)).
 
 ### Fixed
 
@@ -63,8 +69,7 @@ artifact was built from is the durable record of what shipped.
   `ok` document. It now reads any document that carries a `result`.
   **Re-run `bk hooks install --agent claude`** (no `--force` needed — the
   managed script is rewritten in place) to refresh an installed copy;
-  `bk status` and `bk doctor` check that the script is installed and
-  registered, not what it says, so they report a stale copy as active.
+  `bk status` and `bk doctor` flag a stale copy as `outdated` with that command.
 - **The release gate now proves both artefacts reached PyPI**
   ([#7](https://github.com/huglabs/brainskit/issues/7)). The visibility check
   matched `*"brainskit-$version"*` anywhere in the simple index, so a `v0.6`
@@ -130,8 +135,8 @@ artifact was built from is the durable record of what shipped.
   model instead of blocking the call. When every match is withheld the job
   refuses with `policy_denied` and a hint (`bk search` for ask and resurface,
   `bk lint` without `--semantic` for lint) instead of calling a model. The
-  router's own refusals are unchanged and remain the last defence — including
-  `local-only` evidence on a cloud-routed `ask`, which still refuses.
+  router's own refusals are unchanged and remain the last defence. `local-only`
+  evidence on a cloud route is covered by the entry below.
 - **`bk digest` no longer tells the model about material its route may not
   see.** The route is chosen as before — from the `local`-visible recent
   sources — but is now asked of the router itself (`route_for`, which `run`
@@ -160,15 +165,76 @@ artifact was built from is the durable record of what shipped.
   `bk hooks install` would write now; a stale one is `outdated: true` with a
   `bk hooks install --agent <agent> [--root …]` hint and is listed in
   `enforcement.outdated`. An outdated write gate counts as not gated and not
-  healthy; an outdated session-status script is a warning. This closes the gap
-  the SessionStart entry above describes. `/api/status` and the web viewer
-  header report it too (for `cloud`, absolute paths in the hint become
-  `<path>`, ADR 0009), and the SessionStart summary names outdated hooks with
-  the refresh command.
+  healthy; an outdated session-status script is a warning. `/api/status` and
+  the web viewer header report it too (for `cloud`, absolute paths in the hint
+  become `<path>`, ADR 0009), and the SessionStart summary names outdated hooks
+  with the refresh command.
 - **`bk doctor` no longer reports `healthy` for a write gate the agent does
   not run.** A script that refused the probe but is unregistered or outdated
   now fails the check, and doctor draws the advisory `instructions` layer as
   `bk status` does — it used to show a fourth green tick.
+- **`ask`, `resurface`, `digest` and `lint --semantic` no longer refuse the
+  whole job when the job is mapped to a cloud provider and a `local-only` source
+  appears in recall** (or among recent sources, for `digest`). Evidence is read
+  under the boundary of the route the router picks: on a cloud route
+  `local-only` and `never-ingest` evidence is withheld and counted in
+  `withheld_sources`; a local route — flat or privacy-keyed — still receives it.
+  If every match is withheld the job returns `policy_denied` with a hint naming
+  how to route `local-only` evidence to a local provider
+  (`job_models.<job>.local-only`). The router's refusal stays as the last line
+  of defence.
+- **The git pre-commit hook quoted the vault path as JSON**, so a vault under a
+  non-ASCII directory (e.g. `Operação/`) was never found and every commit
+  failed; a path containing `$` or backticks was expanded or executed. The hook
+  is now shell-quoted and carries the `# brainskit:generated` marker;
+  `bk hooks install` upgrades a hook written by an earlier release without
+  `--force`, and `bk status` reports it as outdated. Claude Code hook commands
+  in `.claude/settings.json` are shell-quoted too — a workspace path with a
+  space made the write gate exit 127 and let every write through; stale
+  unquoted entries are replaced on reinstall.
+- **`bk status` no longer reports `commit_lint` active for a pre-commit hook
+  that lints some other vault.** The layer was judged by the file's existence
+  and content, so while this repository's own hook named a directory that did
+  not exist — the JSON-quoted path above — `bk status` said "vault healthy" and
+  every commit failed. It now reads the `--vault` a brainskit-generated hook
+  passes, as sh will see it, and a path that is not this vault makes the layer
+  inactive with the path, whether it exists, and the reinstall command. This
+  also catches a repository moved since install. Operator-written hooks are
+  not judged.
+- **`bk doctor` runs the pre-commit hook** as well as the write gate
+  (`enforcement.commit_lint_probe`): the hook git will run — `core.hooksPath`
+  honoured — executed from the workspace. Exit 0 (clean) or 1 (lint found
+  errors) is `enforcing`; anything else — 126/127 from the shell, 2 from a `bk`
+  error such as "Not a brainskit vault" — is `not_enforcing` with the hook's
+  first stderr line, as are a hook naming another vault (not run) and one
+  without its executable bit, which git skips. An operator-written hook is
+  `not_judged` and never run. `not_enforcing` and `unknown` make `healthy`
+  false: such a hook refuses every commit without checking one, and
+  `bk status` already counts an inactive `commit_lint` against its own
+  `healthy`. `gated` still means the write gate alone. The lint the probe runs
+  refreshes page ages in the freshness ledger, as every commit does.
+- **`bk doctor`'s write-gate probe runs the command `.claude/settings.json`
+  registers**, through `sh -c` as Claude Code does (or directly, for an
+  exec-form entry with `args`), with `CLAUDE_PROJECT_DIR` set and the workspace
+  as working directory. It ran the script path, so the unquoted registration
+  above — exit 127 under the shell, every write allowed — passed the probe
+  because the script itself denied correctly. The report names the command
+  (`command`) and says what was run (`exercised`: `registered_command`, or
+  `script` when nothing registers it, which `gated: false` already fails). A
+  gate script without its executable bit is now `not_enforcing` (the shell's
+  exit 126) rather than `unknown`.
+- **A vault whose repository was moved says so.** The adapter records the
+  workspace an install went to; once that directory is gone `bk status`
+  printed "enforcement off: write_gate, session_status, commit_lint" and each
+  row said a file was missing, and `bk doctor` found no gate to run and called
+  the install healthy. Every layer now says the recorded workspace no longer
+  exists and carries `workspace_missing: true` and a reinstall hint —
+  `bk hooks install --agent <agent> --root <project>`, naming the repository
+  the vault now sits in when there is one — which `bk status` prints under the
+  table and appends to its headline. Doctor's probes report `unknown` with the
+  same hint, and `healthy` is false. The reinstall itself works without
+  `--force`: an unedited skill file rendered for the old vault path is now
+  recognised as brainskit's and rewritten, where it used to refuse.
 
 - `providers.<name>.reasoning` on the OpenAI-compatible driver, forwarded
   verbatim to the provider. Absent by default, so a model that reasons keeps

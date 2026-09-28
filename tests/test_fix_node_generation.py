@@ -23,6 +23,11 @@ Every case here descends from a reproduced failure, not a hypothesis:
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import hashlib
 import json
 import os

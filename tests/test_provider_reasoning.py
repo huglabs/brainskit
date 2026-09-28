@@ -28,6 +28,11 @@ must still answer the job rather than fail on an operator's choice of model.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import io
 import json as _json
 import sys

@@ -21,6 +21,11 @@ placeholder, and `.env` must never be read as source.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import tempfile
 import unittest
 from pathlib import Path

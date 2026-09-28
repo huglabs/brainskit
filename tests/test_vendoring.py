@@ -52,6 +52,11 @@ Regenerating it is not a rubber stamp: whatever moved has to be argued for in
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import fnmatch
 import hashlib
 import os
@@ -637,7 +642,7 @@ class ReleaseGateIsolationTest(unittest.TestCase):
     both `ci.yml` and `release.yml` run this script.
 
     Pinned here for the same reason `RegistryIsolationTest` pins
-    `tests/conftest.py`: the isolation is one line, and one line is exactly what
+    `tests/_harness.py`: the isolation is one line, and one line is exactly what
     a later edit removes without noticing. Asserted statically rather than by
     running the gate, because the gate builds a wheel and this file is unit
     speed -- what can regress is the *placement* of that line, and placement is

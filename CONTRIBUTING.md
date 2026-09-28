@@ -56,6 +56,11 @@ calls it. See [`NOTICE`](./NOTICE).
 - **Tests assert behaviour, not implementation.** A test that would pass with
   the feature reverted is not a test. If you are unsure, revert your change,
   run the test, and confirm it fails.
+- **Tests stand on `tests/_harness.py`.** A new test module imports it before
+  anything else (copy the `try`/`except ImportError` block from any existing
+  one), so it can never reach your real `~/.config` under any runner; and it
+  drives `bk` through `_harness.run_cli`, which refuses a run that never reached
+  the command under test. `test_harness.py` fails the suite if either lapses.
 - **A refusal names the next move.** Every error carries a machine code (see
   [the failure table](./docs/commands.md#what-a-failure-tells-you-to-do)); pick
   the one whose *remedy* matches, and keep the human message specific enough

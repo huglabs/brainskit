@@ -22,6 +22,11 @@ so the two sides are compared rather than each being asserted against a fixture.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import subprocess
 import tempfile

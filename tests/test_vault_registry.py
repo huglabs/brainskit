@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import contextlib
-import io
 import json
 import os
 import shutil
 import stat
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -124,11 +127,11 @@ class RegistryFixture(unittest.TestCase):
         patched.start()
         self.addCleanup(patched.stop)
 
-    def run_cli(self, argv: list[str]) -> tuple[int, dict[str, Any]]:
-        stream = io.StringIO()
-        with redirect_stdout(stream):
-            code = cli.main(["--json", *argv])
-        return code, json.loads(stream.getvalue())
+    def run_cli(
+        self, argv: list[str], *, expect: tuple[str, ...] = ()
+    ) -> tuple[int, dict[str, Any]]:
+        run = _harness.run_cli(["--json", *argv], expect=expect)
+        return run.code, run.json()
 
     def result(self, argv: list[str]) -> dict[str, Any]:
         code, payload = self.run_cli(argv)
@@ -219,7 +222,9 @@ class RegistrationContractTest(RegistryFixture):
     def test_a_path_that_is_not_a_vault_is_refused(self) -> None:
         stranger = self.root / "not-a-vault"
         stranger.mkdir()
-        code, payload = self.run_cli(["vaults", "register", str(stranger)])
+        code, payload = self.run_cli(
+            ["vaults", "register", str(stranger)], expect=("Not a brainskit vault",)
+        )
         self.assertEqual(code, 2)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "validation_error")
@@ -228,10 +233,13 @@ class RegistrationContractTest(RegistryFixture):
 
     def test_a_missing_path_is_refused_rather_than_registered_blindly(self) -> None:
         code, payload = self.run_cli(
-            ["vaults", "register", str(self.root / "never-existed")]
+            ["vaults", "register", str(self.root / "never-existed")],
+            expect=("Not a brainskit vault",),
         )
         self.assertEqual(code, 2)
         self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "validation_error")
+        self.assertFalse((self.config_home / "brainskit" / "vaults.json").exists())
 
     def test_the_stored_path_is_the_one_the_shared_store_hashes(self) -> None:
         """A registry entry that normalised differently would report a
@@ -413,7 +421,9 @@ class MissingVaultTest(RegistryFixture):
         doomed = self.make_vault("gone", enable="postgres")
         self.result(["vaults", "register", str(doomed)])
         shutil.rmtree(doomed)
-        code, payload = self.run_cli(["vaults", "sync"])
+        code, payload = self.run_cli(
+            ["vaults", "sync"], expect=("Not a brainskit vault",)
+        )
         self.assertEqual(code, 1)
         self.assertFalse(payload["ok"], "the envelope and the exit status are one answer")
         result = payload["result"]
@@ -421,6 +431,7 @@ class MissingVaultTest(RegistryFixture):
         entry = result["vaults"][0]
         self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["code"], "not_found")
+        self.assertEqual(entry["reason"], "Not a brainskit vault")
 
     def test_forget_clears_a_stale_entry_for_a_directory_that_is_gone(self) -> None:
         doomed = self.make_vault("stale")
@@ -578,8 +589,9 @@ class RegistryIsolationTest(unittest.TestCase):
     collected dozens of `/var/folders/.../T/tmp*/v` entries pointing at
     directories that no longer exist.
 
-    `tests/conftest.py` fixes that by pointing `XDG_CONFIG_HOME` at a
-    throwaway directory for the whole run. These two cases are what stops
+    `tests/_harness.py` fixes that by pointing `XDG_CONFIG_HOME` at a
+    throwaway directory for the whole run, whatever the runner. These two
+    cases are what stops
     that from being deleted, or defeated by an unrelated change, without
     anyone noticing -- deliberately taking the environment as the run
     actually has it rather than patching one of their own, because the
@@ -617,9 +629,8 @@ class RegistryIsolationTest(unittest.TestCase):
         regression this pollution must not be traded for.
 
         The destination is checked before `init` runs as well as after, so
-        this fails without polluting anything when the isolation is missing
-        -- running one of these files directly through `unittest` loads no
-        `conftest.py` and is exactly that case.
+        this fails without polluting anything when the isolation is missing.
+        `test_harness.py` covers the runners that load no `conftest.py`.
         """
 
         self.refuse_the_operator_s_registry("before init")
@@ -628,20 +639,18 @@ class RegistryIsolationTest(unittest.TestCase):
             config = root / "policy.json"
             config.write_text(json.dumps(policy()), encoding="utf-8")
             target = root / "v"
-            stream = io.StringIO()
-            with redirect_stdout(stream):
-                code = cli.main(
-                    [
-                        "--json",
-                        "init",
-                        str(target),
-                        "--config",
-                        str(config),
-                        "--skip-code-build",
-                    ]
-                )
-            self.assertEqual(code, 0, stream.getvalue())
-            registered = json.loads(stream.getvalue())["result"]["registered"]
+            run = _harness.run_cli(
+                [
+                    "--json",
+                    "init",
+                    str(target),
+                    "--config",
+                    str(config),
+                    "--skip-code-build",
+                ]
+            )
+            self.assertEqual(run.code, 0, run.output)
+            registered = run.json()["result"]["registered"]
             self.assertIsNotNone(registered, "bk init must still register the vault")
             # This is the one case that deliberately writes the ambient
             # registry, so it is also the one that has to leave it as it found

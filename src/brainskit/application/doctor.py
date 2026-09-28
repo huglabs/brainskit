@@ -3,7 +3,8 @@
 `installer.py` writes an install and `Health` reads one back; both then say a
 layer is *installed and registered*. This module answers the different question
 `bk doctor` exists for -- whether the thing installed actually refuses a write
--- by executing the gate hook on one path it must deny and one it must allow.
+-- by executing the gate hook on one path it must deny and one it must allow,
+and the git pre-commit hook to see that it lints this vault.
 That is the "exercised, not believed" idea ADR 0004 keeps separate from the
 registry, and it is separate here for the same reason: the installer's remit
 ends when the files are on disk, and this begins by distrusting them.
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import re
 import subprocess
 from collections.abc import Mapping
@@ -28,7 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from brainskit.application.codegraph import CODE_PROJECTION
-from brainskit.application.install import WRITE_GATE
+from brainskit.application.install import COMMIT_LINT, WRITE_GATE
+from brainskit.application.installer import (
+    is_generated_pre_commit,
+    pre_commit_lints,
+    pre_commit_vault,
+)
 from brainskit.application.ports import EnvironmentPort, VaultPort
 
 #: The probe payload is the shape Claude Code sends a PreToolUse hook.
@@ -38,32 +45,53 @@ _GATE_PROBE_NAME = "brainskit-doctor-probe.md"
 _SELF_DISTRIBUTION = "brainskit"
 
 
-def _run_gate_hook(script: Path, target: Path) -> tuple[int | None, str]:
-    """Ask the installed hook about one path, exactly as the agent would.
+def _run_hook(
+    argv: list[str], *, stdin: str | None, workspace: Path | None, timeout: int = 60
+) -> tuple[int | None, str]:
+    """Run one installed hook the way its caller would; (status, first stderr line).
 
-    Runs the script itself rather than `sh script`, because the executable bit
-    is part of what makes a hook fire and `sh` would paper over its absence.
     Never raises: a hook that cannot run is a finding, not a crash.
     """
-    payload = json.dumps(
-        {"tool_name": "Write", "tool_input": {"file_path": str(target)}}
-    )
+    env = dict(os.environ)
+    cwd = workspace if workspace is not None and workspace.is_dir() else None
+    if cwd is not None:
+        env["CLAUDE_PROJECT_DIR"] = str(cwd)
     try:
-        # The path is the hook brainskit installed and `Health` reports, not
-        # caller input, and it is a one-element argument vector with no shell.
-        # Executing it is the entire point: reading the file instead is the
-        # bug this probe exists to catch.
+        # The argument vector is the hook brainskit installed or the command
+        # the operator's settings.json registers -- the thing the agent or git
+        # will run anyway. Executing it is the entire point: reading the file
+        # instead is the bug this probe exists to catch.
         done = subprocess.run(  # noqa: S603
-            [str(script)],
-            input=payload,
+            argv,
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
             check=False,
+            cwd=cwd,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, str(exc)
     return done.returncode, done.stderr.strip()
+
+
+def _registered_argv(registration: Mapping[str, Any]) -> list[str]:
+    """How Claude Code runs a registered hook command.
+
+    Per its hooks reference: with `args` it spawns `command` directly with that
+    argument vector; without, "the `command` string is passed to a shell: `sh -c`
+    on macOS and Linux". Running the script path instead is what let a command
+    that exits 127 under `sh` -- an unquoted workspace path with a space -- pass
+    this probe while every write went through.
+    """
+    command = str(registration.get("command", ""))
+    args = registration.get("args")
+    if isinstance(args, list):
+        return [command, *(str(arg) for arg in args)]
+    shell = "/bin/bash" if registration.get("shell") == "bash" else "/bin/sh"
+    return [shell, "-c", command]
 
 
 #: The extra whose grammars pip installs as one unit, and the one the docs
@@ -338,19 +366,40 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
         ),
         None,
     )
+    if entry is not None and entry.get("workspace_missing"):
+        return _workspace_missing(entry)
     script = Path(entry["script"]) if entry and entry.get("script") else None
-    if script is None or not script.is_file():
+    if entry is None or script is None or not script.is_file():
         return {
             "state": "absent",
             "detail": "no write-gate hook is installed; nothing to exercise",
         }
 
+    registration = entry.get("registration")
+    if isinstance(registration, dict) and registration.get("command"):
+        argv = _registered_argv(registration)
+        exercised = "registered_command"
+    else:
+        # Nothing registers it, so the agent never runs it and `gated` already
+        # says so; the script is still worth running to say whether it works.
+        # Run as itself rather than `sh script`: the executable bit is part of
+        # what makes a hook fire, and `sh` would paper over its absence.
+        argv = [str(script)]
+        exercised = "script"
+    workspace = Path(entry["workspace"]) if entry.get("workspace") else None
+
     vault_root = vault.root
     gated = vault_root / "wiki" / _GATE_PROBE_NAME
     ordinary = vault_root.parent / _GATE_PROBE_NAME
 
-    denied_status, denied_note = _run_gate_hook(script, gated)
-    allowed_status, allowed_note = _run_gate_hook(script, ordinary)
+    def ask(target: Path) -> tuple[int | None, str]:
+        payload = json.dumps(
+            {"tool_name": "Write", "tool_input": {"file_path": str(target)}}
+        )
+        return _run_hook(argv, stdin=payload, workspace=workspace)
+
+    denied_status, denied_note = ask(gated)
+    allowed_status, allowed_note = ask(ordinary)
     denies_gated = denied_status == 2
     allows_ordinary = allowed_status == 0
 
@@ -375,6 +424,7 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
         "state": state,
         "detail": detail,
         "script": str(script),
+        "exercised": exercised,
         "denies_a_gated_write": denies_gated,
         "allows_an_ordinary_write": allows_ordinary,
     }
@@ -383,6 +433,129 @@ def probe_write_gate(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str
     note = denied_note or allowed_note
     if note and state != "enforcing":
         report["hook_said"] = note
+    if isinstance(registration, dict) and exercised == "registered_command":
+        report["command"] = str(registration["command"])
+    return report
+
+
+def _workspace_missing(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """A layer whose recorded workspace is gone: nothing there to run."""
+
+    report: dict[str, Any] = {
+        "state": "unknown",
+        "detail": f"nothing to exercise: {entry.get('detail', '')}",
+    }
+    if entry.get("hint"):
+        report["hint"] = entry["hint"]
+    return report
+
+
+#: `bk lint`'s exit status when it ran and found an error: `interfaces/cli.py`
+#: returns `0 if ok else 1` for a lint result, and every `BrainskitError` --
+#: "Not a brainskit vault" among them -- exits through the error table with 2.
+_LINT_FOUND_ERRORS = 1
+
+
+def _first_line(text: str) -> str:
+    return next((line for line in text.splitlines() if line.strip()), "")
+
+
+def probe_commit_lint(vault: VaultPort, layers: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run the git pre-commit hook instead of reading it.
+
+    `commit_lint` was judged by the file's existence and content, so a hook
+    naming a vault that does not exist -- a pre-0.8.0 hook's JSON-quoted
+    non-ASCII path, or a repository moved since install -- read `active` while
+    every commit failed with "Not a brainskit vault". Run from the workspace
+    with nothing on stdin, as git runs it: exit 0 is a clean lint and exit 1 is
+    lint finding errors, both of which mean the hook linted this vault. Anything
+    else -- 126/127 from the shell, 2 from a `bk` error -- means it refuses every
+    commit without checking one, which teaches `--no-verify`.
+
+    Only a hook brainskit wrote is run. An operator's hook may do anything at
+    all, and executing it to find out is not a diagnosis doctor gets to make.
+    `bk lint` refreshes page ages in the freshness ledger as it goes, the same
+    bookkeeping every commit and every `bk status` performs; nothing else is
+    written.
+    """
+
+    entry = next(
+        (
+            layer
+            for layer in layers
+            if layer["layer"] == COMMIT_LINT and layer.get("script")
+        ),
+        None,
+    )
+    if entry is not None and entry.get("workspace_missing"):
+        return _workspace_missing(entry)
+    hook = Path(entry["script"]) if entry else None
+    if entry is None or hook is None or not hook.is_file():
+        return {
+            "state": "absent",
+            "detail": "no pre-commit hook is installed; nothing to exercise",
+        }
+    workspace = Path(entry.get("workspace") or hook.parent)
+    report: dict[str, Any] = {"script": str(hook)}
+    try:
+        content = hook.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {**report, "state": "unknown", "detail": f"the hook could not be read: {exc}"}
+    if not is_generated_pre_commit(content):
+        return {
+            **report,
+            "state": "not_judged",
+            "detail": "the pre-commit hook was not written by brainskit, so it is not run",
+        }
+    if not os.access(hook, os.X_OK):
+        return {
+            **report,
+            "state": "not_enforcing",
+            "detail": (
+                "the pre-commit hook is not executable, and git skips it, so "
+                "commits are never linted"
+            ),
+            "hint": f"chmod +x {hook}",
+        }
+    if pre_commit_lints(content, workspace, vault.root) is False:
+        named = pre_commit_vault(content, workspace)
+        report.update(
+            {
+                "state": "not_enforcing",
+                "detail": f"the pre-commit hook lints {named}, not this vault",
+            }
+        )
+        if entry.get("hint"):
+            report["hint"] = entry["hint"]
+        return report
+
+    status, stderr = _run_hook([str(hook)], stdin=None, workspace=workspace, timeout=300)
+    if status is None:
+        return {**report, "state": "unknown", "detail": f"the hook could not be run: {stderr}"}
+    report["exit"] = status
+    if status == 0:
+        report.update(state="enforcing", detail="the pre-commit hook linted this vault (exit 0)")
+    elif status == _LINT_FOUND_ERRORS:
+        report.update(
+            state="enforcing",
+            detail=(
+                "the pre-commit hook linted this vault and found errors (exit 1), "
+                "so a commit is refused until they are fixed"
+            ),
+        )
+    else:
+        report.update(
+            state="not_enforcing",
+            detail=(
+                f"the pre-commit hook exited {status} before linting anything, "
+                "so every commit is refused and none is checked"
+            ),
+        )
+        said = _first_line(stderr)
+        if said:
+            report["hook_said"] = said
+        if entry.get("hint"):
+            report["hint"] = entry["hint"]
     return report
 
 
@@ -424,6 +597,8 @@ def doctor_report(
     broken = verdict["broken"]
     probe = probe_write_gate(vault, enforcement["layers"])
     enforcement["write_gate_probe"] = probe
+    commit_probe = probe_commit_lint(vault, enforcement["layers"])
+    enforcement["commit_lint_probe"] = commit_probe
     # The update half of the grammar check: a distribution may be present and
     # still violate the pin brainskit declares, which fails later, per file,
     # at extraction time. Same report as a broken install, because it is the
@@ -468,11 +643,11 @@ def doctor_report(
     graph_note = _code_graph_without_grammars(vault, verdict["state"])
     if graph_note is not None:
         code["graph_without_grammars"] = graph_note
-    # The probe ran the script directly, which proves the script refuses a
-    # write; `gated` is what says the agent will actually run it -- registered
-    # under its event, and the script this version installs rather than an
-    # older copy that may enforce older rules. Both, or nobody has shown that a
-    # write to wiki/ is refused.
+    # The probe ran the command settings.json registers, through the shell
+    # Claude Code uses, which proves that command refuses a write; `gated` is
+    # what says it runs the script this version installs rather than an older
+    # copy that may enforce older rules. Both, or nobody has shown that a write
+    # to wiki/ is refused.
     gate_live = probe["state"] == "absent" or bool(enforcement.get("gated"))
     return {
         "vault": str(vault.root),
@@ -500,11 +675,21 @@ def doctor_report(
         # silently loses a language. A code graph this machine cannot rebuild
         # is reported beside them but is not one: `bk code build` refuses loudly
         # with the install command, and the stored graph still answers.
+        #
+        # A pre-commit hook brainskit wrote that does not lint this vault counts
+        # too, though it is not the guarantee `gated` is. It does not fail
+        # open quietly: it refuses every commit, which is how operators learn
+        # `--no-verify`, and `bk status` already counts an inactive commit_lint
+        # against its own `healthy` -- a doctor that stayed green over it would
+        # be the one report of the two that missed a fault it had just run into.
+        # Absent (no repository, no hook) and an operator's own hook are not
+        # faults doctor can see, so they stay compatible, as for the gate.
         "healthy": (
             not broken
             and not outdated
             and probe["state"] in {"enforcing", "absent"}
             and gate_live
+            and commit_probe["state"] in {"enforcing", "absent", "not_judged"}
         ),
     }
 

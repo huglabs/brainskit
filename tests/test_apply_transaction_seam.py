@@ -22,6 +22,11 @@ journal nor the transaction directory is left behind.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import sys
 import unittest

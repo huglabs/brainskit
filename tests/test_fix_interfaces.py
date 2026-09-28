@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import io
 import json
 import re
@@ -106,10 +111,8 @@ class CliExportConsumerTest(unittest.TestCase):
         cli.create_service = self.original  # type: ignore[assignment]
 
     def _run(self, argv: list[str]) -> tuple[int, dict[str, Any]]:
-        stream = io.StringIO()
-        with redirect_stdout(stream):
-            code = cli.main(argv)
-        return code, json.loads(stream.getvalue())
+        run = _harness.run_cli(argv)
+        return run.code, run.json()
 
     def test_export_defaults_to_local_consumer(self) -> None:
         code, payload = self._run(["--json", "export", "--target", "json"])
@@ -139,10 +142,9 @@ class CliExportConsumerTest(unittest.TestCase):
                 self.assertEqual(self.service.calls[-1][2]["consumer"], consumer)
 
     def test_export_rejects_an_unknown_consumer(self) -> None:
-        with redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as exit_code:
-                cli.main(["export", "--target", "json", "--consumer", "nope"])
-        self.assertEqual(exit_code.exception.code, 2)
+        run = _harness.run_cli(["export", "--target", "json", "--consumer", "nope"])
+        self.assertTrue(run.exited)
+        self.assertEqual(run.code, 2)
 
     def test_export_consumer_never_raises_unlike_search_and_context(self) -> None:
         """search/context still demand an explicit --consumer in --json mode."""
@@ -166,26 +168,25 @@ class CliSafetyNetTest(unittest.TestCase):
         cli.create_service = self.original  # type: ignore[assignment]
 
     def test_json_mode_emits_a_single_line_envelope_without_a_traceback(self) -> None:
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(["--json", "status"])
-        self.assertNotEqual(code, 0)
-        stdout = out.getvalue()
-        self.assertEqual(len(stdout.strip().splitlines()), 1)
-        self.assertNotIn("Traceback", stdout)
-        payload = json.loads(stdout)
+        run = _harness.run_cli(
+            ["--json", "status"], expect=("unhandled internal error", "Traceback")
+        )
+        self.assertNotEqual(run.code, 0)
+        self.assertEqual(len(run.stdout.strip().splitlines()), 1)
+        self.assertNotIn("Traceback", run.stdout)
+        payload = run.json()
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "internal_error")
         self.assertIn("RuntimeError", payload["error"]["message"])
-        self.assertIn("Traceback", err.getvalue())
+        self.assertIn("Traceback", run.stderr)
 
     def test_non_json_mode_prints_a_readable_message_on_stderr(self) -> None:
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(["status"])
-        self.assertNotEqual(code, 0)
-        self.assertEqual(out.getvalue(), "")
-        self.assertIn("bk: RuntimeError: boom", err.getvalue())
+        run = _harness.run_cli(
+            ["status"], expect=("unhandled internal error", "Traceback")
+        )
+        self.assertNotEqual(run.code, 0)
+        self.assertEqual(run.stdout, "")
+        self.assertIn("bk: RuntimeError: boom", run.stderr)
 
     def test_safety_net_does_not_swallow_system_exit(self) -> None:
         original = cli._dispatch
@@ -195,11 +196,11 @@ class CliSafetyNetTest(unittest.TestCase):
 
         cli._dispatch = exiting  # type: ignore[assignment]
         try:
-            with self.assertRaises(SystemExit) as exit_code:
-                cli.main(["--json", "status"])
+            run = _harness.run_cli(["--json", "status"])
         finally:
             cli._dispatch = original  # type: ignore[assignment]
-        self.assertEqual(exit_code.exception.code, 7)
+        self.assertTrue(run.exited, "the safety net swallowed a SystemExit")
+        self.assertEqual(run.code, 7)
 
     def test_safety_net_keeps_the_interrupt_exit_code(self) -> None:
         original = cli._dispatch
@@ -209,11 +210,10 @@ class CliSafetyNetTest(unittest.TestCase):
 
         cli._dispatch = interrupted  # type: ignore[assignment]
         try:
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                code = cli.main(["--json", "status"])
+            run = _harness.run_cli(["--json", "status"])
         finally:
             cli._dispatch = original  # type: ignore[assignment]
-        self.assertEqual(code, 130)
+        self.assertEqual(run.code, 130)
 
 
 class CliEnvelopeAgreesWithExitStatusTest(unittest.TestCase):
@@ -247,10 +247,8 @@ class CliEnvelopeAgreesWithExitStatusTest(unittest.TestCase):
         (self.root / captured["source"]["path"]).write_text("Mutated", encoding="utf-8")
 
     def _lint(self) -> tuple[int, dict[str, Any]]:
-        stream = io.StringIO()
-        with redirect_stdout(stream):
-            code = cli.main(["--json", "--vault", str(self.root), "lint"])
-        return code, json.loads(stream.getvalue())
+        run = _harness.run_cli(["--json", "--vault", str(self.root), "lint"])
+        return run.code, run.json()
 
     def _mcp_lint(self) -> dict[str, Any]:
         response = _handle(
@@ -330,13 +328,11 @@ class CliEnvelopeAgreesWithExitStatusTest(unittest.TestCase):
                             cli, "_sync_registered_vaults", return_value=value
                         ), \
                         mock.patch.object(cli, "_run_update", return_value=value):
-                    stream = io.StringIO()
-                    with redirect_stdout(stream):
-                        code = cli.main(["--json", *argv])
-                payload = json.loads(stream.getvalue())
+                    run = _harness.run_cli(["--json", *argv])
+                payload = run.json()
                 self.assertEqual(payload["result"], value)
                 self.assertEqual(payload["ok"], succeeds)
-                self.assertEqual(code == 0, succeeds)
+                self.assertEqual(run.code == 0, succeeds)
 
 
 class CliWebNoBrowserFlagTest(unittest.TestCase):
@@ -362,14 +358,15 @@ class CliWebNoBrowserFlagTest(unittest.TestCase):
 
     def test_the_flag_reaches_run_web_as_open_browser_false(self) -> None:
         with mock.patch("brainskit.interfaces.web.run_web") as run_web_mock:
-            code = cli.main(["--vault", str(self.root), "web", "--no-browser"])
-        self.assertEqual(code, 0)
+            run = _harness.run_cli(["--vault", str(self.root), "web", "--no-browser"])
+        self.assertEqual(run.code, 0)
         run_web_mock.assert_called_once()
         self.assertFalse(run_web_mock.call_args.kwargs["open_browser"])
 
     def test_without_the_flag_open_browser_defaults_to_true(self) -> None:
         with mock.patch("brainskit.interfaces.web.run_web") as run_web_mock:
-            cli.main(["--vault", str(self.root), "web"])
+            run = _harness.run_cli(["--vault", str(self.root), "web"])
+        self.assertEqual(run.code, 0)
         self.assertTrue(run_web_mock.call_args.kwargs["open_browser"])
 
 
@@ -394,8 +391,10 @@ class CliWebNoVaultPromptTest(unittest.TestCase):
             mock.patch.object(prompt, "supports_interactive", return_value=False),
             mock.patch.object(prompt, "confirm") as confirm_mock,
         ):
-            code = cli.main(["--vault", str(self.empty), "web"])
-        self.assertEqual(code, 2)
+            run = _harness.run_cli(
+                ["--vault", str(self.empty), "web"], expect=("Not a brainskit vault",)
+            )
+        self.assertEqual(run.code, 2)
         confirm_mock.assert_not_called()
         self.assertFalse((self.empty / ".brain" / "config.json").exists())
 
@@ -406,8 +405,11 @@ class CliWebNoVaultPromptTest(unittest.TestCase):
             mock.patch.object(prompt, "supports_interactive", return_value=True),
             mock.patch.object(prompt, "confirm") as confirm_mock,
         ):
-            code = cli.main(["--json", "--vault", str(self.empty), "web"])
-        self.assertEqual(code, 2)
+            run = _harness.run_cli(
+                ["--json", "--vault", str(self.empty), "web"],
+                expect=("Not a brainskit vault",),
+            )
+        self.assertEqual(run.code, 2)
         confirm_mock.assert_not_called()
 
     def test_declining_the_prompt_falls_through_to_the_same_refusal(self) -> None:
@@ -415,8 +417,10 @@ class CliWebNoVaultPromptTest(unittest.TestCase):
             mock.patch.object(prompt, "supports_interactive", return_value=True),
             mock.patch.object(prompt, "confirm", return_value=False) as confirm_mock,
         ):
-            code = cli.main(["--vault", str(self.empty), "web"])
-        self.assertEqual(code, 2)
+            run = _harness.run_cli(
+                ["--vault", str(self.empty), "web"], expect=("Not a brainskit vault",)
+            )
+        self.assertEqual(run.code, 2)
         confirm_mock.assert_called_once()
         self.assertFalse((self.empty / ".brain" / "config.json").exists())
 
@@ -428,8 +432,8 @@ class CliWebNoVaultPromptTest(unittest.TestCase):
             mock.patch.object(cli, "_guided_init", return_value=outcome) as init_mock,
             mock.patch("brainskit.interfaces.web.run_web") as run_web_mock,
         ):
-            code = cli.main(["--vault", str(self.empty), "web", "--no-browser"])
-        self.assertEqual(code, 0)
+            run = _harness.run_cli(["--vault", str(self.empty), "web", "--no-browser"])
+        self.assertEqual(run.code, 0)
         init_mock.assert_called_once_with(self.empty.expanduser().resolve())
         self.assertTrue((self.empty / ".brain" / "config.json").exists())
         run_web_mock.assert_called_once()
@@ -1776,24 +1780,20 @@ class GroupedHelpTests(unittest.TestCase):
         )
 
     def test_top_level_help_is_branded_and_grouped(self) -> None:
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(["--help"])
-        self.assertEqual(0, code)
-        self.assertIn("brainskit", out.getvalue())
-        self.assertIn("HugLabs", out.getvalue())
-        self.assertIn("Vault & capture", out.getvalue())
-        self.assertIn("Code graph", out.getvalue())
-        self.assertEqual("", err.getvalue())
+        run = _harness.run_cli(["--help"])
+        self.assertEqual(0, run.code)
+        self.assertIn("brainskit", run.stdout)
+        self.assertIn("HugLabs", run.stdout)
+        self.assertIn("Vault & capture", run.stdout)
+        self.assertIn("Code graph", run.stdout)
+        self.assertEqual("", run.stderr)
 
     def test_subcommand_help_is_left_to_argparse(self) -> None:
-        out, err = io.StringIO(), io.StringIO()
-        with redirect_stdout(out), redirect_stderr(err):
-            with self.assertRaises(SystemExit) as exit_code:
-                cli.main(["code", "--help"])
-        self.assertEqual(0, exit_code.exception.code)
-        self.assertIn("{build,import,status", out.getvalue())
-        self.assertNotIn("HugLabs", out.getvalue())
+        run = _harness.run_cli(["code", "--help"])
+        self.assertTrue(run.exited)
+        self.assertEqual(0, run.code)
+        self.assertIn("{build,import,status", run.stdout)
+        self.assertNotIn("HugLabs", run.stdout)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     ModelResponseError,
     NotConfiguredError,
+    PolicyError,
 )
 
 
@@ -125,6 +126,25 @@ class JudgmentRunner:
         if not isinstance(judgment, JudgmentRoutePort):
             return None
         return judgment.route_for(job=job, branches=branches)
+
+    def consumer_for(self, *, job: str, branches: list[str]) -> str:
+        """The boundary of the model `job` reaches over `local`-visible branches.
+
+        The router answers, not a copy of it: `local` only when it routes those
+        branches to a model on this machine. Its privacy refusal means the job
+        is mapped to a cloud provider for this evidence, and a port that cannot
+        say is assumed to be one -- both answer `cloud`, which only ever
+        narrows. A caller reads its evidence again under the answer, and `run`
+        routes that narrower bundle itself, so the refusal still stands behind
+        it. Refusals that are not about privacy (`NotConfiguredError`)
+        propagate before any prompt exists.
+        """
+
+        try:
+            route = self.route_for(job=job, branches=branches)
+        except PolicyError:
+            return "cloud"
+        return "local" if route is not None and route.local else "cloud"
 
     def require(self) -> JudgmentPort:
         """The configured provider, or a clear error naming what is missing."""

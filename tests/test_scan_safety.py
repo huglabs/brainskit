@@ -26,6 +26,11 @@ repository with a two-node graph, and `bk code status` then called that graph
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import json
 import unittest
 import unittest.mock

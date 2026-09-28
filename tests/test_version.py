@@ -14,6 +14,11 @@ permanent.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import os
 import re
 import shutil

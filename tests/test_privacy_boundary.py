@@ -9,6 +9,11 @@ executable: a boundary built before a write answers from before the write.
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import inspect
 import tempfile
 import unittest

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness
+
 import hashlib
 import io
 import json
@@ -8,7 +13,7 @@ import tempfile
 import unittest
 import urllib.error
 from collections.abc import Callable
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
@@ -1297,29 +1302,22 @@ class ErrorExitCodeTest(unittest.TestCase):
             ModelResponseError,
         ):
             with self.subTest(error=error.__name__):
-                buffer = io.StringIO()
-                with mock.patch.object(
-                    cli, "_dispatch", side_effect=error("boom")
-                ), redirect_stderr(buffer):
-                    status = cli.main(["status"])
-                self.assertEqual(status, 2)
+                with mock.patch.object(cli, "_dispatch", side_effect=error("boom")):
+                    run = _harness.run_cli(["status"])
+                self.assertEqual(run.code, 2)
 
     def test_a_policy_error_still_exits_three(self) -> None:
         """The one code that does carry a different status keeps it."""
-        buffer = io.StringIO()
-        with mock.patch.object(
-            cli, "_dispatch", side_effect=PolicyError("nope")
-        ), redirect_stderr(buffer):
-            self.assertEqual(cli.main(["status"]), 3)
+        with mock.patch.object(cli, "_dispatch", side_effect=PolicyError("nope")):
+            self.assertEqual(_harness.run_cli(["status"]).code, 3)
 
     def test_the_code_reaches_the_json_envelope(self) -> None:
         """What an agent actually reads is the serialised envelope."""
-        out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(
             cli, "_dispatch", side_effect=ConflictError("stale", details={"a": 1})
-        ), redirect_stdout(out), redirect_stderr(err):
-            cli.main(["--json", "status"])
-        payload = json.loads(out.getvalue() or err.getvalue())
+        ):
+            run = _harness.run_cli(["--json", "status"])
+        payload = json.loads(run.stdout or run.stderr)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "conflict")
         self.assertEqual(payload["error"]["details"], {"a": 1})

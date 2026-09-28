@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import gzip
 import json
 import re
@@ -2496,8 +2501,9 @@ class RetrievalContextApplyContractScopeTest(unittest.TestCase):
         self.assertIn("apply_contract", bundle)
 
     def test_ask_never_sees_the_apply_contract(self) -> None:
-        fake = FakeJudgment(
-            {"query": [{"answer": "x", "citations": [], "uncertainty": ""}]}
+        fake = RoutedFakeJudgment(
+            {"query": [{"answer": "x", "citations": [], "uncertainty": ""}]},
+            self.vault.config(),
         )
         service = self._service(fake)
         service.ask("what is this vault about")
@@ -2506,12 +2512,13 @@ class RetrievalContextApplyContractScopeTest(unittest.TestCase):
         self.assertIn("evidence", context)
 
     def test_resurface_never_sees_the_apply_contract(self) -> None:
-        fake = FakeJudgment(
+        fake = RoutedFakeJudgment(
             {
                 "resurface": [
                     {"markdown": "x", "page": "wiki/index.md", "question": "q"}
                 ]
-            }
+            },
+            self.vault.config(),
         )
         service = self._service(fake)
         service.jobs_runner.resurface()
@@ -2572,7 +2579,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         return {"answer": "x", "citations": [], "uncertainty": ""}
 
     def test_history_keeps_only_the_last_six_exchanges(self) -> None:
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         service.ask(
             "e sobre o code graph?",
@@ -2589,7 +2596,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         self.assertLess(serialized.index("q2"), serialized.index("q7"))
 
     def test_history_char_budget_trims_oldest_first(self) -> None:
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         service.ask(
             "e sobre o code graph?",
@@ -2604,7 +2611,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         self.assertIn("Q: q3", serialized)
 
     def test_a_single_oversized_exchange_is_truncated_not_dropped(self) -> None:
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         service.ask(
             "e sobre o code graph?",
@@ -2615,7 +2622,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         self.assertIn("Q: q1", serialized)
 
     def test_retrieval_is_keyed_on_the_bare_current_question(self) -> None:
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         spy = _SpyRetrieval(service.jobs_runner.retrieval)
         service.jobs_runner.retrieval = spy
@@ -2626,7 +2633,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         self.assertEqual(spy.queries, ["e sobre o code graph?"])
 
     def test_prompt_variables_render_through_the_real_template(self) -> None:
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         service.ask(
             "e sobre o code graph?",
@@ -2642,7 +2649,7 @@ class AskConversationHistoryTest(unittest.TestCase):
         self.assertIn("Q: o que sabemos?", prompt)
 
     def test_ask_without_history_still_renders_the_template(self) -> None:
-        fake = FakeJudgment({"query": [self._answer()]})
+        fake = RoutedFakeJudgment({"query": [self._answer()]}, self.vault.config())
         service = self._service(fake)
         service.ask("e sobre o code graph?")
         variables = fake.variables[0]
@@ -3100,6 +3107,161 @@ class DigestBoundaryFollowsTheRouterTest(unittest.TestCase):
         del raw["job_models"]["digest"]
         with self.assertRaises(NotConfiguredError):
             self._digest(raw)
+
+
+class JudgmentReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
+    """A `local-only` match narrows a cloud-routed job; it does not refuse it.
+
+    #14 for the other restricted class. `ask`, `resurface` and `digest` read
+    as `local`, which keeps `local-only` evidence, and handed its branch to the
+    router: with the job mapped to a cloud provider, the router refused the
+    whole call because BM25 recall (or the recent-source list) brushed one
+    local-only source. The evidence is now read under the boundary of the
+    route the router picks, so a cloud route withholds and counts it, and a
+    local route -- flat or privacy-keyed -- still receives it. The real router
+    runs, so a local-only branch reaching a cloud prompt would be refused
+    there rather than pass silently.
+    """
+
+    LOCAL_ONLY_TEXT = "Platform team pay bands kappa-sigma durable insight worth revisiting."
+    LOCAL_ONLY_TITLE = "Pay bands"
+    CLOUD_TEXT = "Platform team ships on Fridays durable insight worth revisiting."
+    KEYED: ClassVar[dict] = {
+        "cloud": {"provider": "openai", "model": "m"},
+        "local-only": {"provider": "ollama", "model": "m"},
+    }
+    CLOUD: ClassVar[dict] = {"provider": "openai", "model": "m"}
+    OLLAMA: ClassVar[dict] = {"provider": "ollama", "model": "m"}
+    ANSWER: ClassVar[dict] = {"answer": "x", "citations": [], "uncertainty": ""}
+    RESURFACE: ClassVar[dict] = {"markdown": "x", "page": "wiki/index.md", "question": "q"}
+    DIGEST: ClassVar[dict] = {"markdown": "x", "actions": [], "resurfaced": ""}
+
+    def _vault(self, job: str, mapping: dict, *, cloud_match: bool = True) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        raw = policy()
+        raw["branches"]["30-public"] = {"privacy": "cloud", "filing": "approve-each"}
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"][job] = mapping
+        self.vault = FileVault.initialize(self.root, raw)
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = seed.capture(
+            None, text=self.LOCAL_ONLY_TEXT, title=self.LOCAL_ONLY_TITLE
+        )
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = seed.file(self.private_hash, "20-research")["source"][
+            "path"
+        ]
+        if cloud_match:
+            public = seed.capture(None, text=self.CLOUD_TEXT, title="Cadence")
+            seed.file(public["source"]["content_hash"], "30-public")
+
+    def _run(self, response: dict, call):
+        driver = _RecordingDriver(response)
+        providers: list[str] = []
+
+        def create_driver(name, config):
+            providers.append(name)
+            return driver
+
+        service = BrainskitService(
+            self.vault,
+            self.index,
+            judgment=PolicyJudgmentRouter(self.vault.config(), JobSpecs()),
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+        with mock.patch("brainskit.infrastructure.llm._create_driver", create_driver):
+            result = call(service)
+        return result, driver.prompts, providers
+
+    def _assert_no_local_only(self, text: str) -> None:
+        for disclosure in (
+            "kappa-sigma",
+            self.LOCAL_ONLY_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "20-research",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def _jobs(self):
+        return {
+            "query": (self.ANSWER, lambda service: service.ask("platform team")),
+            "resurface": (
+                self.RESURFACE,
+                lambda service: service.jobs_runner.resurface(),
+            ),
+            "digest": (self.DIGEST, lambda service: service.digest()),
+        }
+
+    def test_a_cloud_route_answers_from_cloud_evidence_and_counts_the_rest(
+        self,
+    ) -> None:
+        for job, (response, call) in self._jobs().items():
+            with self.subTest(job=job):
+                self._vault(job, self.CLOUD)
+                result, prompts, providers = self._run(response, call)
+                self.assertEqual(providers, ["openai"])
+                self.assertEqual(len(prompts), 1)
+                self._assert_no_local_only(prompts[0])
+                self._assert_no_local_only(json.dumps(result, ensure_ascii=False))
+                self.assertGreaterEqual(result["withheld_sources"], 1)
+                if job != "digest":
+                    self.assertIn("Fridays", prompts[0])
+
+    def test_a_local_route_still_receives_local_only_evidence(self) -> None:
+        for mapping_name, mapping in {"ollama": self.OLLAMA, "keyed": self.KEYED}.items():
+            for job, (response, call) in self._jobs().items():
+                with self.subTest(job=job, mapping=mapping_name):
+                    self._vault(job, mapping)
+                    result, prompts, providers = self._run(response, call)
+                    self.assertEqual(providers, ["ollama"])
+                    self.assertEqual(result["withheld_sources"], 0)
+                    self.assertIn(
+                        "kappa-sigma" if job != "digest" else self.private_hash,
+                        prompts[0],
+                    )
+
+    def test_ask_reports_the_cloud_provider_that_answered(self) -> None:
+        self._vault("query", self.CLOUD)
+        result, _, _ = self._run(
+            self.ANSWER, lambda service: service.ask("platform team")
+        )
+        self.assertEqual((result["provider"], result["model"]), ("openai", "m"))
+        self.assertEqual(result["withheld_sources"], 1)
+
+    def test_only_local_only_matches_on_a_cloud_route_is_an_actionable_refusal(
+        self,
+    ) -> None:
+        self._vault("query", self.CLOUD, cloud_match=False)
+        with self.assertRaises(PolicyError) as caught:
+            self._run(self.ANSWER, lambda service: service.ask("pay bands"))
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("bk search", details["hint"])
+        self.assertIn("job_models.query", details["hint"])
+        self._assert_no_local_only(
+            json.dumps(
+                {"message": str(caught.exception), "details": details},
+                ensure_ascii=False,
+            )
+        )
+
+    def test_a_port_that_cannot_route_is_treated_as_cloud(self) -> None:
+        self._vault("query", self.OLLAMA)
+        fake = FakeJudgment({"query": [self.ANSWER]})
+        service = BrainskitService(
+            self.vault, self.index, judgment=fake, jobs=JobSpecs(), graph=MarkdownGraph()
+        )
+        result = service.ask("platform team")
+        self.assertEqual(result["withheld_sources"], 1)
+        self._assert_no_local_only(json.dumps(fake.variables, ensure_ascii=False))
 
 
 class WebAskHistoryTest(unittest.TestCase):

@@ -39,18 +39,23 @@ cloud routing is allowed only when every contributing branch permits it.
 Enrichment edges follow the same rule through the same function — see
 [Enrichment](./enrichment.md).
 
-`ask` and `resurface` never hand the router `never-ingest` evidence in the first
-place: they read under the `local` boundary, after expansion, so a question
-that merely brushes a private source is answered from the rest. The result
-carries `withheld_sources` — a count, never a name. When every match was
-withheld, the job refuses with `policy_denied` and a hint instead of calling a
-model; the router's own refusal remains as the last line of defence. `digest`
-chooses its route from the recent sources as before, then holds the metadata it
-sends to the boundary of that route — `local` for Ollama, `cloud` otherwise.
-Branch names, freshness entries for pages compiled from withheld or
-unresolvable sources, and filing proposals for such sources are dropped and
-counted in `withheld_sources`; on a cloud route, installation facts (the vault
-path, hook script paths) are withheld as well.
+`ask`, `resurface` and `digest` never hand the router evidence it would refuse
+in the first place. Each reads under the `local` boundary, after expansion,
+asks the router where that evidence would be routed, and then reads under the
+boundary of that route: `local` when it is a model on this machine, `cloud`
+otherwise (including a provider that cannot say). So a question that merely
+brushes a `never-ingest` source is answered from the rest, and on a job mapped
+to a cloud provider a `local-only` match is withheld rather than refusing the
+whole call. A privacy-keyed mapping (`job_models.<job>.local-only` → Ollama)
+still sends `local-only` evidence to the local model. The result carries
+`withheld_sources` — a count, never a name. When every match was withheld, the
+job refuses with `policy_denied` and a hint instead of calling a model; the
+router's own refusal remains as the last line of defence. For `digest` the
+same boundary also governs the metadata it sends: branch names, freshness
+entries for pages compiled from withheld or unresolvable sources, and filing
+proposals for such sources are dropped and counted in `withheld_sources`; on a
+cloud route, installation facts (the vault path, hook script paths) are
+withheld as well.
 
 ## Every egress carries it
 

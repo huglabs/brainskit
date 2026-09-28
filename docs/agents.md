@@ -42,14 +42,20 @@ reporting the layer active.
 
 So `bk doctor` runs it. It sends the gate one path it must refuse and one it
 must allow, using the same payload Claude Code sends, and reports what actually
-happened under `enforcement.write_gate_probe`:
+happened under `enforcement.write_gate_probe`. What it runs is the command
+`.claude/settings.json` registers, the way Claude Code runs it — through
+`sh -c`, from the workspace, with `CLAUDE_PROJECT_DIR` set — so a registration
+that does not survive the shell (an unquoted path with a space exits 127, and
+Claude Code lets the write through) is caught even though the script it names
+works. `command` names what was run and `exercised` says whether it was the
+registered command or, when nothing registers the gate, the script itself.
 
 | `state` | Meaning |
 |---|---|
 | `enforcing` | a write to `wiki/` was refused and an ordinary write was not |
 | `not_enforcing` | the hook is installed and let a gated write through |
 | `over_blocking` | it refused an ordinary write outside the vault too |
-| `unknown` | the hook could not be executed at all |
+| `unknown` | the hook could not be executed at all, or its recorded workspace is gone |
 | `absent` | no gate is installed — a choice, not a fault |
 
 Both probes are decisions only: `gate check-write` writes nothing, and no probe
@@ -58,9 +64,35 @@ that sentence is repeated back as `hook_said` because it names the missing piece
 better than an exit code can. `doctor` reports `healthy: false` for every state
 except `enforcing` and `absent` — an installed gate that does not guard is worse
 than none, because everything else goes on reporting success. `enforcing` also
-needs `status` to agree that the gate is live (`gated: true`). The probe runs the
-script directly, so it can pass for a script the agent never runs, or for an
-outdated copy.
+needs `status` to agree that the gate is live (`gated: true`): the probe can
+pass for an unregistered script (run directly) or for an outdated copy.
+
+The git pre-commit hook is exercised the same way, under
+`enforcement.commit_lint_probe`: the hook git will run (`core.hooksPath`
+honoured) is executed from the workspace with nothing on stdin. `bk lint` exits
+0 when clean and 1 when it finds errors — both mean the hook linted this vault,
+`enforcing`. Anything else is `not_enforcing` and quotes the first stderr line:
+126/127 from the shell, or 2 from a `bk` error such as `Not a brainskit vault`.
+Such a hook refuses every commit without checking one. A hook naming another
+vault is reported without being run, and one without its executable bit is
+`not_enforcing` because git skips it. A hook brainskit did not write is
+`not_judged` and never executed. `not_enforcing` and `unknown` make `healthy`
+false, as they do for the gate; `gated` is unaffected, because commit-time lint
+catches a bypass after the fact. The lint refreshes page ages in the freshness
+ledger, the same bookkeeping every commit does.
+
+`bk status` makes the cheap half of that check without running anything: it
+reads the `--vault` a generated hook passes, as sh will read it, and reports
+`commit_lint` inactive when that is not this vault — a hook from before 0.8.0
+that JSON-quoted a non-ASCII path, or one naming where the repository used to
+be.
+
+If the workspace recorded in `.brain/agent-<agent>.json` no longer exists —
+the repository was moved — every layer says so, carries
+`workspace_missing: true`, and gives the reinstall command with
+`--root <project>` (the repository the vault now sits in, when there is one).
+The skill file an earlier install wrote for the old vault path is replaced by
+that reinstall without `--force`, as long as it was not edited.
 
 `healthy` does not depend on the optional `[code]` extra. A default install with
 no tree-sitter grammar can report `healthy: true`, so CI can gate on it. Only a

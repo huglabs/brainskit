@@ -31,6 +31,11 @@ stayed correct. The tests below drive `up("postgres")`, which is what
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import io
 import os
 import sys

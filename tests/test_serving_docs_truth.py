@@ -12,6 +12,11 @@ Compared against the source rather than restated, the same way
 
 from __future__ import annotations
 
+try:
+    from . import _harness
+except ImportError:
+    import _harness  # noqa: F401
+
 import re
 import unittest
 from pathlib import Path

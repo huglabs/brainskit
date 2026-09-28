@@ -27,6 +27,7 @@ from brainskit.application.retrieval import Retrieval
 from brainskit.domain.model import (
     BrainskitError,
     PolicyError,
+    SourceRecord,
     utc_now,
 )
 from brainskit.domain.privacy import (
@@ -94,6 +95,10 @@ def _hashes_allowed(boundary: PrivacyBoundary, hashes: list[Any]) -> bool:
         if record is None or not boundary.allows_record(record):
             return False
     return True
+
+
+def _record_branches(records: list[SourceRecord]) -> list[str]:
+    return sorted({record_branch(record) for record in records}) or ["_inbox"]
 
 
 def _branch_allowed(boundary: PrivacyBoundary, branch: str) -> bool:
@@ -234,34 +239,46 @@ class Jobs:
         self.ledger = ledger
 
     def _judgment_context(
-        self, query: str, **kwargs: Any
+        self, job: str, query: str, **kwargs: Any
     ) -> tuple[dict[str, Any], int]:
-        """Evidence a model may read for `query`, and how much was withheld.
+        """Evidence the model on `job`'s route may read, and how much was withheld.
 
-        Read under the `local` boundary because it excludes exactly
-        `never-ingest` -- the set the judgment router refuses outright. Read
-        as `human`, one such match anywhere in BM25 recall made the router
-        refuse the whole question; narrowing here leaves that refusal as the
-        last line of defence rather than the first. The withheld side is a
-        count only: its path would name the document and its branch.
+        Read first under `local`, the widest boundary any model gets: it
+        excludes exactly `never-ingest`, which the router refuses outright, and
+        its branches are what the router routes from. When that route is not
+        local the evidence is read again under `cloud`, so a `local-only` match
+        is withheld and counted rather than refusing the whole question. The
+        router routes the final bundle again inside `run`, and its refusal
+        stays the last line of defence. The withheld side is a count only: its
+        path would name the document and its branch.
         """
 
-        context = self.retrieval.context(
-            query, consumer="local", include_apply_contract=False, **kwargs
-        )
+        def read(consumer: str) -> dict[str, Any]:
+            return self.retrieval.context(
+                query, consumer=consumer, include_apply_contract=False, **kwargs
+            )
+
+        context = read("local")
+        local_withheld = int(context["redacted"])
+        branches = context_branches(context)
+        if self.judgment_runner.consumer_for(job=job, branches=branches) == "cloud":
+            context = read("cloud")
         withheld = int(context["redacted"])
         if withheld and not context["evidence"]:
+            hint = (
+                "Rephrase toward material a model may read, or read the "
+                "withheld evidence yourself with bk search -- it is withheld "
+                "from models, not from you"
+            )
+            if withheld > local_withheld:
+                hint += (
+                    f"; to let a model read local-only evidence, map "
+                    f"job_models.{job}.local-only to a local provider"
+                )
             raise PolicyError(
                 "Every source matching this request is withheld from models "
                 "by its branch privacy policy",
-                details={
-                    "withheld_sources": withheld,
-                    "hint": (
-                        "Rephrase toward material a model may read, or read the "
-                        "withheld evidence yourself with bk search -- it is "
-                        "withheld from models, not from you"
-                    ),
-                },
+                details={"withheld_sources": withheld, "hint": hint},
             )
         return context, withheld
 
@@ -280,7 +297,7 @@ class Jobs:
         # would pollute BM25 term matching with every word already discussed,
         # burying the terms this question is actually about. History is model
         # context for *interpreting* the question, and rides only the prompt.
-        context, withheld = self._judgment_context(question)
+        context, withheld = self._judgment_context("query", question)
         branches = context_branches(context)
         response = self.judgment_runner.run(
             job="query",
@@ -323,25 +340,21 @@ class Jobs:
             key=lambda item: item.captured_at,
             reverse=True,
         )[:50]
-        # `local` is the boundary that excludes exactly never-ingest evidence,
-        # and the sources it keeps decide the route, as they always have.
+        # The sources `local` keeps decide the route, as they always have; the
+        # sources and the metadata are then held to the boundary of the model
+        # the digest will actually reach (see `JudgmentRunner.consumer_for`).
+        # A branch name, a page path, a source hash and an absolute path are
+        # each disclosure in their own right.
         local = for_consumer("local", self.vault)
         routed = [record for record in recent if local.allows_record(record)]
-        digest_branches = sorted({record_branch(record) for record in routed})
-        if not digest_branches:
-            digest_branches = ["_inbox"]
-        # The metadata is then held to the boundary of the model it will
-        # actually reach, as the router itself reports it: a branch name, a
-        # page path, a source hash and an absolute path are each disclosure in
-        # their own right. A port that cannot say is assumed to be cloud.
-        route = self.judgment_runner.route_for(job="digest", branches=digest_branches)
-        boundary = (
-            local if route is not None and route.local
-            else for_consumer("cloud", self.vault)
+        consumer = self.judgment_runner.consumer_for(
+            job="digest", branches=_record_branches(routed)
         )
+        boundary = local if consumer == "local" else for_consumer("cloud", self.vault)
         allowed_recent = [
             record for record in routed if boundary.allows_record(record)
         ]
+        digest_branches = _record_branches(allowed_recent)
         freshness, withheld_pages = _freshness_within(
             boundary, self.ledger.snapshot().state
         )
@@ -381,7 +394,7 @@ class Jobs:
         # `resurface` only ever reads (see `ask`, above, for why the apply
         # contract stays off).
         context, withheld = self._judgment_context(
-            "durable insight worth revisiting", limit=20
+            "resurface", "durable insight worth revisiting", limit=20
         )
         result = self.judgment_runner.run(
             job="resurface",
