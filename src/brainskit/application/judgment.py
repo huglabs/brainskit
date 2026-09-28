@@ -24,6 +24,7 @@ from brainskit.application.ports import (
 )
 from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
+    BrainskitError,
     ModelResponseError,
     NotConfiguredError,
     PolicyError,
@@ -111,8 +112,38 @@ class JudgmentRunner:
                 "job": job,
                 "attempts": max_attempts,
                 "failures": last_failures,
+                **self._exhausted_remedy(job=job, branches=branches, attempts=max_attempts),
             },
         )
+
+    def _exhausted_remedy(
+        self, *, job: str, branches: list[str], attempts: int
+    ) -> dict[str, Any]:
+        """Which model kept failing, and the config key that replaces it.
+
+        A small local model is the usual cause: it holds the citation contract
+        on a short source and loses it on a long one, identically on every
+        attempt, so "retry" alone repeats the failure. The route is the one
+        `run` just used; a port that cannot say leaves the hint unnamed.
+        """
+
+        try:
+            route = self.route_for(job=job, branches=branches)
+        except BrainskitError:
+            route = None
+        reroute = (
+            f"route job_models.{job} in .brain/config.json to a larger model"
+        )
+        if route is None:
+            return {"hint": f"The model failed validation {attempts} times; {reroute}"}
+        return {
+            "provider": route.provider,
+            "model": route.model,
+            "hint": (
+                f"{route.provider} model {route.model} failed validation "
+                f"{attempts} times; {reroute}"
+            ),
+        }
 
     def route_for(self, *, job: str, branches: list[str]) -> JudgmentRoute | None:
         """Where the configured provider would route `job`, if it can say.

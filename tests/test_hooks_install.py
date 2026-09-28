@@ -15,6 +15,7 @@ try:
 except ImportError:
     import _harness
 
+import hashlib
 import json
 import os
 import shlex
@@ -40,11 +41,10 @@ from brainskit.application.gate import (
 )
 from brainskit.application.install import BRAND
 from brainskit.application.services import BrainskitService
-from brainskit.domain.model import PolicyError, ValidationError
+from brainskit.domain.model import ValidationError
 from brainskit.infrastructure.extractor import GraphifyExtractor
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
-from brainskit.infrastructure.llm import JobSpecs, PolicyJudgmentRouter
 from brainskit.infrastructure.vault import FileVault
 from brainskit.interfaces import cli, console
 
@@ -2639,104 +2639,142 @@ class MovedWorkspaceTest(unittest.TestCase):
         self.assertFalse(any(layer.get("workspace_missing") for layer in layers))
 
 
-class SemanticLintReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
-    """`bk lint --semantic` on a cloud route withholds `local-only` pages.
+class QuotedVaultPathTemplateTest(VaultCase):
+    """The skill and instruction examples survive a vault path sh would split.
 
-    The twin of the `ask`/`resurface`/`digest` fix: semantic lint read as
-    `local`, which keeps `local-only` pages, and handed their branch to the
-    router, so with `lint-semantic` mapped to a cloud provider one local-only
-    page in recall refused the whole lint. The real router runs, so a
-    local-only branch reaching the cloud prompt would be refused there.
-
-    Here rather than beside `SemanticLintWithholdsNeverIngestEvidenceTest`
-    only because that file belongs to another change in flight.
+    Through 0.7.x both templates substituted the raw path into every `bk --vault
+    …` example, so an agent copying one under `Operação/` or a directory with a
+    space ran `bk` against a vault that does not exist. The frontmatter got the
+    same raw path, and `: ` or ` #` in it ended the YAML value early.
     """
 
-    LOCAL_ONLY_TEXT = "Contradictions unsupported claims about kappa-sigma pay bands."
-    LOCAL_ONLY_TITLE = "Pay bands"
-    CLOUD_TEXT = "Contradictions unsupported claims about the Friday release cadence."
+    VAULT_DIR = "Operação dir: #1"
+    SHELL_EXAMPLES = 18
 
-    class _Recorder:
-        def __init__(self) -> None:
-            self.prompts: list[str] = []
+    def skill_path(self) -> Path:
+        return self.root / ".claude" / "skills" / BRAND / "SKILL.md"
 
-        def complete(self, prompt: str, *, model: str, output_schema: Any = None) -> str:
-            self.prompts.append(prompt)
-            return json.dumps({"findings": []})
-
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        raw = policy()
-        raw["branches"]["30-public"] = {"privacy": "cloud", "filing": "approve-each"}
-        raw["providers"]["openai"] = {
-            "base_url": "https://api.openai.invalid/v1",
-            "api_key_env": "UNSET_TEST_KEY",
-        }
-        raw["job_models"]["lint-semantic"] = {"provider": "openai", "model": "m"}
-        self.vault = FileVault.initialize(Path(temporary.name), raw)
-        self.index = SqliteFtsIndex(self.vault.index_path)
-        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
-        private = self.seed.capture(
-            None, text=self.LOCAL_ONLY_TEXT, title=self.LOCAL_ONLY_TITLE
+    def adapter(self) -> dict[str, Any]:
+        loaded = json.loads(
+            (self.root / ".brain" / "agent-claude.json").read_text(encoding="utf-8")
         )
-        self.private_hash = private["source"]["content_hash"]
-        self.private_path = self.seed.file(self.private_hash, "20-research")[
-            "source"
-        ]["path"]
+        assert isinstance(loaded, dict)
+        return loaded
 
-    def lint(self) -> tuple[dict[str, Any], _Recorder, list[str]]:
-        driver = self._Recorder()
-        providers: list[str] = []
+    def vault_arguments(self, text: str) -> list[str]:
+        """The `--vault` argument of every `bk --vault …` example, as sh reads it."""
+        found = []
+        for line in text.splitlines():
+            if "bk --vault " not in line:
+                continue
+            command = line[line.index("bk --vault ") :]
+            command = command.split("`")[0].split("   #")[0]
+            found.append(shlex.split(command)[2])
+        return found
 
-        def create_driver(name: str, config: Any) -> SemanticLintReadsUnderTheRoutesBoundaryTest._Recorder:
-            providers.append(name)
-            return driver
+    def test_every_skill_example_passes_the_vault_as_one_word(self) -> None:
+        self.install(skip_code_build=True)
+        arguments = self.vault_arguments(self.skill_path().read_text(encoding="utf-8"))
+        self.assertEqual(arguments, [str(self.root)] * self.SHELL_EXAMPLES)
 
-        service = BrainskitService(
-            self.vault,
-            self.index,
-            judgment=PolicyJudgmentRouter(self.vault.config(), JobSpecs()),
-            jobs=JobSpecs(),
-            graph=MarkdownGraph(),
+    def test_every_instruction_file_example_passes_the_vault_as_one_word(self) -> None:
+        for agent, filename in (("claude", "CLAUDE.md"), ("gemini", "GEMINI.md")):
+            with self.subTest(agent=agent):
+                self.install(agent, skip_code_build=True)
+                text = (self.root / filename).read_text(encoding="utf-8")
+                self.assertEqual(self.vault_arguments(text), [str(self.root)])
+
+    def test_the_frontmatter_description_is_one_valid_scalar(self) -> None:
+        self.install(skip_code_build=True)
+        content = self.skill_path().read_text(encoding="utf-8")
+        head, frontmatter, _ = content.split("---\n", 2)
+        self.assertEqual(head, "")
+        fields = dict(line.split(": ", 1) for line in frontmatter.splitlines())
+        self.assertEqual(set(fields), {"name", "description"})
+        # A JSON string is a YAML double-quoted scalar, so this is the parse a
+        # YAML reader performs on it.
+        description = json.loads(fields["description"])
+        self.assertIn(f"the vault at {self.root}, or whenever", description)
+
+    def test_no_placeholder_survives_rendering(self) -> None:
+        for name in ("claude-skill", "instructions"):
+            with self.subTest(template=name):
+                self.assertNotIn("{{", installer._agent_template(name, self.root))
+
+    def test_an_unedited_skill_from_0_7_is_upgraded_without_force(self) -> None:
+        previous = installer._agent_template_text("claude-skill-0.7").replace(
+            "{{vault}}", str(self.root)
         )
-        with patch("brainskit.infrastructure.llm._create_driver", create_driver):
-            return service.lint(semantic=True), driver, providers
+        self.skill_path().parent.mkdir(parents=True)
+        self.skill_path().write_text(previous, encoding="utf-8")
 
-    def assert_no_local_only(self, text: str) -> None:
-        for disclosure in (
-            "kappa-sigma",
-            self.LOCAL_ONLY_TITLE,
-            self.private_hash,
-            Path(self.private_path).name,
-            "20-research",
-        ):
-            self.assertNotIn(disclosure, text)
+        result = self.install(skip_code_build=True)
 
-    def test_a_cloud_route_lints_the_cloud_pages_and_counts_the_rest(self) -> None:
-        public = self.seed.capture(None, text=self.CLOUD_TEXT, title="Cadence")
-        self.seed.file(public["source"]["content_hash"], "30-public")
-        result, driver, providers = self.lint()
-        self.assertEqual(providers, ["openai"])
-        self.assertEqual(result["semantic_report"], {"findings": []})
-        self.assertEqual(result["withheld_sources"], 1)
-        self.assertEqual(len(driver.prompts), 1)
-        self.assertIn("Friday release cadence", driver.prompts[0])
-        self.assert_no_local_only(driver.prompts[0])
-        self.assert_no_local_only(json.dumps(result, ensure_ascii=False))
+        self.assertEqual(result["skill"]["state"], "updated")
+        self.assertEqual(
+            self.skill_path().read_text(encoding="utf-8"),
+            installer._agent_template("claude-skill", self.root),
+        )
 
-    def test_only_local_only_pages_names_the_mapping_that_would_read_them(
-        self,
-    ) -> None:
-        with self.assertRaises(PolicyError) as caught:
-            self.lint()
-        details = caught.exception.details
-        self.assertEqual(details["withheld_sources"], 1)
-        self.assertIn("job_models.lint-semantic.local-only", details["hint"])
-        self.assert_no_local_only(
-            json.dumps(
-                {"message": str(caught.exception), "details": details},
-                ensure_ascii=False,
+    def test_an_edited_skill_from_0_7_is_still_the_operators(self) -> None:
+        edited = (
+            installer._agent_template_text("claude-skill-0.7").replace(
+                "{{vault}}", str(self.root)
             )
+            + "\nMy own note.\n"
+        )
+        self.skill_path().parent.mkdir(parents=True)
+        self.skill_path().write_text(edited, encoding="utf-8")
+
+        with self.assertRaises(ValidationError):
+            self.install(skip_code_build=True)
+        self.assertEqual(self.skill_path().read_text(encoding="utf-8"), edited)
+
+    def test_the_adapter_records_the_digest_of_the_skill_it_rendered(self) -> None:
+        self.install(skip_code_build=True)
+        digest = hashlib.sha256(self.skill_path().read_bytes()).hexdigest()
+        self.assertEqual(
+            self.adapter()["rendered"], {f".claude/skills/{BRAND}/SKILL.md": digest}
         )
 
+    def changed_template(self) -> Any:
+        """The shipped templates, with the skill's text changed as a release would."""
+        original = installer._agent_template_text
+
+        def text(name: str) -> str:
+            shipped = original(name)
+            return shipped + "\nA line a later release adds.\n" if name == "claude-skill" else shipped
+
+        return patch.object(installer, "_agent_template_text", side_effect=text)
+
+    def test_a_skill_matching_the_recorded_digest_is_replaced_without_force(self) -> None:
+        self.install(skip_code_build=True)
+        with self.changed_template(), patch.object(
+            installer, "_PREVIOUS_SKILL_TEMPLATES", ()
+        ):
+            # Neither template recognises the file now; only the digest can.
+            self.assertFalse(
+                installer._rendered_for_some_vault(
+                    installer._agent_template_text("claude-skill"),
+                    self.skill_path().read_text(encoding="utf-8"),
+                )
+            )
+            result = self.install(skip_code_build=True)
+            expected = installer._agent_template("claude-skill", self.root)
+
+        self.assertEqual(result["skill"]["state"], "updated")
+        self.assertEqual(self.skill_path().read_text(encoding="utf-8"), expected)
+        self.assertEqual(
+            self.adapter()["rendered"][f".claude/skills/{BRAND}/SKILL.md"],
+            hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+        )
+
+    def test_a_skill_edited_since_the_recorded_digest_is_refused(self) -> None:
+        self.install(skip_code_build=True)
+        edited = self.skill_path().read_text(encoding="utf-8") + "\nMy own note.\n"
+        self.skill_path().write_text(edited, encoding="utf-8")
+        with self.changed_template(), patch.object(
+            installer, "_PREVIOUS_SKILL_TEMPLATES", ()
+        ), self.assertRaises(ValidationError):
+            self.install(skip_code_build=True)
+        self.assertEqual(self.skill_path().read_text(encoding="utf-8"), edited)

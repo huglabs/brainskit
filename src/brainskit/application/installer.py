@@ -26,6 +26,7 @@ stdlib-only and gate-free; the writer is free to depend on both.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
@@ -47,6 +48,7 @@ from brainskit.application.install import (
     DEFAULT_AGENT,
     INSTRUCTIONS,
     AgentHook,
+    adapter_path,
     agent_install,
     redirected_git_hooks_path,
     redirected_hooks_hint,
@@ -122,7 +124,9 @@ GATE_REMEDIATION: dict[str, str] = {
 }
 
 
-def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
+def _agent_policy(
+    agent: str, workspace: Path, rendered: dict[str, str] | None = None
+) -> dict[str, Any]:
     """The adapter file, written as policy the gate reads rather than prose.
 
     `rules` stays for the human who opens the vault. `gate` is what code reads,
@@ -133,8 +137,13 @@ def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
     that is not always the vault and nothing else on disk remembers it. Without
     it `bk status` would look for hooks beside the vault, find none, and report
     every layer off while they are in fact guarding the project correctly.
+
+    `rendered` is the SHA-256 of each file the installer rendered for the
+    operator to keep, keyed by its workspace-relative path. A file whose digest
+    still matches was never edited, so the next install may replace it without
+    `--force` when the template changes under an unchanged vault.
     """
-    return {
+    policy: dict[str, Any] = {
         "agent": agent,
         "version": 2,
         "workspace": str(workspace),
@@ -148,6 +157,9 @@ def _agent_policy(agent: str, workspace: Path) -> dict[str, Any]:
             "Never edit raw content",
         ],
     }
+    if rendered:
+        policy["rendered"] = dict(sorted(rendered.items()))
+    return policy
 
 
 def _agent_template_text(name: str) -> str:
@@ -160,29 +172,136 @@ def _agent_template_text(name: str) -> str:
     return resource.read_text(encoding="utf-8")
 
 
+#: Where a markdown template puts the vault path, one placeholder per context
+#: the path lands in, because no single spelling is safe in all three.
+#
+# `{{vault}}` is prose. `{{vault_arg}}` is a word in a shell example, so a path
+# with a space (or `Operação`, which `shlex.quote` quotes too) stays one
+# argument when an agent copies the line. `{{vault_yaml}}` sits inside a
+# double-quoted frontmatter scalar: JSON string escaping is valid there, and a
+# raw `: ` or ` #` in a plain scalar would end the value or break the parse.
+_VAULT_PLACEHOLDER = re.compile(r"\{\{vault(?:_arg|_yaml)?\}\}")
+
+
+def _vault_renderings(vault: Path) -> dict[str, str]:
+    text = str(vault)
+    return {
+        "{{vault}}": text,
+        "{{vault_arg}}": shlex.quote(text),
+        "{{vault_yaml}}": json.dumps(text, ensure_ascii=False)[1:-1],
+    }
+
+
+def _vault_from_rendering(placeholder: str, rendered: str) -> str | None:
+    """The vault path a single rendered placeholder spells, or None."""
+    if placeholder == "{{vault_arg}}":
+        try:
+            words = shlex.split(rendered)
+        except ValueError:
+            return None
+        return words[0] if len(words) == 1 else None
+    if placeholder == "{{vault_yaml}}":
+        try:
+            decoded = json.loads(f'"{rendered}"')
+        except ValueError:
+            return None
+        return decoded if isinstance(decoded, str) else None
+    return rendered
+
+
+def _render_agent_template(text: str, vault: Path) -> str:
+    renderings = _vault_renderings(vault)
+    # One pass, so a path that happens to spell a placeholder is not re-expanded.
+    return _VAULT_PLACEHOLDER.sub(lambda match: renderings[match.group(0)], text)
+
+
 def _agent_template(name: str, vault: Path) -> str:
-    return _agent_template_text(name).replace("{{vault}}", str(vault))
+    return _render_agent_template(_agent_template_text(name), vault)
 
 
-def _rendered_for_some_vault(name: str, existing: str) -> bool:
-    """Whether `existing` is this template, unedited, rendered for any one vault.
+def _rendered_for_some_vault(template: str, existing: str) -> bool:
+    """Whether `existing` is `template`, unedited, rendered for any one vault.
 
     A moved repository leaves the skill naming the old vault path, and refusing
     to replace it without `--force` made the reinstall a moved install needs
     fail -- while `--force` would also clobber an operator's own pre-commit
-    hook. Only a byte-for-byte render with a different path qualifies; any edit
-    still makes the file the operator's.
+    hook. Only a byte-for-byte render qualifies: every vault the placeholders
+    could spell is rendered again and compared, so any edit still makes the
+    file the operator's.
     """
-    pieces = _agent_template_text(name).split("{{vault}}")
+    pieces = _VAULT_PLACEHOLDER.split(template)
     if len(pieces) < 2:
         return False
-    pattern = (
-        re.escape(pieces[0])
-        + r"(?P<vault>[^\n]+?)"
-        + "".join(f"{re.escape(piece)}(?P=vault)" for piece in pieces[1:-1])
-        + re.escape(pieces[-1])
+    match = re.fullmatch(
+        r"([^\n]+?)".join(re.escape(piece) for piece in pieces), existing
     )
-    return re.fullmatch(pattern, existing) is not None
+    if match is None:
+        return False
+    candidates = {
+        _vault_from_rendering(placeholder, rendered)
+        for placeholder, rendered in zip(
+            _VAULT_PLACEHOLDER.findall(template), match.groups(), strict=True
+        )
+    }
+    return any(
+        _render_agent_template(template, Path(candidate)) == existing
+        for candidate in candidates
+        if candidate
+    )
+
+
+#: Skill templates earlier releases shipped, by resource name.
+#
+# PREVIOUS-TEMPLATE RECOGNITION -- delete this tuple and the files it names once
+# no install from before 0.8.0 is left to upgrade. Through 0.7.x the skill put
+# the raw vault path into every shell example and the frontmatter; 0.8.0 quotes
+# them, so every skill whose path needed quoting changed under an unchanged
+# vault, and those installs recorded no hash of what they wrote. Recognising an
+# unedited render of the old text is what lets a plain `bk hooks install`
+# upgrade them without `--force`.
+_PREVIOUS_SKILL_TEMPLATES: tuple[str, ...] = ("claude-skill-0.7",)
+
+#: The skill, relative to the workspace. Also the key its digest is recorded
+#: under in the adapter.
+_SKILL = f".claude/skills/{BRAND}/SKILL.md"
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _recorded_renders(vault_root: Path, agent: str) -> dict[str, str]:
+    """What the last install recorded writing, per workspace-relative path.
+
+    Read before this install rewrites the adapter. Anything unreadable is no
+    record at all, which only ever makes the skill harder to replace, never
+    easier.
+    """
+    try:
+        document = json.loads(
+            (vault_root / adapter_path(agent)).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return {}
+    rendered = document.get("rendered") if isinstance(document, dict) else None
+    if not isinstance(rendered, dict):
+        return {}
+    return {
+        str(path): digest
+        for path, digest in rendered.items()
+        if isinstance(digest, str)
+    }
+
+
+def _unedited_skill(existing: str, recorded: str | None) -> bool:
+    """Whether a skill on disk is one an install wrote and nobody edited since."""
+    if recorded is not None and _digest(existing) == recorded:
+        return True
+    templates = ("claude-skill", *_PREVIOUS_SKILL_TEMPLATES)
+    return any(
+        _rendered_for_some_vault(_agent_template_text(name), existing)
+        for name in templates
+    )
 
 
 def render_hook_script(name: str, vault: Path, workspace: Path | None = None) -> str:
@@ -214,21 +333,27 @@ def render_hook_script(name: str, vault: Path, workspace: Path | None = None) ->
     )
 
 
-def _install_skill(root: Path, vault: Path, *, force: bool) -> dict[str, Any]:
+def _install_skill(
+    root: Path, vault: Path, *, force: bool, recorded: str | None = None
+) -> dict[str, Any]:
     """Install the Claude Code skill that teaches the vault contract.
+
+    A skill whose digest is the one `recorded` by the last install, or that is
+    an unedited render of a template this tool shipped, is replaced without
+    `--force`; anything else is the operator's.
 
     A former brand's skill directory is reported alongside — an already-current
     install is exactly where that debris hides, so the report is attached to
     every outcome rather than only to the one that writes.
     """
-    skill = root / ".claude" / "skills" / BRAND / "SKILL.md"
+    skill = root / _SKILL
     content = _agent_template("claude-skill", vault)
     legacy = _legacy_skill_dirs(root)
     if skill.is_file() and not force:
         existing = skill.read_text(encoding="utf-8")
         if existing == content:
             return {"path": str(skill), "state": "current", **_legacy(legacy)}
-        if not _rendered_for_some_vault("claude-skill", existing):
+        if not _unedited_skill(existing, recorded):
             raise ValidationError(
                 "A brainskit skill already exists; re-run with --force to replace it",
                 details={"path": str(skill)},
@@ -906,8 +1031,17 @@ def install_agent(
     # observing its own side effect and concluding all is well.
     advisory = _workspace_advisory(vault_root, workspace)
     install = agent_install(agent)
+    # Read before the adapter is rewritten. What replaces it is the digest of
+    # what this run renders, even when the skill step then refuses: a refusal
+    # means the file on disk already failed to match the old digest, so the old
+    # one identifies nothing that is still there.
+    recorded = _recorded_renders(vault_root, agent)
+    rendered = dict(recorded)
+    if install.skill:
+        rendered[_SKILL] = _digest(_agent_template("claude-skill", vault_root))
     vault.write_generated(
-        install.adapter, json.dumps(_agent_policy(agent, workspace), indent=2) + "\n"
+        install.adapter,
+        json.dumps(_agent_policy(agent, workspace, rendered), indent=2) + "\n",
     )
     result: dict[str, Any] = {
         "agent": agent,
@@ -919,7 +1053,9 @@ def install_agent(
     # What an agent gets is registry data, not a test on its name: `bk status`
     # reads the same two fields back to decide which layers to report.
     if install.skill:
-        result["skill"] = _install_skill(workspace, vault_root, force=force)
+        result["skill"] = _install_skill(
+            workspace, vault_root, force=force, recorded=recorded.get(_SKILL)
+        )
     if install.hooks:
         result["claude_hook"] = _install_claude_hook(workspace, vault_root, force=force)
     if advisory is not None:

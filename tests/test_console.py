@@ -92,6 +92,20 @@ class StatusLineTests(unittest.TestCase):
             console.status_line(False, "2 lint errors", stream=PIPE),
         )
 
+    def test_a_warning_is_neither_a_tick_nor_a_cross(self) -> None:
+        """Off a terminal the glyph is all that is left to read."""
+
+        line = console.warn_line("1 warning(s)", stream=PIPE)
+        self.assertEqual(line, f"{console.BANG} 1 warning(s)")
+        self.assertNotIn(console.CHECK, line)
+        self.assertNotIn(console.CROSS, line)
+
+    def test_a_warning_is_drawn_in_the_warn_colour_on_a_terminal(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            line = console.warn_line("stale", stream=TTY)
+        self.assertTrue(line.startswith(console.WARN))
+        self.assertNotIn(console.OK, line)
+
 
 class LinkTests(unittest.TestCase):
     def test_off_a_terminal_the_text_is_returned_untouched(self) -> None:

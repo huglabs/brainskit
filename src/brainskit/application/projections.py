@@ -176,8 +176,9 @@ class Projections:
                 )
             self.vault.write_generated(view_path, "\n".join(rows) + "\n")
             written.append(view_path)
-        self.vault.write_generated("views/home.md", "\n".join(home) + "\n")
-        self.ledger.record_projection(VIEWS_PROJECTION)
+        home_text = "\n".join(home) + "\n"
+        self.vault.write_generated("views/home.md", home_text)
+        self.ledger.record_projection(VIEWS_PROJECTION, home_text)
         return {"written": written}
 
     def graph(
@@ -198,16 +199,15 @@ class Projections:
         if not self.graph_port:
             raise NotConfiguredError("Graph adapter is not configured")
         graph = self.graph_data(consumer=consumer, limit=0)
-        self.vault.write_generated(
-            "graph/graph.json", json.dumps(graph, indent=2, ensure_ascii=False) + "\n"
-        )
+        graph_text = json.dumps(graph, indent=2, ensure_ascii=False) + "\n"
+        self.vault.write_generated("graph/graph.json", graph_text)
         written = ["graph/graph.json"]
         if html:
             self.vault.write_generated(
                 "graph/graph.html", self.graph_port.export(graph, "html")
             )
             written.append("graph/graph.html")
-        self.ledger.record_projection(GRAPH_PROJECTION)
+        self.ledger.record_projection(GRAPH_PROJECTION, graph_text)
         return {
             "consumer": consumer,
             "nodes": len(graph["nodes"]),

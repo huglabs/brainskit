@@ -94,7 +94,8 @@ de seguir em março.
 ## Funciona no seu laptop e não pede nada
 
 Nenhum sistema de conta. Nenhuma credencial. Nenhuma rede para qualquer trabalho mecânico.
-Uma dependência no núcleo.
+Uma dependência declarada no núcleo, `jsonschema[format]`, que resolve para
+cerca de 17 pacotes no total — todos Python puro, exceto `rpds-py`.
 
 Anthropic, OpenAI, OpenRouter e Ollama são drivers intercambiáveis atrás de um
 contrato de trabalho — e evidência que você marcou `local-only` vai para Ollama ou não vai
@@ -111,7 +112,7 @@ uv tool install brainskit     # ou: pipx install brainskit
 bk --help
 ```
 
-Quatro extras são opcionais, porque o núcleo mantém uma única dependência e nenhuma dessas
+Quatro extras são opcionais, porque o núcleo se limita a essa única dependência declarada e nenhuma dessas
 capacidades é obrigatória para cada vault:
 
 ```bash
@@ -132,7 +133,7 @@ Instale a árvore de trabalho, uma ref git, ou um wheel construído com o mesmo 
 
 ```bash
 uv tool install /path/to/brainskit
-uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.5.0'
+uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.8.0'
 ```
 
 Para fixar `bk` a um projeto em vez da máquina, declare-o como uma dependência

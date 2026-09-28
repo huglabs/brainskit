@@ -84,6 +84,9 @@ CODE_PRIVACY = PrivacyMode.LOCAL_ONLY
 
 SCHEMA_VERSION = 1
 
+#: The remedy a missing or out-of-date graph names. A fresh vault has no
+#: `graph.json` to import, so `CODE_PROJECTION_COMMAND` is named only where no
+#: extractor is configured and extracting elsewhere is the one route left.
 CODE_REBUILD_COMMAND = "bk code build"
 
 #: What a reader says when it refuses a malformed artefact, and what `status`
@@ -901,7 +904,7 @@ class CodeGraph:
                 "state": "missing",
                 "stale": False,
                 "generated_at": None,
-                "command": CODE_PROJECTION_COMMAND,
+                "command": CODE_REBUILD_COMMAND,
             }
 
         generated_at = graph.get("built_at")
@@ -935,7 +938,7 @@ class CodeGraph:
                 "stale": True,
                 "generated_at": generated_at if isinstance(generated_at, str) else None,
                 "reason": "the graph records no input set, so it cannot be verified",
-                "command": CODE_PROJECTION_COMMAND,
+                "command": CODE_REBUILD_COMMAND,
             }
 
         changed: list[str] = []
@@ -979,7 +982,7 @@ class CodeGraph:
             "removed": removed[:20],
             "changed_total": len(changed),
             "removed_total": len(removed),
-            **({} if fresh else {"command": CODE_PROJECTION_COMMAND}),
+            **({} if fresh else {"command": CODE_REBUILD_COMMAND}),
         }
         if missing:
             result["missing_grammars"] = [
@@ -1328,7 +1331,7 @@ class CodeGraph:
         if graph is None:
             raise NotFoundError(
                 "No code graph in this vault",
-                details={"hint": f"Build one with {CODE_PROJECTION_COMMAND}"},
+                details={"hint": f"Build one with {CODE_REBUILD_COMMAND}"},
             )
         self._refuse_malformed(graph, hint=CODE_MALFORMED_HINT)
         return graph

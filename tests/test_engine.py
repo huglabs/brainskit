@@ -31,6 +31,7 @@ from brainskit.application.schema import validate_schema
 from brainskit.application.services import BrainskitService
 from brainskit.domain.model import (
     ConflictError,
+    ModelResponseError,
     NotConfiguredError,
     PolicyError,
     ValidationError,
@@ -2503,6 +2504,63 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(record.status, "ingested")
 
 
+class ExhaustedIngestNamesTheModelTest(unittest.TestCase):
+    """An ingest that never cites its source says which model to replace.
+
+    The refusal used to carry the failures and the attempt count only, so a
+    small model losing the citation contract on a long source read as a bad
+    request -- and the fix, a larger model under `job_models.ingest`, appeared
+    nowhere in it.
+    """
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.vault = FileVault.initialize(Path(temporary.name), policy())
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        captured = BrainskitService(self.vault, self.index, graph=MarkdownGraph()).capture(
+            None, text="Evidence the model will not cite.", title="Uncited"
+        )
+        self.hash = captured["source"]["content_hash"]
+        self.uncited = {
+            "operations": [
+                {
+                    "action": "upsert",
+                    "kind": "concept",
+                    "slug": "uncited",
+                    "title": "Uncited",
+                    "aliases": [],
+                    "source_hashes": [self.hash],
+                    "body": "A claim with no citation.",
+                    "links": [],
+                    "base_hash": None,
+                }
+            ]
+        }
+
+    def ingest(self, judgment: FakeJudgment) -> dict:
+        service = BrainskitService(
+            self.vault, self.index, judgment=judgment, jobs=JobSpecs(), graph=MarkdownGraph()
+        )
+        with self.assertRaises(ModelResponseError) as caught:
+            service.ingest(self.hash, target_branch="20-research")
+        return caught.exception.details
+
+    def test_the_refusal_names_the_model_and_the_route_to_change(self) -> None:
+        details = self.ingest(
+            RoutedFakeJudgment({"ingest": [self.uncited]}, self.vault.config())
+        )
+        self.assertIn("citation_mismatch", [f["code"] for f in details["failures"]])
+        self.assertEqual((details["provider"], details["model"]), ("ollama", "test"))
+        self.assertIn("ollama model test", details["hint"])
+        self.assertIn("job_models.ingest", details["hint"])
+
+    def test_a_port_that_cannot_route_still_names_the_route(self) -> None:
+        details = self.ingest(FakeJudgment({"ingest": [self.uncited]}))
+        self.assertNotIn("model", details)
+        self.assertIn("job_models.ingest", details["hint"])
+
+
 class RetrievalContextApplyContractScopeTest(unittest.TestCase):
     """`apply_contract` belongs to a caller about to write a proposal, not to
     a job that only ever reads. See `Retrieval.context`'s
@@ -3979,10 +4037,10 @@ class WikiCatalogHasNoSelfDeclaredExemptionTest(unittest.TestCase):
     `wiki.outside_apply` exemption, where the file being checked decided whether
     it would be checked.
 
-    The seeded pages are deliberately *not* exempted here, unlike in
-    `SEEDED_SYSTEM_PAGES`. That constant answers a provenance question ("which
-    pages may exist with no ledger entry"); this asks which identities are
-    already taken, and `wiki/index.md` does take one. Sharing a constant would
+    The seeded pages are deliberately *not* exempted here, unlike in the seed
+    records in `.brain/freshness.json`. Those answer a provenance question
+    ("what did init write at this path"); this asks which identities are
+    already taken, and `wiki/index.md` does take one. Sharing one list would
     couple two questions that only agree by coincidence today.
     """
 

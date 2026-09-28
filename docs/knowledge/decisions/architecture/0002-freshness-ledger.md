@@ -129,3 +129,29 @@ to provide for the write gate failing open, and an annotation switched it off.
   tables, `_graph_integrity`, `_views_integrity`) are unchanged and still
   importable; the ledger composes them, and `tests/test_projections.py` keeps
   driving them directly.
+
+## Amendment — 2026-09-28 (0.8.0)
+
+The two consequences above that name `_untracked_page_findings`, the
+`SEEDED_SYSTEM_PAGES` exemption and `_views_integrity` describe the tree as it
+was decided, and are left as written. In 0.8.0 each shape check was replaced by
+an identity, which is the direction this ADR already took for applied pages:
+
+- **Seed records** ([#34](https://github.com/huglabs/brainskit/issues/34)).
+  `SEEDED_SYSTEM_PAGES` and `_is_seeded_shape` are deleted. The ledger gains a
+  `seeded` table and a transition, `record_seeded`, which lint calls only for a
+  seed page byte-identical to the template some release of `bk init` wrote
+  (`domain/model.py` `is_seed_template`). `seeded_hash` is then compared exactly
+  as `applied_hash` is, and after it. A seed record is not an applied entry — it
+  does not age and does not enter the freshness summary or the projection
+  fingerprint — so the rule this ADR fixes, that only `mark_applied` produces a
+  `content_hash`, is unchanged. The finding helper is now
+  `_untracked_page_finding`, and no path is exempt from it.
+- **Artefact hashes** ([#33](https://github.com/huglabs/brainskit/issues/33)).
+  `_views_integrity` and its marker-shape regex are deleted.
+  `record_projection(artifact, anchor_text)` now also stamps `artefact_hash`,
+  the SHA-256 of the anchor it was handed, and an anchor whose bytes differ is
+  `malformed`; `_graph_integrity` remains as the structural check that runs
+  first. A projection recorded before the stamp reads the new state
+  `unverified`. The record also keeps per-input digests (`inputs`), which only
+  explain a `stale` verdict and do not decide it.

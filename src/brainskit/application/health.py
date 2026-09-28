@@ -30,6 +30,9 @@ from brainskit.application.freshness import (
     FreshnessLedger,
     FreshnessSnapshot,
     _age_in_days,
+    _artefact_hash,
+    _drift_reason,
+    _projection_inputs,
     _projection_source_hash,
 )
 from brainskit.application.gate import HOOK_SENTINEL, INSTRUCTION_START
@@ -63,6 +66,7 @@ from brainskit.application.schema import validate_schema
 from brainskit.domain.model import (
     CITATION_RE,
     CODE_CITATION_RE,
+    SEED_PAGES,
     WIKI_LINK_RE,
     CodeSource,
     LintFinding,
@@ -70,6 +74,7 @@ from brainskit.domain.model import (
     PolicyError,
     SourceRecord,
     ValidationError,
+    is_seed_template,
 )
 from brainskit.domain.privacy import context_branches
 
@@ -77,38 +82,6 @@ from brainskit.domain.privacy import context_branches
 #: Compared by identity, never by value, so it can never be confused with a real
 #: fault a detector reports.
 _ARTEFACT_ABSENT: dict[str, Any] = {"problem": "no artefact"}
-
-#: The two pages `bk init` writes before any apply has run, so they exist with
-#: no entry in the freshness ledger. `Vault.initialize` writes them from
-#: `_system_page` and nothing writes them again -- not `bk apply`, which only
-#: ever writes the pages a proposal names, and not `bk views`, which writes
-#: `views/`. They are named here rather than recognised by their `type: system`
-#: frontmatter because that field is written by whatever wrote the file: keying
-#: the exemption on it let any page opt itself out of `wiki.outside_apply`
-#: forever, which is the one thing an integrity check must not let its subject
-#: decide. `SeededSystemPageTest` builds a page with the real `_system_page` and
-#: asserts lint stays quiet, so this list cannot drift from what init writes.
-SEEDED_SYSTEM_PAGES: frozenset[str] = frozenset({"wiki/index.md", "wiki/log.md"})
-
-
-def _is_seeded_shape(body: str) -> bool:
-    """Whether a page body is still the heading `bk init` seeded and nothing else.
-
-    The seeded pages have no sources and no ledger entry, so there is no hash to
-    compare against and nothing to say what they looked like when they were
-    written. What can be checked is the shape init gives them -- a single
-    heading -- which holds across every version that has ever seeded them,
-    including the ones that spelled the title differently.
-
-    That makes this narrower than the hash comparison a tracked page gets: an
-    edit that replaced the heading with another heading would pass. It is the
-    strongest claim available without inventing state, and it catches the case
-    that actually happens, which is content appended below.
-    """
-
-    lines = [line for line in body.strip().splitlines() if line.strip()]
-    return len(lines) == 1 and lines[0].startswith("# ")
-
 
 def _reinstall_hint(agent: str, workspace: Path, vault_root: Path) -> str:
     """The command that rewrites an agent's install where it already is.
@@ -373,6 +346,7 @@ class Health:
         # `.brain/schema.json` from disk on every call, so a vault-wide lint
         # was paying for the same file as many times as it had pages.
         schema = self.vault.schema()
+        seeds: dict[str, str] = {}
         for path in self.vault.wiki_pages():
             text = self.vault.read_text(path)
             metadata, body = parse_frontmatter(text)
@@ -380,10 +354,15 @@ class Health:
             # ledger rather than derived here from the shape of an entry. A
             # bare entry -- one an annotation created, carrying no hash -- is
             # not provenance, so it falls to the untracked branch instead of
-            # buying the page silence in both.
-            expected_hash = freshness.applied_hash(path)
+            # buying the page silence in both. A seeded page is compared the
+            # same way, against what init recorded writing.
+            expected_hash = freshness.applied_hash(path) or freshness.seeded_hash(path)
             if expected_hash is None:
-                findings.extend(self._untracked_page_findings(path, body))
+                observed = self.vault.wiki_version(path)
+                if observed is not None and is_seed_template(path, text):
+                    seeds[path] = observed
+                else:
+                    findings.append(self._untracked_page_finding(path))
             elif expected_hash != self.vault.wiki_version(path):
                 findings.append(
                     LintFinding(
@@ -448,6 +427,7 @@ class Health:
                             path=path,
                         )
                     )
+        self.ledger.record_seeded(seeds)
         for path, age_days in freshness.stale_pages():
             findings.append(
                 LintFinding(
@@ -475,71 +455,45 @@ class Health:
         for artifact, report in self._projection_report(freshness, records).items():
             if not report["stale"]:
                 continue
-            # `stale` now covers `malformed` too, and the two need different
-            # sentences: "built from a different set of wiki pages" is a lie
-            # about a file that is not JSON, and it sends a reader looking for a
-            # page that changed. The malformed report already carries the
-            # sentence that describes it, so the code takes it rather than
-            # restating it; the remedy is the same command either way.
-            reason = report.get("reason")
-            message = (
-                f"Derived {artifact} {reason}; run {PROJECTION_COMMANDS[artifact]}"
-                if isinstance(reason, str)
-                else f"Derived {artifact} was built from a different set of wiki "
-                f"pages; run {PROJECTION_COMMANDS[artifact]}"
-            )
+            # Every regenerate state carries the fragment that describes it, so
+            # the sentence is taken from the report rather than restated here:
+            # a malformed file, an unverifiable one and each kind of input drift
+            # send a reader looking for different things, and the remedy is the
+            # same command for all of them.
             findings.append(
                 LintFinding(
                     PROJECTION_LINT_CODES[artifact],
-                    message,
+                    f"Derived {artifact} {report['reason']}; "
+                    f"run {PROJECTION_COMMANDS[artifact]}",
                     severity="warning",
                 )
             )
         return findings
 
-    def _untracked_page_findings(self, path: str, body: str) -> list[LintFinding]:
-        """Report a `wiki/` page the freshness ledger has never heard of.
+    def _untracked_page_finding(self, path: str) -> LintFinding:
+        """Report a `wiki/` page the freshness ledger cannot vouch for.
 
         Every page under `wiki/` is one of three things, and only the first two
-        are legitimate: written by `bk apply`, which records a ledger entry;
-        seeded by `bk init`, which records nothing; or written by something else,
-        which is the bypass the write gate exists to stop.
+        are legitimate: written by `bk apply`, which records an applied entry;
+        seeded by `bk init`, whose bytes lint records while they still equal
+        the seed template; or written by something else, which is the bypass
+        the write gate exists to stop. Reaching here means neither record
+        exists and the bytes are not the seed template either.
 
-        The seeded pages used to be recognised by their `type: system`
-        frontmatter and skipped entirely. Both halves of that were wrong. Keying
-        on frontmatter meant the file being checked decided whether it would be
-        checked -- writing `type: "system"` into any path under `wiki/` bought
-        permanent silence -- and skipping meant the two pages `bk init` really
-        does write were never looked at either, so appending a fabricated claim
-        to `wiki/index.md` produced no finding at all while `bk gate check-write`
-        refused the same path. This is what the gate hook's header comment names
-        as the reason it may fail open, so it has to be true for every page the
-        gate covers, not for seven of nine.
-
-        A seeded page that later gains a ledger entry -- an apply naming
-        `wiki/index.md` in a proposal -- never reaches here: the caller's ledger
-        branch handles it, and the hash comparison there is strictly stronger.
-        So making these pages visible cannot make `bk apply` report findings
-        against its own output.
+        Nothing here is exempt by path or by the page's own frontmatter: a check
+        keyed on `type: system` let the file being checked decide whether it
+        would be checked. The path only picks the sentence -- a seeded path
+        holding something init never wrote was edited, while any other path
+        appeared from nowhere, and a reader acts differently on each.
         """
 
-        if path not in SEEDED_SYSTEM_PAGES:
-            return [
-                LintFinding(
-                    "wiki.outside_apply",
-                    "Wiki page is not tracked by the apply gate",
-                    path=path,
-                )
-            ]
-        if _is_seeded_shape(body):
-            return []
-        return [
-            LintFinding(
-                "wiki.outside_apply",
-                "Wiki page changed outside the apply gate",
-                path=path,
-            )
-        ]
+        return LintFinding(
+            "wiki.outside_apply",
+            "Wiki page changed outside the apply gate"
+            if path in SEED_PAGES
+            else "Wiki page is not tracked by the apply gate",
+            path=path,
+        )
 
     def _code_citation_findings(
         self, path: str, metadata: dict[str, Any], body: str
@@ -656,18 +610,27 @@ class Health:
     ) -> dict[str, Any]:
         """Compare every derived artefact against the inputs it was built from.
 
-        Four outcomes, and they are not the same thing:
+        Five outcomes, and they are not the same thing:
 
         - `missing` — the artefact is not on disk. Nothing derives from the
           vault yet, so nothing can be out of date. `bk graph` and `bk views`
           are on-demand, and a vault that never ran them is not in error.
         - `malformed` — the artefact is on disk but is not the artefact. A
           `graph/graph.json` that is not JSON, or whose nodes and edges cannot
-          be traversed; a `views/home.md` that no `bk views` wrote.
+          be traversed; any anchor whose bytes differ from the `artefact_hash`
+          recorded when it was written.
         - `stale` — the artefact exists, is usable, and was built from different
           inputs or from an unrecorded set. A projection whose provenance is
           unknown is treated as out of date rather than trusted.
-        - `fresh` — the recorded fingerprint matches the current inputs.
+        - `unverified` — built from the current inputs, but written before
+          brainskit stamped what it writes, so nothing can say whether the file
+          is still the one it wrote. Not `malformed`: a view an older release
+          generated is a legitimate artefact, and calling it broken would fire
+          on every upgraded vault. Not `fresh` either, since a stamp is exactly
+          what would have caught a `views/home.md` gutted to one line. One run
+          of the command stamps it.
+        - `fresh` — the file is the one recorded, and the recorded fingerprint
+          matches the current inputs.
 
         `malformed` exists because the other three answer a question the artefact
         can pass while being worthless. The fingerprint lives in
@@ -712,26 +675,40 @@ class Health:
             generated_at = entry.get("generated_at")
             if not isinstance(generated_at, str):
                 generated_at = None
+            stamp = entry.get("artefact_hash")
+            stamp = stamp if isinstance(stamp, str) else None
+            command = PROJECTION_COMMANDS[artifact]
+            # Each `reason` is a fragment, not a sentence, and the same shape
+            # `CodeGraph.staleness` reports: `lint` prefixes it with the
+            # artefact it is about, and repeating the name there would print
+            # it twice.
             detail: dict[str, Any] = {}
-            fault = self._artefact_fault(artifact, anchor)
+            fault = self._artefact_fault(artifact, anchor, stamp)
             if fault is _ARTEFACT_ABSENT:
                 state = "missing"
             elif fault is not None:
                 state = "malformed"
                 detail = {
                     **fault,
-                    # A fragment, not a sentence, and the same shape
-                    # `CodeGraph.staleness` reports: `lint` prefixes it with the
-                    # artefact it is about, and repeating the name there would
-                    # print it twice.
-                    "reason": (
-                        f"is not what {PROJECTION_COMMANDS[artifact]} writes, "
-                        "so it answers nothing"
-                    ),
-                    "command": PROJECTION_COMMANDS[artifact],
+                    "reason": f"is not what {command} writes, so it answers nothing",
+                    "command": command,
                 }
             elif entry.get("source_hash") != expected:
                 state = "stale"
+                detail = {
+                    "reason": _drift_reason(
+                        entry.get("inputs"), _projection_inputs(pages, records)
+                    )
+                }
+            elif stamp is None:
+                state = "unverified"
+                detail = {
+                    "reason": (
+                        "was generated before brainskit recorded what it writes, "
+                        "so it cannot be verified"
+                    ),
+                    "command": command,
+                }
             else:
                 state = "fresh"
             item: dict[str, Any] = {
@@ -746,7 +723,9 @@ class Health:
             report[artifact] = item
         return report
 
-    def _artefact_fault(self, artifact: str, anchor: str) -> dict[str, Any] | None:
+    def _artefact_fault(
+        self, artifact: str, anchor: str, stamp: str | None
+    ) -> dict[str, Any] | None:
         """Open a projection's anchor and say what is wrong with it.
 
         Three answers: `_ARTEFACT_ABSENT` for a file that is not there, a fault
@@ -754,6 +733,11 @@ class Health:
         that can. A sentinel rather than a second return value because "absent"
         is not a degree of "malformed" — one is a vault that has not generated
         yet and is healthy, the other is a file to be replaced.
+
+        The structural check runs before the stamp because its fault names the
+        field or the parse that failed, which says more than "changed". The
+        stamp then catches what no structure can: a file that still parses, or
+        a view that still opens with its marker, but is not what was written.
 
         Every read failure is absence. A directory where the anchor should be,
         a permission error, bytes that are not text: none of them is an artefact,
@@ -765,7 +749,11 @@ class Health:
             text = self.vault.read_text(anchor)
         except (OSError, ValueError):
             return _ARTEFACT_ABSENT
-        return PROJECTION_INTEGRITY[artifact](text)
+        structural = PROJECTION_INTEGRITY.get(artifact)
+        fault = structural(text) if structural else None
+        if fault is None and stamp is not None and _artefact_hash(text) != stamp:
+            fault = {"problem": "changed since it was generated"}
+        return fault
 
     def _enforcement_state(self) -> dict[str, Any]:
         """Report which enforcement layers are live for this vault, from disk.

@@ -1432,6 +1432,25 @@ def _post_json(
             if attempt == _HTTP_ATTEMPTS - 1:
                 raise last_error from exc
             time.sleep(float(2**attempt))
+        except TimeoutError as exc:
+            # `urlopen` wraps a timeout while *sending* in `URLError`, but not
+            # one while waiting for the answer -- which is where a local model
+            # too slow for the job spends its time. That escaped as a bare
+            # `timed out` with no provider, model or next step. Not retried: the
+            # next attempt repeats the same generation against the same clock.
+            raise NotConfiguredError(
+                "Provider did not answer in time",
+                details={
+                    "provider": resolved.provider,
+                    "model": resolved.model,
+                    "timeout_seconds": timeout,
+                    "hint": (
+                        f"Raise providers.{resolved.provider or '<provider>'}."
+                        "timeout_seconds in .brain/config.json, or route this "
+                        "job to a faster model."
+                    ),
+                },
+            ) from exc
     if last_error:
         raise last_error
     try:

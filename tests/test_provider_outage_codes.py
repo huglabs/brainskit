@@ -79,6 +79,33 @@ class ProviderOutageIsNotConfiguredTest(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.code, "not_configured")
 
+    def test_a_provider_too_slow_to_answer_names_the_knob(self) -> None:
+        """A read timeout escaped as a bare `timed out` with no details at all.
+
+        It is what a local model too slow for `ingest` produces, so the operator
+        needed the provider, the model and the setting -- and got none of them.
+        """
+
+        from brainskit.infrastructure import llm
+
+        with mock.patch.object(
+            llm.urllib.request, "urlopen", side_effect=TimeoutError("timed out")
+        ) as urlopen:
+            with self.assertRaises(ValidationError) as raised:
+                llm._post_json(
+                    "http://127.0.0.1:9/none",
+                    {},
+                    headers={},
+                    timeout=120,
+                    context=llm.ProviderContext(provider="ollama", model="big:14b"),
+                )
+        self.assertEqual(raised.exception.code, "not_configured")
+        details = raised.exception.details
+        self.assertEqual(details["model"], "big:14b")
+        self.assertEqual(details["timeout_seconds"], 120)
+        self.assertIn("providers.ollama.timeout_seconds", details["hint"])
+        self.assertEqual(urlopen.call_count, 1)
+
     def test_the_error_is_still_a_validation_error_subclass(self) -> None:
         """The compatibility guarantee that makes this change safe."""
 

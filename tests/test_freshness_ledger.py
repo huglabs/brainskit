@@ -241,5 +241,46 @@ class AnnotationDoesNotLaunderTest(FreshnessLedgerFixture):
         self.assertNotIn("wiki.outside_apply", self.lint_codes_for(applied))
 
 
+class SeedRecordIsNotAnAppliedEntryTest(FreshnessLedgerFixture):
+    """A seed record is provenance for the bytes `bk init` wrote, and nothing more.
+
+    A seed carries no `content_hash`, so `applied_hash` still means "the apply
+    gate wrote this"; it has no page entry, so it never ages, never counts in
+    the freshness summary and never enters a projection fingerprint.
+    """
+
+    SEEDED = "wiki/index.md"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.service.lint()
+
+    def test_a_seeded_page_has_a_seed_hash_and_no_applied_hash(self) -> None:
+        snapshot = self.service.ledger.snapshot()
+        self.assertIsNone(snapshot.applied_hash(self.SEEDED))
+        self.assertEqual(
+            snapshot.seeded_hash(self.SEEDED), self.vault.content_hash(self.SEEDED)
+        )
+        self.assertNotIn(self.SEEDED, snapshot.pages())
+
+    def test_an_annotation_on_a_seed_does_not_launder_an_edit(self) -> None:
+        self.service.ledger.mark_reviewed({self.SEEDED: "capture related"})
+        target = self.root / self.SEEDED
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\nForjado.\n", encoding="utf-8"
+        )
+        self.assertIn("wiki.outside_apply", self.lint_codes_for(self.SEEDED))
+
+    def test_a_page_the_gate_later_writes_is_checked_against_the_gate(self) -> None:
+        def applied(state: dict[str, Any]) -> dict[str, Any]:
+            state["pages"][self.SEEDED] = {"content_hash": "0" * 64}
+            return state
+
+        self.vault.mutate_state("freshness", applied)
+        snapshot = self.service.ledger.snapshot()
+        self.assertEqual(snapshot.applied_hash(self.SEEDED), "0" * 64)
+        self.assertIn("wiki.outside_apply", self.lint_codes_for(self.SEEDED))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

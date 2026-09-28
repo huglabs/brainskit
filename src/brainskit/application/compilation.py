@@ -380,14 +380,14 @@ class ApplyGate:
         catalog entirely, so `duplicate_identity` never fired against it.
 
         The seeded pages `bk init` writes are *not* exempted here, unlike in
-        `SEEDED_SYSTEM_PAGES`, because the two lists answer different questions
-        that only coincidentally agree today. That constant answers "which pages
-        may exist with no entry in the freshness ledger" -- a provenance
-        question, where init's pages are a genuine special case. This asks "which
+        the seed records in `.brain/freshness.json`, because the two answer
+        different questions that only coincidentally agree today. Those records
+        answer "what did init write at this path" -- a provenance question,
+        where init's pages are a genuine special case. This asks "which
         titles, aliases and bodies are already taken", and `wiki/index.md`
         genuinely takes the title "Brainskit index" and the slug `index`. A
         proposal claiming either is a duplicate, and refusing it is the check
-        working rather than a false positive. Sharing one constant would couple
+        working rather than a false positive. Sharing one list would couple
         them, so that seeding a third page would silently grant it a dedupe
         exemption nobody argued for -- which is this defect again, one release
         later.

@@ -1,6 +1,6 @@
 ---
 name: brainskit
-description: "Read and write a brainskit vault — a local-first second brain where markdown is the source of truth and only `bk apply` may write the wiki. Use when asked to research, summarize, file, or answer from the vault at {{vault_yaml}}, or whenever a task would otherwise mean editing files under wiki/ or raw/."
+description: Read and write a brainskit vault — a local-first second brain where markdown is the source of truth and only `bk apply` may write the wiki. Use when asked to research, summarize, file, or answer from the vault at {{vault}}, or whenever a task would otherwise mean editing files under wiki/ or raw/.
 ---
 
 # brainskit
@@ -22,7 +22,7 @@ PreToolUse hook that refuses the write while you are attempting it, and returns
 the command to use instead. Ask it yourself before writing anywhere unusual:
 
 ```bash
-bk --vault {{vault_arg}} gate check-write PATH --json   # exit 0 allowed, 2 denied
+bk --vault {{vault}} gate check-write PATH --json   # exit 0 allowed, 2 denied
 ```
 
 A write that slips past the hook is still caught afterwards: `bk lint` compares
@@ -30,8 +30,8 @@ each page against the hash the apply gate recorded, and the vault reports
 `wiki.outside_apply` until it is reverted.
 
 ```bash
-bk --vault {{vault_arg}} context "QUERY" --consumer local --json   # 1. get evidence
-bk --vault {{vault_arg}} apply proposal.json --json                # 2. write pages
+bk --vault {{vault}} context "QUERY" --consumer local --json   # 1. get evidence
+bk --vault {{vault}} apply proposal.json --json                # 2. write pages
 ```
 
 `context` returns the evidence bundle and the exact proposal contract. Build the
@@ -91,13 +91,13 @@ not its body, not its name.
 
 | Goal | Command |
 | --- | --- |
-| Add evidence | `bk --vault {{vault_arg}} capture FILE --json` |
-| Search | `bk --vault {{vault_arg}} search "Q" --consumer local --json` |
-| Answer from the vault | `bk --vault {{vault_arg}} ask "Q" --json` |
-| Check integrity | `bk --vault {{vault_arg}} lint --json` |
-| Heal state after manual moves/deletes | `bk --vault {{vault_arg}} reconcile --json` |
-| Drop one source record | `bk --vault {{vault_arg}} forget ITEM --json` |
-| Vault health | `bk --vault {{vault_arg}} status --json` |
+| Add evidence | `bk --vault {{vault}} capture FILE --json` |
+| Search | `bk --vault {{vault}} search "Q" --consumer local --json` |
+| Answer from the vault | `bk --vault {{vault}} ask "Q" --json` |
+| Check integrity | `bk --vault {{vault}} lint --json` |
+| Heal state after manual moves/deletes | `bk --vault {{vault}} reconcile --json` |
+| Drop one source record | `bk --vault {{vault}} forget ITEM --json` |
+| Vault health | `bk --vault {{vault}} status --json` |
 
 `forget` needs `--force` when the raw file is still on disk. It drops one
 source from this vault's own registry — not `bk vaults forget`, which
@@ -110,14 +110,14 @@ A question about this repository's own code — not the vault's evidence — is
 
 | Goal | Command |
 | --- | --- |
-| Extract or refresh the graph | `bk --vault {{vault_arg}} code build [PATH …] --json` |
-| Is it still accurate? | `bk --vault {{vault_arg}} code status --json` |
-| What breaks if this changes | `bk --vault {{vault_arg}} code affected SYMBOL --json` |
-| Shortest chain between two symbols | `bk --vault {{vault_arg}} code path FROM TO --json` |
-| Most connected symbols | `bk --vault {{vault_arg}} code hubs --json` |
-| Structural clusters | `bk --vault {{vault_arg}} code communities --json` |
-| Import cycles among files | `bk --vault {{vault_arg}} code cycles --json` |
-| What changed structurally | `bk --vault {{vault_arg}} code diff --json` |
+| Extract or refresh the graph | `bk --vault {{vault}} code build [PATH …] --json` |
+| Is it still accurate? | `bk --vault {{vault}} code status --json` |
+| What breaks if this changes | `bk --vault {{vault}} code affected SYMBOL --json` |
+| Shortest chain between two symbols | `bk --vault {{vault}} code path FROM TO --json` |
+| Most connected symbols | `bk --vault {{vault}} code hubs --json` |
+| Structural clusters | `bk --vault {{vault}} code communities --json` |
+| Import cycles among files | `bk --vault {{vault}} code cycles --json` |
+| What changed structurally | `bk --vault {{vault}} code diff --json` |
 
 Given `PATH`s, `build` merges that subset into the stored graph instead of
 replacing it. `build`, `communities`, `cycles` and `diff` need the `code`

@@ -1446,6 +1446,7 @@ def _finish_init(
         # Names only. This dict is printed, and `bk init --json` output ends up
         # in issue reports.
         "credentials": stored,
+        "warnings": onboarding.small_ingest_model_warnings(vault.config().to_dict()),
     }
     # Wiring the agent is deliberately the *last* step: it writes outside
     # the vault, into the operator's project, and doing it before the vault
@@ -1464,7 +1465,59 @@ def _finish_init(
             root=_project_root_for(vault),
             skip_code_build=skip_code_build,
         )
+    result["next"] = _init_next_steps(vault, agent_wired=outcome.wire_agent)
     return vault, service, result
+
+
+def _init_next_steps(vault: FileVault, *, agent_wired: bool) -> list[dict[str, str]]:
+    """The commands `bk init` ends on, written to work from where it leaves you.
+
+    They were printed bare, and bare is right only when discovery from the
+    current directory lands on this vault -- `bk init ./my-vault` leaves you one
+    level above it, where all three failed with "No brainskit vault found". So
+    `--vault` is added exactly when discovery would miss, and `--root` whenever
+    the vault is nested in a project, because `hooks install` otherwise defaults
+    to the vault and installs where no agent will load it.
+    """
+
+    cwd = Path.cwd().resolve()
+    flag = _vault_flag(vault.root)
+    steps = []
+    if not agent_wired:
+        project = _project_root_for(vault)
+        root = f" --root {_shell_path(Path(project), cwd)}" if project else ""
+        steps.append(
+            {
+                "command": f"bk hooks install --agent claude{root}{flag}",
+                "purpose": "wire up your agent",
+            }
+        )
+    for command, purpose in _INIT_NEXT_STEPS:
+        steps.append({"command": command + flag, "purpose": purpose})
+    return steps
+
+
+def _vault_flag(root: Path) -> str:
+    """` --vault <path>` when discovery from here would miss `root`, else ``."""
+
+    cwd = Path.cwd().resolve()
+    try:
+        if FileVault.discover(cwd).root.resolve() == root.resolve():
+            return ""
+    except BrainskitError:
+        pass
+    return f" --vault {_shell_path(root, cwd)}"
+
+
+def _shell_path(path: Path, cwd: Path) -> str:
+    """`path` as the shortest argument that names it from `cwd`, shell-quoted."""
+
+    resolved = path.resolve()
+    try:
+        shown = str(resolved.relative_to(cwd)) or "."
+    except ValueError:
+        shown = str(resolved)
+    return shlex.quote(shown)
 
 
 def _store_credentials(secrets: Mapping[str, str]) -> list[str]:
@@ -1593,7 +1646,16 @@ def _dispatch(args: argparse.Namespace) -> Any:
         _service_for_web(args) if args.command == "web" else create_service(args.vault)
     )
     if args.command == "capture":
-        return service.capture(args.source, text=args.text, title=args.title)
+        captured = service.capture(args.source, text=args.text, title=args.title)
+        source = captured.get("source") or {}
+        if str(source.get("status", "")) == "pending":
+            # The same trap as `bk init`'s Next block: a capture run with
+            # `--vault` suggested a bare `bk file` that fails from here.
+            captured["next"] = (
+                f"bk file {str(source.get('content_hash', ''))[:16]} --to <branch>"
+                f"{_vault_flag(service.vault.root)}"
+            )
+        return captured
     if args.command == "status":
         return service.status()
     if args.command == "doctor":
@@ -2619,7 +2681,7 @@ def _enforcement_rows(layers: Sequence[dict[str, Any]]) -> list[list[str]]:
             )
         elif layer["active"] and layer.get("outdated"):
             # Still runs, so not a cross; out of date, so not a tick either.
-            rows.append([name, console.style(f"! {detail}", console.WARN)])
+            rows.append([name, console.warn_line(detail)])
         else:
             rows.append([name, console.status_line(bool(layer["active"]), detail)])
     return rows
@@ -2785,7 +2847,9 @@ def _render_lint(value: dict[str, Any]) -> str:
         )
         if part
     )
-    header = console.status_line(value["ok"], summary)
+    header = (
+        console.status_line(False, summary) if errors else console.warn_line(summary)
+    )
     rows = [
         [
             console.style(
@@ -2873,8 +2937,8 @@ def _render_capture(value: dict[str, Any]) -> str:
         f"  hash  {content_hash}",
         f"  path  {source.get('path', '?')}",
     ]
-    if str(source.get("status", "")) == "pending":
-        lines.append(f"  next  bk file {content_hash[:16]} --to <branch>")
+    if value.get("next"):
+        lines.append(f"  next  {value['next']}")
     return "\n".join(lines)
 
 
@@ -2912,22 +2976,140 @@ def _render_init(value: dict[str, Any]) -> str:
         console.status_line(True, f"vault initialized at {value['vault']}"),
         console.kv_panel(rows),
         "",
-        console.style("Next", console.BOLD, console.ACCENT),
     ]
+    warnings = [str(w.get("message", "")) for w in value.get("warnings") or []]
+    if warnings:
+        parts += [console.warn_line(message) for message in warnings] + [""]
+    parts.append(console.style("Next", console.BOLD, console.ACCENT))
     # Onboarding used to end without ever naming `bk hooks install`, so the one
     # step that turns a vault into something an agent can use was left for the
-    # operator to discover in the README. It leads the list when it is still
-    # pending, and is dropped only once it has actually run.
-    steps = list(_INIT_NEXT_STEPS)
-    if not hooks:
-        steps.insert(0, ("bk hooks install --agent claude", "wire up your agent"))
-    width = max(len(command) for command, _ in steps)
+    # operator to discover in the README. `_init_next_steps` leads with it while
+    # it is still pending and drops it only once it has actually run.
+    steps = [(str(s["command"]), str(s["purpose"])) for s in value.get("next") or []]
+    width = max((len(command) for command, _ in steps), default=0)
     for command, description in steps:
         parts.append(
             f"  {console.ARROW} {command:<{width}}  "
             f"{console.style(description, console.MUTED)}"
         )
     return "\n".join(parts)
+
+
+#: How each file state `hooks install` reports is drawn: a write is news, an
+#: unchanged file is not, and a skipped layer is the one row worth a second look.
+_INSTALL_STATE_COLORS = {
+    "created": console.OK,
+    "updated": console.OK,
+    "appended": console.OK,
+    "migrated": console.OK,
+    "current": console.MUTED,
+    "skipped": console.WARN,
+}
+
+
+def _render_hooks(value: dict[str, Any]) -> str:
+    """`bk hooks install`, drawn like `bk status` instead of dumped as JSON.
+
+    It is one of the two commands the README gives a section of its own, and a
+    person reading its output got the raw result dict. The banners on stderr
+    still carry each gap's reason, consequence and fix, so this is the record of
+    what landed: a headline, one row per file, and the enforcement table
+    `bk status` draws.
+    """
+
+    agent = str(value.get("agent", "?"))
+    workspace = Path(str(value.get("workspace", "")))
+    layers = [
+        {
+            **layer,
+            "detail": layer.get("mechanism", "")
+            if layer.get("active")
+            else layer.get("reason") or layer.get("mechanism", ""),
+        }
+        for layer in (value.get("enforcement") or {}).get("layers") or []
+    ]
+    off = [
+        str(layer["layer"])
+        for layer in layers
+        if not layer.get("active") and not layer.get("advisory")
+    ]
+    headline = f"{agent} installed into {workspace}"
+    if value.get("workspace_advisory"):
+        header = console.warn_line(
+            f"{headline} {console.DASH} an agent opened there loads none of it"
+        )
+    elif off:
+        header = console.warn_line(
+            f"{headline} {console.DASH} enforcement off: {', '.join(off)}"
+        )
+    else:
+        header = console.status_line(True, headline)
+    parts = [
+        header,
+        "",
+        console.kv_panel(
+            [
+                ("adapter", str(value.get("adapter", "-"))),
+                ("code graph", _bootstrap_note(value.get("code_graph") or {})),
+            ]
+        ),
+    ]
+    files = _installed_files(value, workspace)
+    if files:
+        parts += ["", console.rule("files"), console.table(["path", "state"], files)]
+    if layers:
+        parts += [
+            "",
+            console.rule("enforcement"),
+            console.table(["layer", "status"], _enforcement_rows(layers)),
+        ]
+    return "\n".join(parts)
+
+
+def _installed_files(value: dict[str, Any], workspace: Path) -> list[list[str]]:
+    entries: list[tuple[str, dict[str, Any]]] = [
+        (key, value[key])
+        for key in (INSTRUCTIONS, "skill", "pre_commit")
+        if isinstance(value.get(key), dict)
+    ]
+    hook = value.get("claude_hook")
+    if isinstance(hook, dict):
+        entries += [
+            (name, item)
+            for name, item in (hook.get("scripts") or {}).items()
+            if isinstance(item, dict)
+        ]
+        if isinstance(hook.get("settings"), dict):
+            entries.append(("settings", hook["settings"]))
+    rows = []
+    for label, item in entries:
+        path = item.get("path")
+        shown = _under(Path(str(path)), workspace) if path else label.replace("_", "-")
+        state = str(item.get("state", "?"))
+        color = _INSTALL_STATE_COLORS.get(state)
+        rows.append([shown, console.style(state, color) if color else state])
+    return rows
+
+
+def _under(path: Path, base: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
+def _bootstrap_note(code_graph: dict[str, Any]) -> str:
+    state = str(code_graph.get("state", "-"))
+    if state == "built":
+        return console.style(
+            f"built {console.DASH} {code_graph.get('nodes', 0)} nodes, "
+            f"{code_graph.get('edges', 0)} edges",
+            console.OK,
+        )
+    reason = code_graph.get("reason")
+    return console.style(
+        f"{state} {console.DASH} {reason}" if reason else state, console.WARN
+    )
 
 
 def _render_ask(value: dict[str, Any]) -> str:
@@ -3229,7 +3411,7 @@ def _render_doctor(value: dict[str, Any]) -> str:
         ]
     graph_note = code.get("graph_without_grammars")
     if graph_note:
-        parts += ["", console.style(f"  ! {graph_note.get('detail', '')}", console.WARN)]
+        parts += ["", "  " + console.warn_line(str(graph_note.get("detail", "")))]
     outdated = code.get("grammars_outdated") or []
     if outdated:
         # Present but out of range: the wheel imports, so nothing above flags
@@ -3332,19 +3514,51 @@ def _render_code_build(value: dict[str, Any]) -> str:
 def _render_code_status(value: dict[str, Any]) -> str:
     """The freshness verdict, plus a loud line when the graph is unreadable.
 
-    Every existing state keeps exactly the rendering it had -- `_render_auto`
-    is still what draws it -- because `fresh`, `stale` and `missing` were never
-    the problem. `malformed` is, and it is the one verdict a reader must not
-    have to notice inside a dump: the graph parses, its `generated_at` looks
-    recent, and nothing about the block says the artefact answers nothing.
+    This used to be `_render_auto` for every state but `malformed`, on the
+    theory that the others "were never the problem". They were: a `fresh` or
+    `stale` verdict carries two lists, which `_render_auto` answers with a raw
+    JSON dump -- so the common case printed a payload in human mode.
 
-    Same treatment `_render_code_build` gives a build that dropped a language,
-    and for the same reason: the panel above is not wrong, it is beside the
-    point, and only an interruption says so.
+    `malformed` still gets its interruption. It is the one verdict a reader must
+    not have to notice inside a panel: the graph parses, its `generated_at`
+    looks recent, and nothing about the block says the artefact answers nothing.
+    Same treatment `_render_code_build` gives a build that dropped a language.
     """
 
-    rendered = _render_auto(value)
-    if value.get("state") == "partial" and int(value.get("unexplained_files") or 0):
+    state = str(value.get("state", "?"))
+    rows = [
+        ("state", console.state_tag(state)),
+        ("generated_at", str(value.get("generated_at") or "-")),
+    ]
+    if "files" in value:
+        rows.append(("files", str(value["files"])))
+    grammars = value.get("missing_grammars") or []
+    if grammars:
+        rows.append(
+            (
+                "missing grammars",
+                f"{', '.join(str(g) for g in grammars)} "
+                f"({value.get('unreachable_files', 0)} file(s) unreachable)",
+            )
+        )
+    if value.get("reason"):
+        rows.append(("reason", str(value["reason"])))
+    if value.get("command"):
+        rows.append(("next", str(value["command"])))
+    parts = [_code_status_headline(value), "", console.kv_panel(rows)]
+    for key in ("changed", "removed"):
+        items = [str(item) for item in value.get(key) or []]
+        if not items:
+            continue
+        total = int(value.get(f"{key}_total") or len(items))
+        parts += ["", console.rule(f"{key} ({total})")]
+        parts += [f"{console.BULLET} {item}" for item in items]
+        if total > len(items):
+            parts.append(
+                console.style(f"  … and {total - len(items)} more", console.MUTED)
+            )
+    rendered = "\n".join(parts)
+    if state == "partial" and int(value.get("unexplained_files") or 0):
         # Persisted by the build, surfaced here: files that should have been
         # indexed and were not, for no stated reason. The verdict alone says
         # "incomplete"; this says how much and what to do.
@@ -3352,15 +3566,15 @@ def _render_code_status(value: dict[str, Any]) -> str:
             [
                 rendered,
                 "",
-                console.style(
-                    f"  {console.CROSS} {value['unexplained_files']} file(s) have "
+                "  "
+                + console.warn_line(
+                    f"{value['unexplained_files']} file(s) have "
                     "an installed grammar but contributed no nodes — rebuild "
-                    "with bk code build, and report it if it repeats.",
-                    console.WARN,
+                    "with bk code build, and report it if it repeats."
                 ),
             ]
         )
-    if value.get("state") != "malformed":
+    if state != "malformed":
         return rendered
     where = str(value.get("collection", "the graph"))
     index = value.get("index")
@@ -3389,8 +3603,27 @@ def _render_code_status(value: dict[str, Any]) -> str:
     )
 
 
+def _code_status_headline(value: dict[str, Any]) -> str:
+    state = str(value.get("state", "?"))
+    if state == "fresh":
+        return console.status_line(
+            True, f"code graph fresh {console.DASH} {value.get('files', 0)} file(s)"
+        )
+    if state == "missing":
+        return console.style("no code graph yet", console.MUTED)
+    if state == "malformed":
+        return console.status_line(False, "code graph malformed")
+    if state == "stale" and "changed_total" in value:
+        return console.warn_line(
+            f"code graph stale {console.DASH} {value['changed_total']} changed, "
+            f"{value.get('removed_total', 0)} removed"
+        )
+    return console.warn_line(f"code graph {state}")
+
+
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "init": _render_init,
+    "hooks": _render_hooks,
     "capture": _render_capture,
     "status": _render_status,
     "doctor": _render_doctor,

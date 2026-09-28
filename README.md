@@ -95,7 +95,8 @@ following in March.
 ## It runs on your laptop and asks for nothing
 
 No account system. No credentials. No network for any of the mechanical work.
-One dependency in the core.
+One declared dependency in the core, `jsonschema[format]`, which resolves to
+about 17 packages in all — every one pure Python except `rpds-py`.
 
 Anthropic, OpenAI, OpenRouter and Ollama are interchangeable drivers behind one
 job contract — and evidence you marked `local-only` goes to Ollama or it goes
@@ -112,8 +113,8 @@ uv tool install brainskit     # or: pipx install brainskit
 bk --help
 ```
 
-Four extras are optional, because the core keeps a single dependency and none of
-these capabilities is one every vault wants:
+Four extras are optional, because the core keeps to that one declared dependency
+and none of these capabilities is one every vault wants:
 
 ```bash
 uv tool install 'brainskit[integrations]'  # Neo4j and PostgreSQL drivers
@@ -133,7 +134,7 @@ Install the working tree, a git ref, or a built wheel with the same command:
 
 ```bash
 uv tool install /path/to/brainskit
-uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.5.0'
+uv tool install 'brainskit @ git+https://github.com/huglabs/brainskit@v0.8.0'
 ```
 
 To pin `bk` to one project instead of the machine, declare it as a dependency

@@ -37,6 +37,7 @@ ERR = "\x1b[31m"
 
 CHECK = "✓"
 CROSS = "✗"
+BANG = "!"
 ARROW = "→"
 BULLET = "•"
 DASH = "—"
@@ -189,6 +190,7 @@ _STATE_COLORS = {
     "fresh": OK,
     "stale": WARN,
     "partial": WARN,
+    "unverified": WARN,
     "malformed": ERR,
     "missing": MUTED,
 }
@@ -204,6 +206,18 @@ def status_line(ok: bool, message: str, *, stream: IO[str] | None = None) -> str
     symbol = CHECK if ok else CROSS
     color = OK if ok else ERR
     return style(f"{symbol} {message}", color, stream=stream)
+
+
+def warn_line(message: str, *, stream: IO[str] | None = None) -> str:
+    """The third headline: nothing failed, and something still needs a look.
+
+    `status_line` has two answers, so a result that was only warnings had to
+    borrow one of them -- and `bk lint` borrowed the tick, printing a green
+    `✓ 1 warning(s)`. The glyph is not decoration: colour is stripped in a pipe,
+    a log and every test capture, and there `✓` alone reads as "all clear".
+    """
+
+    return style(f"{BANG} {message}", WARN, stream=stream)
 
 
 def banner(*, stream: IO[str] | None = None) -> str:

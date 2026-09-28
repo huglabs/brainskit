@@ -15,7 +15,7 @@ from __future__ import annotations
 try:
     from . import _harness
 except ImportError:
-    import _harness  # noqa: F401
+    import _harness
 
 import sys
 import unittest
@@ -56,7 +56,12 @@ class CaptureRendererTest(unittest.TestCase):
         self.assertIn(payload["source"]["content_hash"], cli._render_capture(payload))
 
     def test_it_names_the_next_command(self) -> None:
-        self.assertIn("bk file", self.rendered())
+        # Through the CLI: the command is built there, where the current
+        # directory is known, so it can carry `--vault` when discovery would miss.
+        run = _harness.run_cli(
+            ["capture", "--text", "Terceira nota.", "--title", "t", "--vault", str(self.vault.root)]
+        )
+        self.assertIn("bk file", run.stdout)
 
     def test_capture_is_registered_as_a_renderer(self) -> None:
         """Control: the renderer must be reachable, not merely defined."""

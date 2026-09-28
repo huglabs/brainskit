@@ -76,8 +76,8 @@ Five states, and only three of them are about freshness:
 | state | meaning | remedy |
 |---|---|---|
 | `fresh` | the recorded file digests all still match | — |
-| `stale` | a file the graph indexed changed or was removed | `bk code import <graph.json>` |
-| `missing` | there is no graph on disk, or what is there is not a JSON object | `bk code import <graph.json>` |
+| `stale` | a file the graph indexed changed or was removed | `bk code build` (or `bk code import` again, if an external extractor produced it) |
+| `missing` | there is no graph on disk, or what is there is not a JSON object | `bk code build` |
 | `partial` | fresh, but a grammar was absent so a whole language went unindexed | install the named grammar, then rebuild |
 | `malformed` | the graph parses but cannot be traversed | `bk code build` |
 

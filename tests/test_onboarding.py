@@ -188,6 +188,74 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual([m.name for m in probe.usable], ["only"])
 
 
+class ModelCountTest(unittest.TestCase):
+    """The header, the provider row and the picker count the same models.
+
+    The header said `4 models` above a picker of 3: the one model without tool
+    support was dropped from the list without a word, and it was the largest.
+    """
+
+    PROBE = OllamaProbe(
+        base_url="http://127.0.0.1:11434",
+        reachable=True,
+        models=(
+            OllamaModel("qwen2.5:3b", "3.1B", 32768, True),
+            OllamaModel("qwen2.5:1.5b", "1.5B", 32768, True),
+            OllamaModel("llama3.2:1b", "1.2B", 131072, True),
+            OllamaModel("big-no-tools", "13.8B", 262144, False),
+        ),
+    )
+
+    def picker_rows(self, probe: OllamaProbe) -> list[Choice[str]]:
+        offered: list[list[Choice[str]]] = []
+
+        def select(_title: str, choices: list[Choice[str]], **_: object) -> str:
+            offered.append(list(choices))
+            return next(c.value for c in choices if c.enabled)
+
+        with patch.object(prompt, "select", select), patch("sys.stdout", StringIO()):
+            onboarding._ask_ollama_model(probe)
+        return offered[0]
+
+    def test_every_count_on_screen_is_the_number_of_picker_rows(self) -> None:
+        rows = self.picker_rows(self.PROBE)
+        self.assertEqual(len(rows), 4)
+        with patch("sys.stdout", StringIO()):
+            header = console_text(onboarding._context_panel(_environment(), self.PROBE))
+        self.assertIn("4 models", header)
+
+    def test_the_model_without_tools_is_dimmed_with_its_reason_not_dropped(self) -> None:
+        rows = self.picker_rows(self.PROBE)
+        dimmed = [row for row in rows if not row.enabled]
+        self.assertEqual([row.value for row in dimmed], ["big-no-tools"])
+        self.assertIn("no tool support", dimmed[0].note)
+        self.assertEqual(rows[0].value, "qwen2.5:3b")
+        self.assertEqual(onboarding._model_count(self.PROBE), "4 models (1 without tool support)")
+
+    def test_when_nothing_has_tools_nothing_is_dimmed(self) -> None:
+        probe = OllamaProbe(
+            base_url="x",
+            reachable=True,
+            models=(OllamaModel("a", "3B", 8192, False), OllamaModel("b", "1B", 8192, False)),
+        )
+        self.assertTrue(all(row.enabled for row in self.picker_rows(probe)))
+        self.assertEqual(onboarding._model_count(probe), "2 models")
+
+
+def _environment() -> onboarding.Environment:
+    return onboarding.Environment(
+        vault=Path("/v"),
+        workspace=Path("/v"),
+        is_git_repo=False,
+        has_agent_dir=False,
+        language="English",
+    )
+
+
+def console_text(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
 class DetectionTest(unittest.TestCase):
     def test_the_language_comes_from_the_environment_not_a_hardcoded_default(
         self,

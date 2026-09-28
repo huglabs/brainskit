@@ -92,8 +92,90 @@ class OllamaModel:
 
     @property
     def billions(self) -> float:
-        match = re.match(r"([\d.]+)\s*B", self.parameter_size or "", re.IGNORECASE)
-        return float(match.group(1)) if match else 0.0
+        return _parameter_billions(self.parameter_size) or 0.0
+
+
+#: Below this, a model routinely loses ingest's citation contract on a longer
+#: source and the repair loop exhausts its attempts on `citation_mismatch`. The
+#: one owner of that line: `bk init` warns from it, and nothing else reads it.
+SMALL_INGEST_MODEL_BILLIONS = 7.0
+
+#: ollama reports `3.2B` or `135M`; anything else is not a size.
+_PARAMETER_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([BM])\b", re.IGNORECASE)
+#: A size in the tag, as ollama names them: `3b`, `1.5b`, `7b-instruct-q4_K_M`.
+#: `8x7b` deliberately does not match -- a mixture's size is not its expert's.
+_SIZE_TAG_RE = re.compile(r"(?:^|[-_])(\d+(?:\.\d+)?)b(?=$|[-_])", re.IGNORECASE)
+
+
+def _parameter_billions(text: str) -> float | None:
+    match = _PARAMETER_SIZE_RE.match((text or "").strip())
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value / 1000 if match.group(2).upper() == "M" else value
+
+
+def ollama_model_billions(name: str, probe: OllamaProbe | None = None) -> float | None:
+    """A model's size in billions of parameters, or None when nothing says.
+
+    What ollama reports wins; the tag in the name is the fallback. None is not
+    small: `qwen3:latest` from a config file with ollama down has no knowable
+    size, and warning about it would be a guess.
+    """
+
+    if probe is not None:
+        for model in probe.models:
+            if model.name in (name, f"{name}:latest"):
+                reported = _parameter_billions(model.parameter_size)
+                if reported is not None:
+                    return reported
+    _, _, tag = name.partition(":")
+    match = _SIZE_TAG_RE.search(tag)
+    return float(match.group(1)) if match else None
+
+
+def small_ingest_model_warnings(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """One warning per ollama model `ingest` routes to that is known to be small.
+
+    ollama is asked only when a name's tag does not already give the size, so
+    `qwen2.5:3b` costs no request and `qwen3:latest` costs one short probe.
+    """
+
+    mapping = (config.get("job_models") or {}).get("ingest")
+    routes: list[dict[str, Any]] = []
+    if isinstance(mapping, dict):
+        routes = [mapping, *(value for value in mapping.values() if isinstance(value, dict))]
+    models = sorted(
+        {
+            str(route["model"])
+            for route in routes
+            if route.get("provider") == "ollama" and route.get("model")
+        }
+    )
+    probe: OllamaProbe | None = None
+    if any(ollama_model_billions(model) is None for model in models):
+        provider = (config.get("providers") or {}).get("ollama") or {}
+        probe = probe_ollama(str(provider.get("base_url") or DEFAULT_OLLAMA_URL))
+    warnings: list[dict[str, Any]] = []
+    for model in models:
+        size = ollama_model_billions(model, probe)
+        if size is None or size >= SMALL_INGEST_MODEL_BILLIONS:
+            continue
+        warnings.append(
+            {
+                "code": "ingest_model_small",
+                "job": "ingest",
+                "provider": "ollama",
+                "model": model,
+                "parameters_billions": size,
+                "message": (
+                    f"{model} is a {size:g}B model: ingest may fail on longer "
+                    "sources; route job_models.ingest to a larger model "
+                    "in .brain/config.json"
+                ),
+            }
+        )
+    return warnings
 
 
 @dataclass(frozen=True)
@@ -748,8 +830,7 @@ def _ask_provider(probe: OllamaProbe) -> str:
     elif not probe.models:
         local = "running, but no models pulled yet"
     else:
-        count = len(probe.models)
-        local = f"{count} model{'s' if count != 1 else ''} on this machine"
+        local = f"{_model_count(probe)} on this machine"
 
     choices = [
         Choice("ollama", "On this machine — ollama", local),
@@ -860,11 +941,10 @@ def _ask_ollama_model(probe: OllamaProbe) -> ModelChoice:
         )
         model = prompt.text("Model to configure anyway", "qwen2.5:3b")
     else:
-        usable = sorted(probe.usable, key=lambda m: -m.billions)
         model = str(
             prompt.select(
                 "Model for the 6 local jobs",
-                [Choice(m.name, m.name, m.note) for m in usable],
+                _ollama_choices(probe),
                 hint="↑↓ · Enter · only models found on this machine",
             )
         )
@@ -873,6 +953,29 @@ def _ask_ollama_model(probe: OllamaProbe) -> ModelChoice:
         model=model or "qwen2.5:3b",
         base_url=probe.base_url,
     )
+
+
+def _ollama_choices(probe: OllamaProbe) -> list[Choice[str]]:
+    """One row per model ollama reports, the unusable ones dimmed, not dropped.
+
+    The picker used to list only `probe.usable` while the header counted
+    `probe.models`, so a machine with a model lacking tool support read
+    "4 models" above a list of 3 -- and the one missing was the largest. Every
+    count on screen is `len(probe.models)` and this is that many rows.
+    """
+
+    usable = {m.name for m in probe.usable}
+    ordered = sorted(probe.models, key=lambda m: (m.name not in usable, -m.billions))
+    return [Choice(m.name, m.name, m.note, enabled=m.name in usable) for m in ordered]
+
+
+def _model_count(probe: OllamaProbe) -> str:
+    """`N models`, and how many of them the picker will show dimmed."""
+
+    count = len(probe.models)
+    text = f"{count} model{'s' if count != 1 else ''}"
+    dimmed = count - len(probe.usable)
+    return f"{text} ({dimmed} without tool support)" if dimmed else text
 
 
 def _ask_openrouter(
@@ -1221,10 +1324,8 @@ def _context_panel(environment: Environment, probe: OllamaProbe) -> str:
     elif not probe.models:
         ollama = console.style("running · no models pulled", console.WARN)
     else:
-        count = len(probe.models)
         ollama = console.style(
-            f"{console.CHECK} running · {count} model{'s' if count != 1 else ''}",
-            console.OK,
+            f"{console.CHECK} running · {_model_count(probe)}", console.OK
         )
     where = _short(environment.vault)
     if environment.is_git_repo:

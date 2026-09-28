@@ -26,12 +26,14 @@ try:
 except ImportError:
     import _harness  # noqa: F401
 
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -44,7 +46,8 @@ from brainskit.infrastructure.extractor import GraphifyExtractor
 from brainskit.infrastructure.graph import MarkdownGraph
 from brainskit.infrastructure.index import SqliteFtsIndex
 from brainskit.infrastructure.vault import FileVault
-from brainskit.interfaces.cli import _render, _render_auto
+from brainskit.interfaces import console
+from brainskit.interfaces.cli import _emit, _render
 
 
 def _code_extra_installed() -> bool:
@@ -222,6 +225,7 @@ class FreshnessTest(CodeGraphFixture):
         report = self.service.code_status()
         self.assertEqual(report["state"], "missing")
         self.assertFalse(report["stale"])
+        self.assertEqual(report["command"], "bk code build")
 
     def test_a_freshly_imported_graph_is_fresh(self) -> None:
         self.service.code_import(self.payload())
@@ -237,7 +241,7 @@ class FreshnessTest(CodeGraphFixture):
         self.assertEqual(report["state"], "stale")
         self.assertTrue(report["stale"])
         self.assertEqual(report["changed"], ["src/db.ts"])
-        self.assertIn("bk code import", report["command"])
+        self.assertEqual(report["command"], "bk code build")
 
     def test_deleting_an_indexed_file_is_reported_separately(self) -> None:
         self.service.code_import(self.payload())
@@ -379,7 +383,8 @@ class BoundaryTest(CodeGraphFixture):
     def test_querying_without_a_graph_says_how_to_build_one(self) -> None:
         with self.assertRaises(NotFoundError) as caught:
             self.service.code_hubs()
-        self.assertIn("bk code import", caught.exception.details["hint"])
+        # A fresh vault has no graph.json to import; extracting one is the route.
+        self.assertEqual(caught.exception.details["hint"], "Build one with bk code build")
 
 
 class MalformedFixture(CodeGraphFixture):
@@ -644,16 +649,55 @@ class MalformedStatusTest(MalformedFixture):
                 self.assertIn("refuses this graph", rendered)
                 self.assertIn("bk code build", rendered)
 
-    def test_the_other_states_render_exactly_as_they_did(self) -> None:
-        # The control that keeps this change additive: `fresh`, `stale` and
-        # `missing` are drawn by `_render_auto`, untouched, byte for byte.
+    def test_the_other_states_render_exactly_as_pinned(self) -> None:
+        # These used to be pinned to `_render_auto` byte for byte, which was the
+        # defect: `fresh` and `stale` carry two lists, and `_render_auto` answers
+        # that shape with a raw JSON dump. Pinned to exact text now, so the
+        # renderer still cannot drift -- and never interrupts outside `malformed`.
         (self.vault.root / CODE_PROJECTION).unlink(missing_ok=True)
         for expected in ("missing", "fresh", "stale"):
             with self.subTest(state=expected):
                 verdict = self.service.code_status()
                 self.assertEqual(verdict["state"], expected)
-                self.assertEqual(self.render(), _render_auto(verdict))
+                built = verdict["generated_at"]
+                pinned = {
+                    "missing": [
+                        "no code graph yet",
+                        "",
+                        "state         missing",
+                        "generated_at  -",
+                        "next          bk code build",
+                    ],
+                    "fresh": [
+                        "✓ code graph fresh — 2 file(s)",
+                        "",
+                        "state         fresh",
+                        f"generated_at  {built}",
+                        "files         2",
+                    ],
+                    "stale": [
+                        "! code graph stale — 1 changed, 0 removed",
+                        "",
+                        "state         stale",
+                        f"generated_at  {built}",
+                        "files         2",
+                        "next          bk code build",
+                        "",
+                        console.rule("changed (1)"),
+                        "• src/db.ts",
+                    ],
+                }[expected]
+                self.assertEqual(self.render(), "\n".join(pinned))
                 self.assertNotIn("refuses this graph", self.render())
+                self.assertNotIn("{", self.render())
+                # `--json` is untouched by any of this: the verdict, verbatim.
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    _emit(verdict, "code", code_command="status", ok=True, json_mode=True)
+                self.assertEqual(
+                    out.getvalue(),
+                    json.dumps({"ok": True, "result": verdict}, ensure_ascii=False) + "\n",
+                )
                 if expected == "missing":
                     self.service.code_import(self.payload())
                 elif expected == "fresh":

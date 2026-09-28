@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 from brainskit.application.ports import ApplyPlan, SearchIndexPort
 from brainskit.domain.model import (
     LEGACY_WIKI_DIRECTORIES,
+    SEED_PAGES,
     WIKI_DIRECTORIES,
     ConflictError,
     ForgottenSourceError,
@@ -27,6 +28,7 @@ from brainskit.domain.model import (
     ValidationError,
     VaultConfig,
     normalize_branch,
+    render_seed_page,
     utc_now,
 )
 from brainskit.infrastructure.apply_transaction import ApplyTransaction
@@ -160,7 +162,7 @@ class FileVault:
             "views/domains",
             "graph",
             "output/digests",
-            "output/reports",
+            "output/resurface",
             "output/answers",
             ".brain",
         ]
@@ -189,10 +191,8 @@ class FileVault:
         except OSError:
             existing = ""
         _atomic_text(gitignore_path, merge_gitignore(existing, gitignore_block()))
-        index_page = _system_page("index", "Brainskit index")
-        log_page = _system_page("log", "Brainskit log")
-        _atomic_text(root / "wiki" / "index.md", index_page)
-        _atomic_text(root / "wiki" / "log.md", log_page)
+        for path, (slug, title) in SEED_PAGES.items():
+            _atomic_text(root / path, render_seed_page(slug, title, utc_now()))
         return cls(root)
 
     @staticmethod
@@ -1202,18 +1202,3 @@ def _atomic_text(path: Path, content: str) -> None:
 
 def _atomic_json(path: Path, content: dict[str, Any]) -> None:
     _atomic_text(path, json.dumps(content, indent=2, ensure_ascii=False) + "\n")
-
-
-def _system_page(slug: str, title: str) -> str:
-    now = utc_now()
-    return (
-        "---\n"
-        f'id: "system:{slug}"\n'
-        'type: "system"\n'
-        f"title: {json.dumps(title)}\n"
-        "aliases:\n"
-        "sources:\n"
-        f'updated_at: "{now}"\n'
-        "---\n\n"
-        f"# {title}\n"
-    )

@@ -59,9 +59,10 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
 - **FreshnessLedger** — the one owner of `.brain/freshness.json`. Every read and
   write goes through it; no other module names the state file. Transitions are
   named after intent (`mark_applied`, `mark_reviewed`, `record_resurfaced`,
-  `refresh_staleness`, `record_projection`, `drop`), so the rules that hold
-  across the file are stated once instead of in each writer. Built at the
-  composition root and handed to its collaborators, never constructed by them.
+  `refresh_staleness`, `record_projection`, `record_seeded`, `drop`), so the
+  rules that hold across the file are stated once instead of in each writer.
+  Built at the composition root and handed to its collaborators, never
+  constructed by them.
 - **FreshnessSnapshot** — one read of the ledger, and every question asked of
   that read. Request-scoped by the same convention as `PrivacyBoundary`: taken,
   questioned, dropped — never held across a write.
@@ -72,6 +73,23 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   nothing. `applied_hash` answers `None` for it, exactly as for no entry at all,
   so `wiki.outside_apply` still reports the page. Populating the field outside
   apply would bless a hand edit rather than report it.
+- **seed record** — a record that brainskit, not the apply gate, wrote a seed
+  page (`wiki/index.md`, `wiki/log.md`), kept in its own `seeded` table rather
+  than as a page entry. It vouches only that the page is still byte-identical to
+  the template `bk init` wrote; `record_seeded` writes it, from lint and only
+  for a page equal to that template, and `seeded_hash` is compared exactly as
+  `applied_hash` is, after it. It does not age, and it counts neither in the
+  freshness summary nor in the projection fingerprint — none of which is true
+  of a page compiled from no sources.
+- **artefact hash** — `artefact_hash`, the SHA-256 of a projection's anchor
+  (`views/home.md`, `graph/graph.json`) stamped by `record_projection` from the
+  text just written. It answers "is this the file brainskit wrote" by identity
+  rather than by shape: an anchor whose bytes differ is `malformed`. A
+  projection recorded before the stamp existed is **`unverified`** — built from
+  the current inputs, but nothing can say the file is still the one written —
+  which is regenerate-class (`stale: true`) and cleared by one run of its
+  command. Not `malformed`, because a view an older release generated is a
+  legitimate artefact.
 - **never-downgrade** — `review` is a weaker claim on attention than `stale`,
   and the ageing pass skips `review`, so writing it over `stale` removes the
   page from the loop rather than lowering a badge. `mark_reviewed` refuses,
@@ -110,6 +128,10 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   and the gate's deny rules, so `installed_agents` reading the directory is the
   whole answer to "who is this vault installed for". Its path is `adapter_path`,
   spelled once, because the gate, the installer and the reader all open it.
+  `rendered` is the SHA-256 of each file the installer rendered for the operator
+  to keep, by workspace-relative path (today, the skill), so an unedited copy is
+  replaced without `--force` when the template changes; any edit makes the file
+  the operator's.
 - **workspace vs vault** — `.claude/`, the instruction file and the git
   pre-commit hook belong to the project an agent is opened on; `.brain/` and the
   graph belong to the vault. A reader that assumes they are the same directory

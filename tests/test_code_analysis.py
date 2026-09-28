@@ -200,7 +200,7 @@ class CommunitiesTest(AnalysisFixture):
 
         with self.assertRaises(NotFoundError) as caught:
             self.service.code_communities()
-        self.assertIn("bk code import", caught.exception.details["hint"])
+        self.assertIn("bk code build", caught.exception.details["hint"])
 
 
 @unittest.skipUnless(_HAS_NETWORKX, "requires the `code` extra (networkx)")

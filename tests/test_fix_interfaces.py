@@ -2205,12 +2205,151 @@ class RendererUnitTests(unittest.TestCase):
                 "config": {"wiki_language": "English", "branches": {"10-work": {}}},
                 "indexed_documents": 2,
                 "views": ["views/home.md"],
+                "next": [
+                    {"command": "bk status --vault v", "purpose": "see vault health"},
+                    {"command": "bk capture <file> --vault v", "purpose": "add"},
+                ],
             },
         )
         self.assertIn("/tmp/vault", text)
         self.assertIn("10-work", text)
-        self.assertIn("bk status", text)
-        self.assertIn("bk capture", text)
+        self.assertIn("bk status --vault v", text)
+        self.assertIn("bk capture <file> --vault v", text)
+
+    def test_a_warnings_only_lint_is_not_a_green_tick(self) -> None:
+        """`✓ 1 warning(s)` -- a success mark above the text of a warning."""
+
+        warning = {"code": "views.stale", "severity": "warning", "message": "m", "path": None}
+        error = {"code": "raw.content_modified", "severity": "error", "message": "m", "path": "x"}
+        cases = [
+            ([], f"{console.CHECK} no lint findings"),
+            ([warning], f"{console.BANG} 1 warning(s)"),
+            ([error, warning], f"{console.CROSS} 1 error(s), 1 warning(s)"),
+        ]
+        for findings, headline in cases:
+            with self.subTest(headline=headline):
+                ok = not any(f["severity"] == "error" for f in findings)
+                text = self.render(
+                    cli._render_lint,
+                    {"ok": ok, "findings": findings, "semantic_report": None},
+                )
+                self.assertEqual(text.splitlines()[0], headline)
+
+    def hooks_result(self, **overrides: Any) -> dict[str, Any]:
+        workspace = "/w"
+        result: dict[str, Any] = {
+            "agent": "claude",
+            "adapter": ".brain/agent-claude.json",
+            "workspace": workspace,
+            "instructions": {"path": f"{workspace}/CLAUDE.md", "state": "created"},
+            "pre_commit": {
+                "state": "skipped",
+                "reason": "/w is not a git repository",
+                "hint": "Run git init there",
+                "enforcement": "off",
+                "consequence": "Commit-time linting is OFF",
+            },
+            "skill": {"path": f"{workspace}/.claude/skills/brainskit/SKILL.md", "state": "current"},
+            "claude_hook": {
+                "scripts": {
+                    "brainskit-gate": {"path": f"{workspace}/.claude/hooks/brainskit-gate.sh", "state": "created"},
+                },
+                "settings": {
+                    "path": f"{workspace}/.claude/settings.json",
+                    "state": "created",
+                    "registered": [{"event": "PreToolUse", "command": "x", "state": "appended"}],
+                },
+            },
+            "enforcement": {
+                "layers": [
+                    {"layer": "write_gate", "mechanism": "PreToolUse hook", "active": True},
+                    {
+                        "layer": "commit_lint",
+                        "mechanism": "pre-commit",
+                        "active": False,
+                        "reason": "/w is not a git repository",
+                    },
+                ],
+                "inactive": ["commit_lint"],
+            },
+            "code_graph": {"state": "skipped", "reason": "--skip-code-build was passed"},
+        }
+        result.update(overrides)
+        return result
+
+    def test_hooks_install_is_rendered_not_dumped(self) -> None:
+        text = self.render(lambda v: cli._render(v, "hooks"), self.hooks_result())
+        self.assertNotIn("{", text)
+        self.assertNotIn('"agent"', text)
+        first = text.splitlines()[0]
+        self.assertTrue(first.startswith(console.BANG), first)
+        self.assertIn("enforcement off: commit_lint", first)
+        for row in ("CLAUDE.md", ".claude/settings.json", "brainskit-gate.sh", "pre-commit"):
+            self.assertIn(row, text)
+        self.assertIn("--skip-code-build was passed", text)
+        self.assertIn(f"{console.CROSS} /w is not a git repository", text)
+
+    def test_a_complete_hooks_install_is_a_tick(self) -> None:
+        value = self.hooks_result()
+        value["enforcement"]["layers"] = value["enforcement"]["layers"][:1]
+        text = self.render(lambda v: cli._render(v, "hooks"), value)
+        self.assertTrue(text.startswith(f"{console.CHECK} claude installed into /w"), text)
+
+    def test_a_workspace_nothing_loads_is_not_a_tick(self) -> None:
+        value = self.hooks_result(workspace_advisory={"state": "advisory", "reason": "r", "hint": "h"})
+        value["enforcement"]["layers"] = value["enforcement"]["layers"][:1]
+        first = self.render(lambda v: cli._render(v, "hooks"), value).splitlines()[0]
+        self.assertTrue(first.startswith(console.BANG), first)
+
+    def code_status(self, value: dict[str, Any]) -> str:
+        return self.render(lambda v: cli._render(v, "code", code_command="status"), value)
+
+    def test_code_status_is_rendered_not_dumped_in_every_state(self) -> None:
+        stale = {
+            "state": "stale",
+            "stale": True,
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "files": 3,
+            "changed": ["src/a.py"],
+            "removed": ["src/b.py"],
+            "changed_total": 1,
+            "removed_total": 1,
+            "command": "bk code build",
+        }
+        fresh = {**stale, "state": "fresh", "stale": False, "changed": [], "removed": [],
+                 "changed_total": 0, "removed_total": 0}
+        del fresh["command"]
+        missing = {"state": "missing", "stale": False, "generated_at": None, "command": "bk code build"}
+        cases = {
+            "stale": (stale, f"{console.BANG} code graph stale"),
+            "fresh": (fresh, f"{console.CHECK} code graph fresh"),
+            "missing": (missing, "no code graph yet"),
+        }
+        for state, (value, headline) in cases.items():
+            with self.subTest(state=state):
+                text = self.code_status(value)
+                self.assertNotIn("{", text)
+                self.assertNotIn('"state"', text)
+                self.assertTrue(text.startswith(headline), text)
+        stale_text = self.code_status(stale)
+        self.assertIn(f"{console.BULLET} src/a.py", stale_text)
+        self.assertIn(f"{console.BULLET} src/b.py", stale_text)
+        self.assertIn("bk code build", stale_text)
+
+    def test_code_status_says_how_many_changed_files_it_left_out(self) -> None:
+        value = {
+            "state": "stale",
+            "stale": True,
+            "generated_at": None,
+            "files": 30,
+            "changed": [f"f{i}.py" for i in range(20)],
+            "removed": [],
+            "changed_total": 27,
+            "removed_total": 0,
+        }
+        text = self.code_status(value)
+        self.assertIn("changed (27)", text)
+        self.assertIn("… and 7 more", text)
 
     def test_auto_render_flat_dict_as_a_panel(self) -> None:
         text = self.render(cli._render_auto, {"indexed_documents": 5})

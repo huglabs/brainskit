@@ -66,7 +66,8 @@ leak or rotate. The workflow refuses to publish when the tag and
 anything.
 
 ```bash
-# 1. bump [project].version and add the CHANGELOG entry, then commit
+# 1. bump [project].version, the @v<version> git-install line in README.md and
+#    README.pt-BR.md, and add the CHANGELOG entry, then commit
 git commit -am 'Release 0.5.0'
 # 2. tag the exact commit the artifact will be built from
 git tag -a v0.5.0 -m 'brainskit 0.5.0'

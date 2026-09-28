@@ -701,5 +701,104 @@ class SemanticLintWithholdsNeverIngestEvidenceTest(unittest.TestCase):
         self.assertNotIn("withheld_sources", self.seed.lint())
 
 
+class SemanticLintReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
+    """`bk lint --semantic` on a cloud route withholds `local-only` pages.
+
+    The twin of the `ask`/`resurface`/`digest` fix: semantic lint read as
+    `local`, which keeps `local-only` pages, and handed their branch to the
+    router, so with `lint-semantic` mapped to a cloud provider one local-only
+    page in recall refused the whole lint. The real router runs, so a
+    local-only branch reaching the cloud prompt would be refused there.
+    """
+
+    LOCAL_ONLY_TEXT = "Contradictions unsupported claims about kappa-sigma pay bands."
+    LOCAL_ONLY_TITLE = "Pay bands"
+    CLOUD_TEXT = "Contradictions unsupported claims about the Friday release cadence."
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str, *, model: str, output_schema: Any = None) -> str:
+            self.prompts.append(prompt)
+            return json.dumps({"findings": []})
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        raw = policy()
+        raw["branches"]["30-public"] = {"privacy": "cloud", "filing": "approve-each"}
+        raw["providers"]["openai"] = {
+            "base_url": "https://api.openai.invalid/v1",
+            "api_key_env": "UNSET_TEST_KEY",
+        }
+        raw["job_models"]["lint-semantic"] = {"provider": "openai", "model": "m"}
+        self.vault = FileVault.initialize(Path(temporary.name), raw)
+        self.index = SqliteFtsIndex(self.vault.index_path)
+        self.seed = BrainskitService(self.vault, self.index, graph=MarkdownGraph())
+        private = self.seed.capture(
+            None, text=self.LOCAL_ONLY_TEXT, title=self.LOCAL_ONLY_TITLE
+        )
+        self.private_hash = private["source"]["content_hash"]
+        self.private_path = self.seed.file(self.private_hash, "20-research")[
+            "source"
+        ]["path"]
+
+    def lint(self) -> tuple[dict[str, Any], _Recorder, list[str]]:
+        driver = self._Recorder()
+        providers: list[str] = []
+
+        def create_driver(name: str, config: Any) -> SemanticLintReadsUnderTheRoutesBoundaryTest._Recorder:
+            providers.append(name)
+            return driver
+
+        service = BrainskitService(
+            self.vault,
+            self.index,
+            judgment=PolicyJudgmentRouter(self.vault.config(), JobSpecs()),
+            jobs=JobSpecs(),
+            graph=MarkdownGraph(),
+        )
+        with mock.patch("brainskit.infrastructure.llm._create_driver", create_driver):
+            return service.lint(semantic=True), driver, providers
+
+    def assert_no_local_only(self, text: str) -> None:
+        for disclosure in (
+            "kappa-sigma",
+            self.LOCAL_ONLY_TITLE,
+            self.private_hash,
+            Path(self.private_path).name,
+            "20-research",
+        ):
+            self.assertNotIn(disclosure, text)
+
+    def test_a_cloud_route_lints_the_cloud_pages_and_counts_the_rest(self) -> None:
+        public = self.seed.capture(None, text=self.CLOUD_TEXT, title="Cadence")
+        self.seed.file(public["source"]["content_hash"], "30-public")
+        result, driver, providers = self.lint()
+        self.assertEqual(providers, ["openai"])
+        self.assertEqual(result["semantic_report"], {"findings": []})
+        self.assertEqual(result["withheld_sources"], 1)
+        self.assertEqual(len(driver.prompts), 1)
+        self.assertIn("Friday release cadence", driver.prompts[0])
+        self.assert_no_local_only(driver.prompts[0])
+        self.assert_no_local_only(json.dumps(result, ensure_ascii=False))
+
+    def test_only_local_only_pages_names_the_mapping_that_would_read_them(
+        self,
+    ) -> None:
+        with self.assertRaises(PolicyError) as caught:
+            self.lint()
+        details = caught.exception.details
+        self.assertEqual(details["withheld_sources"], 1)
+        self.assertIn("job_models.lint-semantic.local-only", details["hint"])
+        self.assert_no_local_only(
+            json.dumps(
+                {"message": str(caught.exception), "details": details},
+                ensure_ascii=False,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
