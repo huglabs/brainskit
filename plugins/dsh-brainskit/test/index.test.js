@@ -168,6 +168,17 @@ test('guidance names the declared consumer and never steers a cloud model to loc
   }
 })
 
+test('guidance ties integration lifecycle to a local consumer, not the opt-in alone', () => {
+  const cloud = brainskitGuidance('cloud')
+  assert.match(cloud, /Integration configuration, startup, shutdown and sync require BRAINSKIT_CONSUMER=local and BRAINSKIT_ALLOW_MUTATIONS=1/)
+  assert.match(cloud, /bk integration <verb>/)
+  assert.doesNotMatch(cloud, /resurface and integration operations/)
+  const local = brainskitGuidance('local')
+  assert.match(local, /Integration configuration, startup, shutdown and sync are also denied by the DSH bridge unless the operator launched DSH with BRAINSKIT_ALLOW_MUTATIONS=1/)
+  assert.doesNotMatch(local, /BRAINSKIT_CONSUMER=local/)
+  assert.match(brainskitGuidance('human'), /require BRAINSKIT_CONSUMER=local/)
+})
+
 test('explicit opt-in permits every Brainskit operation', () => {
   const guard = createMutationGuard(true)
   assert.equal(guard(execution('mcp__brainskit__apply')), undefined)

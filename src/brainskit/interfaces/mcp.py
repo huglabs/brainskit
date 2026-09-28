@@ -81,6 +81,22 @@ def server_consumer(value: str | Consumer | None) -> Consumer:
         )
     return parsed
 
+#: Tools that operate this machine rather than read the vault, with the CLI
+#: verb that does the same. They start and stop containers, write exports to
+#: disk, and store the options a later sync serves under -- operator actions a
+#: consumer that is not on this machine has no business taking (ADR 0010).
+_LIFECYCLE_VERBS = {
+    "integration_configure": "configure",
+    "integration_up": "up",
+    "integration_down": "down",
+    "integration_sync": "sync",
+}
+
+
+def _offers(tool: str, ceiling: Consumer) -> bool:
+    return tool not in _LIFECYCLE_VERBS or ceiling.sees_installation()
+
+
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SUPPORTED_VERSIONS = {MCP_PROTOCOL_VERSION}
 MCP_MAX_REQUEST_BYTES = 1_048_576
@@ -570,6 +586,20 @@ def _call_tool(
     consumer: str | Consumer | None = None,
 ) -> dict[str, Any]:
     ceiling = server_consumer(consumer)
+    if not _offers(name, ceiling):
+        raise PolicyError(
+            "Integration lifecycle is an operator action, and this MCP "
+            "server's declared consumer is not on this machine",
+            details={
+                "tool": name,
+                "server_consumer": ceiling.value,
+                "run_instead": f"bk integration {_LIFECYCLE_VERBS[name]} <name>",
+                "hint": (
+                    "Run it from the CLI, or from a server started with "
+                    "--consumer local for an agent running on this machine"
+                ),
+            },
+        )
     scope = ceiling.value
     tools: dict[str, Callable[[], dict[str, Any]]] = {
         "capture": lambda: service.capture(
@@ -762,6 +792,14 @@ def _tool_definitions(
     consumer: str | Consumer | None = None,
 ) -> list[dict[str, Any]]:
     ceiling = server_consumer(consumer)
+    return [
+        tool
+        for tool in _all_tool_definitions(ceiling)
+        if _offers(tool["name"], ceiling)
+    ]
+
+
+def _all_tool_definitions(ceiling: Consumer) -> list[dict[str, Any]]:
     return [
         _tool(
             "capture",

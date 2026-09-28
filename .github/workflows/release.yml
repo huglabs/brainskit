@@ -32,10 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The job that builds what gets published never restores a shared cache:
+      # anything a cache could plant here would ship inside the artifacts.
       - uses: astral-sh/setup-uv@v10.0.1
         with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          enable-cache: false
 
       # A PEP 440 local version (`0.8.0+huglabs.1`) names a private build. PyPI
       # refuses it anyway, but only after the whole gate has run and the upload

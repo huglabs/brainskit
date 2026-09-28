@@ -8,7 +8,10 @@ process/container state.
 
 All capabilities are available through JSON CLI and the MCP tools
 `integration_configure`, `integration_status`, `integration_up`,
-`integration_down` and `integration_sync`.
+`integration_down` and `integration_sync`. Over MCP, all but
+`integration_status` need a server started with `--consumer local`: a `cloud`
+server refuses them with `policy_denied` and leaves them out of `tools/list`
+(see [Serving](./serving.md#an-mcp-server-declares-its-consumer)).
 
 ## Obsidian
 

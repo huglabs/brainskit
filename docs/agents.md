@@ -192,7 +192,9 @@ bk --vault ./my-vault serve --mcp --transport stdio --consumer local
 `human` is refused over MCP. A `search` or `context` call may ask for a
 narrower consumer than the server's, never a wider one. Over MCP, `capture`
 accepts a file only inside the project and never a credential file such as
-`.env` or an SSH key — see [the privacy boundary](./privacy.md#an-mcp-server-declares-its-consumer).
+`.env` or an SSH key. Integration lifecycle tools (`integration_configure`,
+`_up`, `_down`, `_sync`) run only on a `local` server; a `cloud` one refuses
+them and does not list them — see [the privacy boundary](./privacy.md#an-mcp-server-declares-its-consumer).
 
 ## What a watch will not capture
 

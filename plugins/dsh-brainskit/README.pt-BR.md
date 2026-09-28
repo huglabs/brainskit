@@ -59,7 +59,7 @@ Defina as variáveis antes de iniciar o DSH:
 | `BRAINSKIT_COMMAND` | `bk` | Caminho exato do executável Brainskit; útil no Windows ou em instalações isoladas. |
 | `BRAINSKIT_VAULT` | `<cwd do DSH>/.brainskit` | Vault conectado a este processo DSH. |
 | `BRAINSKIT_CONSUMER` | `cloud` | Teto de privacidade com que o servidor é iniciado. Use `local` somente quando o DSH roda um modelo nesta máquina; veja [Privacidade](#privacidade). |
-| `BRAINSKIT_ALLOW_MUTATIONS` | não definida | Defina como `1` para permitir mutações de wiki, arquivamento e ciclo de vida das integrações. |
+| `BRAINSKIT_ALLOW_MUTATIONS` | não definida | Defina como `1` para permitir mutações de wiki e arquivamento, e do ciclo de vida das integrações quando `BRAINSKIT_CONSUMER=local`; veja [Autoridade padrão](#autoridade-padrão). |
 | `BRAINSKIT_FAIL_ON_STARTUP_ERROR` | não definida | Defina como `1` para um executável ausente, vault inválido ou falha MCP interromper a inicialização do DSH. |
 
 Exemplo em PowerShell:
@@ -116,7 +116,10 @@ incluindo:
 - `ask` com qualquer valor de `save` diferente de `false` (o Brainskit lê o
   valor como verdade em Python, então `"false"` salvaria);
 - `resurface`, que escreve em `output/resurface/` e uma anotação de freshness;
-- configuração, inicialização, encerramento e sincronização de integrações;
+- configuração, inicialização, encerramento e sincronização de integrações. O
+  próprio servidor as recusa sob `cloud` (`policy_denied`) e as omite da sua
+  lista de ferramentas, então elas só rodam com `BRAINSKIT_CONSUMER=local` e a
+  liberação abaixo; fora isso, use `bk integration <verbo>` em um terminal;
 - qualquer ferramenta que uma versão futura do Brainskit adicionar, até que
   esta lista a nomeie.
 

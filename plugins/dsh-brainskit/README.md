@@ -58,7 +58,7 @@ Set variables before launching DSH:
 | `BRAINSKIT_COMMAND` | `bk` | Exact Brainskit executable path; useful for Windows or isolated installs. |
 | `BRAINSKIT_VAULT` | `<DSH cwd>/.brainskit` | Vault connected to this DSH process. |
 | `BRAINSKIT_CONSUMER` | `cloud` | Privacy ceiling the server is started with. Set to `local` only when DSH runs a model on this machine; see [Privacy](#privacy). |
-| `BRAINSKIT_ALLOW_MUTATIONS` | unset | Set to `1` to allow wiki, filing and integration lifecycle mutations. |
+| `BRAINSKIT_ALLOW_MUTATIONS` | unset | Set to `1` to allow wiki and filing mutations, and integration lifecycle mutations when `BRAINSKIT_CONSUMER=local`; see [Default authority](#default-authority). |
 | `BRAINSKIT_FAIL_ON_STARTUP_ERROR` | unset | Set to `1` to make a missing executable, invalid vault or failed MCP handshake abort DSH startup. |
 
 Example for PowerShell:
@@ -111,7 +111,10 @@ denies every other Brainskit tool, including:
 - `ask` with any `save` value other than `false` (Brainskit reads it as a
   Python truth value, so `"false"` would save);
 - `resurface`, which writes `output/resurface/` and a freshness annotation;
-- integration configuration, startup, shutdown and synchronization;
+- integration configuration, startup, shutdown and synchronization. The
+  server refuses these itself under `cloud` (`policy_denied`) and leaves them
+  out of its tool list, so they run only with `BRAINSKIT_CONSUMER=local` and
+  the opt-in below; otherwise use `bk integration <verb>` in a terminal;
 - any tool a later Brainskit release adds, until this list names it.
 
 Set `BRAINSKIT_ALLOW_MUTATIONS=1` only when the DSH profile is intended to

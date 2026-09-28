@@ -58,6 +58,25 @@ bk: WORKSPACE - everything installed, nothing will load:
 
 O workspace resolvido é registrado em `.brain/agent-<agent>.json`, porque nada mais no disco se lembra e `bk status` tem que olhar no mesmo lugar onde o instalador escreveu. Um adaptador escrito antes desse campo existir volta para o vault, então uma instalação existente continua reportando exatamente como fazia.
 
+## Conectando um agente via MCP
+
+`bk serve --mcp` responde sob o consumidor com que é iniciado, e o padrão é
+`cloud`: as respostas de um cliente MCP podem ser encaminhadas a um modelo
+hospedado, e o servidor não tem como saber. Para um agente que roda nesta
+máquina e deve ler evidência local-only, diga isso:
+
+```bash
+bk --vault ./my-vault serve --mcp --transport stdio --consumer local
+```
+
+`human` é recusado via MCP. Uma chamada `search` ou `context` pode pedir um
+consumidor mais estreito que o do servidor, nunca um mais amplo. Via MCP,
+`capture` aceita um arquivo apenas dentro do projeto e nunca um arquivo de
+credencial como `.env` ou uma chave SSH. As ferramentas de ciclo de vida de
+integração (`integration_configure`, `_up`, `_down`, `_sync`) rodam apenas em
+um servidor `local`; um `cloud` as recusa e não as lista — veja
+[a barreira de privacidade](./privacy.md#um-servidor-mcp-declara-seu-consumidor).
+
 ## O que um watch não capturará
 
 `bk watch` percorre cada pasta de origem configurada e captura o que encontra, e uma captura não pode ser desfeita: uma origem é identificada pelo hash de seus bytes e `raw/` é imutável. Então o percurso é filtrado por `ignore` em `.brain/config.json`, uma lista de globs de shell correspondidos a cada segmento de caminho:

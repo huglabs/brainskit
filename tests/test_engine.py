@@ -3299,10 +3299,11 @@ class JudgmentReadsUnderTheRoutesBoundaryTest(unittest.TestCase):
         from brainskit.interfaces.mcp import _call_tool
 
         self._vault("query", self.OLLAMA)
-        _result, prompts, _ = self._run(
+        cloud, prompts, _ = self._run(
             self.ANSWER,
             lambda service: _call_tool(service, "ask", {"question": "platform team"}),
         )
+        self.assertGreaterEqual(cloud["withheld_sources"], 1)
         self._assert_no_local_only(prompts[0])
         local, local_prompts, _ = self._run(
             self.ANSWER,

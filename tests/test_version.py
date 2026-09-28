@@ -341,6 +341,26 @@ class ReleaseGatesAreWiredTest(unittest.TestCase):
         self.assertNotIn("run:", job)
         self.assertNotIn("scripts/", job)
 
+    def test_the_release_never_restores_a_shared_uv_cache(self) -> None:
+        """A cache restored into the job that builds what gets published can poison it."""
+
+        lines = RELEASE.read_text().splitlines()
+        steps = []
+        for i, line in enumerate(lines):
+            if line.strip().startswith("- uses: astral-sh/setup-uv"):
+                indent = len(line) - len(line.lstrip())
+                step = [line]
+                for following in lines[i + 1 :]:
+                    if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                        break
+                    step.append(following)
+                steps.append("\n".join(step))
+        self.assertGreater(len(steps), 0, msg="release.yml no longer sets up uv")
+        for step in steps:
+            with self.subTest(step=step.splitlines()[0].strip()):
+                self.assertRegex(step, r"(?m)^\s*enable-cache: false$")
+        self.assertNotIn("actions/cache", "\n".join(lines))
+
     def test_the_gate_scripts_are_executable_and_parse(self) -> None:
         for script in (FRESH_INSTALL, HARNESS):
             path = REPO_ROOT / script

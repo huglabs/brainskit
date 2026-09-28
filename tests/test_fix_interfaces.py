@@ -887,6 +887,78 @@ class McpIntegrationStatusConsumerTest(unittest.TestCase):
         self.assertEqual(kwargs.get("consumer"), "local")
 
 
+INTEGRATION_LIFECYCLE = {
+    "integration_configure": ("configure", {"name": "web"}),
+    "integration_up": ("up", {"name": "web"}),
+    "integration_down": ("down", {"name": "web"}),
+    "integration_sync": ("sync", {"name": "web"}),
+}
+
+
+class McpIntegrationLifecycleConsumerTest(unittest.TestCase):
+    """A cloud-scoped MCP server does not operate integrations (ADR 0010).
+
+    Starting a container, stopping one, writing an export and storing the
+    options a later sync runs under are operator actions on this machine.
+    Before, a cloud server ran all four with scrubbed responses; now it refuses
+    them before any service method runs, and does not advertise them.
+    """
+
+    def test_a_cloud_server_refuses_every_lifecycle_verb(self) -> None:
+        from brainskit.domain.model import PolicyError
+
+        for server in (None, "cloud"):
+            for tool, (verb, arguments) in INTEGRATION_LIFECYCLE.items():
+                with self.subTest(server=server, tool=tool):
+                    service = RecordingService()
+                    with self.assertRaises(PolicyError) as refused:
+                        _call_tool(service, tool, arguments, server)  # type: ignore[arg-type]
+                    self.assertEqual(refused.exception.code, "policy_denied")
+                    details = refused.exception.details
+                    self.assertEqual(details["tool"], tool)
+                    self.assertEqual(details["server_consumer"], "cloud")
+                    self.assertEqual(details["run_instead"], f"bk integration {verb} <name>")
+                    self.assertIn("--consumer local", details["hint"])
+                    self.assertEqual(service.calls, [], "nothing ran on a refusal")
+
+    def test_the_refusal_comes_before_argument_checks(self) -> None:
+        from brainskit.domain.model import PolicyError
+
+        for arguments in ({}, {"name": "web", "enabled": "false"}, {"name": "web", "options": {"consumer": "human"}}):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(PolicyError):
+                    _call_tool(RecordingService(), "integration_configure", arguments)  # type: ignore[arg-type]
+
+    def test_a_local_server_runs_every_lifecycle_verb_scoped(self) -> None:
+        for tool, (_, arguments) in INTEGRATION_LIFECYCLE.items():
+            with self.subTest(tool=tool):
+                service = RecordingService()
+                _call_tool(service, tool, arguments, "local")  # type: ignore[arg-type]
+                name, _, kwargs = service.calls[-1]
+                self.assertEqual(name, tool)
+                self.assertEqual(kwargs.get("consumer"), "local")
+
+    def test_integration_status_stays_available_on_a_cloud_server(self) -> None:
+        service = RecordingService()
+        _call_tool(service, "integration_status", {})  # type: ignore[arg-type]
+        self.assertEqual(service.calls[-1][0], "integration_status")
+
+    def test_tools_list_offers_lifecycle_only_on_a_local_server(self) -> None:
+        lifecycle = set(INTEGRATION_LIFECYCLE)
+        for server, offered in ((None, False), ("cloud", False), ("local", True)):
+            with self.subTest(server=server):
+                response = _handle(
+                    RecordingService(),  # type: ignore[arg-type]
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    server,
+                )
+                assert response is not None
+                names = {tool["name"] for tool in response["result"]["tools"]}
+                self.assertIn("integration_status", names)
+                self.assertEqual(lifecycle <= names, offered)
+                self.assertEqual(bool(lifecycle & names), offered)
+
+
 class AgentInstallTest(unittest.TestCase):
     """`hooks install` seeds the skill and the graph instructions."""
 
@@ -1429,10 +1501,27 @@ class McpServerConsumerTest(unittest.TestCase):
         response = self.call(
             "integration_configure",
             {"name": "obsidian", "options": {"path": str(target)}},
+            "local",
         )
         self.assertNotIn(str(target), json.dumps(response))
         human = self.service.integration_configure("obsidian")
         self.assertEqual(human["policy"]["options"]["path"], str(target))
+
+    def test_a_cloud_server_refuses_integration_lifecycle_on_the_wire(self) -> None:
+        target = self.root / "obsidian-export"
+        for tool in ("integration_configure", "integration_up", "integration_down", "integration_sync"):
+            with self.subTest(tool=tool):
+                arguments: dict[str, Any] = {"name": "obsidian"}
+                if tool == "integration_configure":
+                    arguments["options"] = {"path": str(target)}
+                response = self.call(tool, arguments)
+                data = response["error"]["data"]
+                self.assertEqual(data["code"], "policy_denied")
+                self.assertEqual(data["server_consumer"], "cloud")
+                blob = json.dumps(response, ensure_ascii=False)
+                for marker in (str(self.root), str(self.vault.root), "obsidian-export"):
+                    self.assertNotIn(marker, blob)
+        self.assertNotIn("path", self.vault.config().integrations["obsidian"].options)
 
     def test_lint_findings_on_hidden_material_are_withheld(self) -> None:
         secret = self.vault.registry()[self.hashes["10-work"]]
@@ -1521,7 +1610,7 @@ class McpBooleanArgumentsTest(unittest.TestCase):
             with self.subTest(tool=tool, arguments=arguments):
                 service = RecordingService()
                 with self.assertRaises(ValidationError) as refused:
-                    _call_tool(service, tool, arguments)  # type: ignore[arg-type]
+                    _call_tool(service, tool, arguments, "local")  # type: ignore[arg-type]
                 self.assertEqual(refused.exception.code, "validation_error")
                 self.assertEqual(service.calls, [], "nothing ran on a bad flag")
 
@@ -1530,7 +1619,7 @@ class McpBooleanArgumentsTest(unittest.TestCase):
         _call_tool(service, "ask", {"question": "q", "save": False})  # type: ignore[arg-type]
         _call_tool(service, "ask", {"question": "q"})  # type: ignore[arg-type]
         _call_tool(service, "lint", {"semantic": True})  # type: ignore[arg-type]
-        _call_tool(service, "integration_configure", {"name": "web"})  # type: ignore[arg-type]
+        _call_tool(service, "integration_configure", {"name": "web"}, "local")  # type: ignore[arg-type]
         saves = [kwargs["save"] for name, _, kwargs in service.calls if name == "ask"]
         self.assertEqual(saves, [False, False])
         lint = next(kwargs for name, _, kwargs in service.calls if name == "lint")

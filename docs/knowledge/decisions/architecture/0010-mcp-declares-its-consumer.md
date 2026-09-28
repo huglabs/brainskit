@@ -86,7 +86,26 @@ and it has to hold for every call rather than for the calls that ask for it.
    nor the project roots (installation facts, ADR 0009), and nothing is read
    before it is decided. `bk capture <path>` is the operator typing, and is
    unchanged.
-6. **MCP tool arguments are typed at the boundary.** A flag is a JSON boolean or
+6. **A `cloud` server does not operate integrations.** `integration_configure`,
+   `integration_up`, `integration_down` and `integration_sync` start and stop
+   containers, write exports to disk, and store the options a later sync
+   serves under: operator actions on this machine. A server whose consumer
+   does not `sees_installation` refuses them with `policy_denied` before any
+   argument is read or any service method runs; `details` carry `tool`,
+   `server_consumer`, `run_instead` (`bk integration <verb> <name>`) and a
+   hint naming `--consumer local`, and no path. `integration_status` is a
+   read, already scoped, and stays available. The predicate is
+   `Consumer.sees_installation` rather than a comparison with `cloud`, so the
+   rule is the ADR 0009 one: a consumer not on this machine is not told its
+   layout and does not act on it.
+7. **`tools/list` omits a tool the server will not run**, rather than listing
+   it as unavailable. It is the same rule as the `consumer` enum in (4), which
+   leaves out the values the server refuses instead of annotating them, and
+   MCP has no field for "listed but unavailable" — tool annotations are
+   behaviour hints, and a note in `description` is free text a client need not
+   read. A client that calls an omitted lifecycle tool anyway gets the
+   `policy_denied` refusal above, not `Unknown MCP tool`, so it learns why.
+8. **MCP tool arguments are typed at the boundary.** A flag is a JSON boolean or
    absent; an integer is a JSON integer, not `true` and not `"5"`; `arguments`
    and `options` are objects. Anything else is `validation_error` naming the
    argument, raised before any service method runs.
@@ -119,7 +138,7 @@ ADR. *Ceiling* is the server's declared consumer.
 | Method / tool | Kind | Before | Now |
 |---|---|---|---|
 | `initialize`, `ping` | protocol | no vault data | unchanged |
-| `tools/list` | protocol | `consumer` enum listed all three | enum is the set within the ceiling |
+| `tools/list` | protocol | `consumer` enum listed all three; every tool listed | enum is the set within the ceiling; the four integration lifecycle tools omitted under `cloud` |
 | `resources/list` | read | `graph_data(local)` | `graph_data(ceiling)` |
 | `resources/read` | read | `read_resource(local)` | `read_resource(ceiling)` |
 | `search`, `context` | read | any declared consumer, `human` included | declared consumer, refused if wider than the ceiling |
@@ -133,8 +152,8 @@ ADR. *Ceiling* is the server's declared consumer.
 | `file` | write that changes privacy | any source, by prefix or path | only a source the ceiling may see; otherwise `not_found` |
 | `approve`, `reject` | write | any proposal id | only a proposal whose source the ceiling may see; otherwise `not_found` |
 | `apply` | write | caller-authored proposal | unchanged — see Out of scope |
-| `integration_configure` | write | echoed every stored option; accepted any `options.consumer` | echo scrubbed of machine layout; `options.consumer` wider than the ceiling is `policy_denied` |
-| `integration_up`, `_down`, `_sync` | operation | echoed paths, container names, file listings | same runtime scrub as `integration_status` |
+| `integration_configure` | write | echoed every stored option; accepted any `options.consumer` | `cloud`: `policy_denied` and not in `tools/list`. `local`: echo scrubbed of machine layout; `options.consumer` wider than the ceiling is `policy_denied` |
+| `integration_up`, `_down`, `_sync` | operation | echoed paths, container names, file listings | `cloud`: `policy_denied` and not in `tools/list`. `local`: same runtime scrub as `integration_status` |
 
 A `local` server keeps what it had — the vault path on `status`, local-only
 evidence on `search`, `context`, resources and the model-backed tools — with
@@ -167,7 +186,10 @@ did; `bk status` still reports it.
 
 - **Breaking:** an MCP client that relied on the old implicit `local` scope, or
   asked for `local`/`human` on `search`/`context`, now gets `cloud` answers or
-  `policy_denied`. Restore it with `bk serve --mcp --consumer local`.
+  `policy_denied`. Restore it with `bk serve --mcp --consumer local`. The same
+  flag is the only way to run integration lifecycle tools over MCP; the
+  `dsh-brainskit` bundle's `BRAINSKIT_ALLOW_MUTATIONS=1` no longer reaches them
+  under its default `cloud` declaration.
 - `run_stdio`, `run_http` and `_handle` take `consumer`; the server's consumer
   is validated once, by `server_consumer`, before any request is read.
 - `BrainskitService.file`, `approve`, `reject`, `lint`, `ask`, `resurface` and
@@ -176,8 +198,8 @@ did; `bk status` still reports it.
   `Health.lint` take a `ceiling` for the first evidence read.
 - `MCP_CONSUMER` is gone; `MCP_DEFAULT_CONSUMER` and `MCP_CONSUMERS` replace it.
 - `tests/test_fix_interfaces.py` carries `McpServerConsumerTest`,
-  `ServeConsumerCliTest`, `McpBooleanArgumentsTest` and
-  `McpCaptureConfinementTest`; `tests/test_engine.py` carries the model-backed
+  `ServeConsumerCliTest`, `McpIntegrationLifecycleConsumerTest`,
+  `McpBooleanArgumentsTest` and `McpCaptureConfinementTest`; `tests/test_engine.py` carries the model-backed
   ceiling tests in `JudgmentReadsUnderTheRoutesBoundaryTest`.
 
 ## Out of scope
@@ -188,9 +210,4 @@ did; `bk status` still reports it.
   oracle: `conflict` versus success says whether a wiki path exists, and a
   citation check says whether a full source hash is registered. Neither
   discloses content; both are recorded here rather than silently accepted.
-- **Whether a `cloud` server should run integration operations at all.**
-  Their responses are scrubbed and their consumer cannot be widened, but
-  starting a container or syncing an export is an operator action. The
-  `dsh-brainskit` bundle already denies them by default; the server-side
-  decision is left to a later ADR.
 - **The web viewer's `capture`** accepts only `human` writes and is unchanged.

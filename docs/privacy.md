@@ -10,8 +10,8 @@ bk --vault ./my-vault search "topic" --consumer local --json
 `cloud` receives only cloud-eligible evidence and `local` excludes
 `never-ingest`. `human` applies no restriction at all: it is the default for
 interactive, non-JSON use, and a machine caller that names it explicitly —
-through `--json`, MCP, or a `--consumer human` integration such as the local
-web viewer — receives `never-ingest` bodies. Declaring the boundary is
+through `--json`, or a `--consumer human` integration such as the local web
+viewer — receives `never-ingest` bodies. MCP never serves `human` (below). Declaring the boundary is
 mandatory for machine callers precisely because the unrestricted value has to
 be a deliberate choice rather than a silent default. Privacy filtering also
 applies to graph-expanded search neighbors.
@@ -34,7 +34,12 @@ wider than it even when a local model is mapped. `search` and `context` still
 require a `consumer` argument, and it may only narrow the server's; a wider one
 is refused with `policy_denied` rather than silently answered narrower. `file`,
 `approve` and `reject` cannot reach a source or proposal outside the ceiling —
-moving a source is how its privacy changes. See
+moving a source is how its privacy changes. A `cloud` server does not run
+`integration_configure`, `integration_up`, `integration_down` or
+`integration_sync` at all: they are operator actions on this machine, so they
+are refused with `policy_denied`, naming `bk integration <verb>` and
+`--consumer local` rather than any path, and are left out of `tools/list`.
+`integration_status` stays available. See
 [ADR 0010](./knowledge/decisions/architecture/0010-mcp-declares-its-consumer.md).
 
 Over MCP, `capture` takes text and `http(s)` URLs as always, but a file path

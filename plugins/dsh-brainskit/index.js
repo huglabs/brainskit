@@ -44,13 +44,17 @@ export function brainskitGuidance(consumer = DEFAULT_CONSUMER) {
     : consumer === 'cloud'
       ? '- This DSH process declared the Brainskit privacy consumer cloud: results reach a third-party model, so the server only returns cloud-eligible evidence. Omit the consumer argument or pass consumer: cloud. Never pass local or human; the DSH bridge denies both.'
       : '- This DSH process declared the Brainskit privacy consumer local: the operator runs a model on this machine. Omit the consumer argument or pass consumer: local, or cloud to narrow a result you will forward to a third-party service. Never pass human; the DSH bridge denies it.'
+  const integrations = consumer === 'local'
+    ? '- Integration configuration, startup, shutdown and sync are also denied by the DSH bridge unless the operator launched DSH with BRAINSKIT_ALLOW_MUTATIONS=1.'
+    : '- Integration configuration, startup, shutdown and sync require BRAINSKIT_CONSUMER=local and BRAINSKIT_ALLOW_MUTATIONS=1; the Brainskit server refuses them for any other consumer. Point the operator to `bk integration <verb>` in a terminal instead.'
   return `Brainskit durable memory is available through tools named ${TOOL_PREFIX}*.
 
 - When historical context may matter, call ${TOOL_PREFIX}search or ${TOOL_PREFIX}context before answering.
 ${privacy}
 - Call ${TOOL_PREFIX}capture only when the user explicitly asks to remember something or supplies a durable source to retain. It accepts text and URLs; a file path is accepted only inside this project and never for a secret file such as .env.
 - Never edit the vault directly. Compiled wiki changes must go through ${TOOL_PREFIX}apply so schema, provenance, citation, link and novelty checks remain active.
-- Mutable wiki, filing, saved-answer, resurface and integration operations are denied by the DSH bridge unless the operator launched DSH with BRAINSKIT_ALLOW_MUTATIONS=1.`
+- Mutable wiki, filing, saved-answer and resurface operations are denied by the DSH bridge unless the operator launched DSH with BRAINSKIT_ALLOW_MUTATIONS=1.
+${integrations}`
 }
 
 export const BRAINSKIT_GUIDANCE = brainskitGuidance(DEFAULT_CONSUMER)

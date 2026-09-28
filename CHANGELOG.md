@@ -45,8 +45,13 @@ artifact was built from is the durable record of what shipped.
   findings on material outside the scope (`redacted_findings`), and a
   `search`/`context` `consumer` wider than the server's is refused with
   `policy_denied` rather than clamped. `tools/list` offers only the consumers
-  the server will answer. **To keep the previous behaviour for an agent on
-  this machine, start the server with `--consumer local`.**
+  the server will answer. A `cloud` server also refuses
+  `integration_configure`, `integration_up`, `integration_down` and
+  `integration_sync` with `policy_denied` (details name `bk integration <verb>`
+  and `--consumer local`, never a path) and leaves them out of `tools/list`;
+  `integration_status` stays available, and a `local` server runs all four
+  with scrubbed responses as before. **To keep the previous behaviour for an
+  agent on this machine, start the server with `--consumer local`.**
 - **`--json`'s `ok` now means the command succeeded, and agrees with the exit
   status** ([#10](https://github.com/huglabs/brainskit/issues/10)). `_emit`
   wrote `"ok": true` as a literal, so `bk lint` with an error and `bk vaults
@@ -108,6 +113,8 @@ artifact was built from is the durable record of what shipped.
   were coerced with `bool()`, so `"false"` saved an answer; limits accepted
   `true` and `"5"`. Anything but a JSON boolean (or integer) is now
   `validation_error` naming the argument, before anything runs.
+- The release workflow no longer restores the uv cache in the job that builds
+  the published artifacts.
 
 ### Fixed
 

@@ -45,7 +45,10 @@ first; a concept named here is a decision, not a suggestion. ADRs live in
   is refused. It is a ceiling: every tool and resource answers under it, and a
   per-call `consumer` may only narrow it — a wider one is `policy_denied`, never
   clamped. Validated once by `server_consumer`; "narrows" is derived from
-  `Consumer.allows`. See ADR 0010.
+  `Consumer.allows`. A server whose consumer does not `sees_installation`
+  (`cloud`) neither lists nor runs the integration lifecycle tools
+  (`integration_configure`, `_up`, `_down`, `_sync`): they are operator
+  actions on this machine. See ADR 0010.
 - **Confined capture** — a capture a model asked for (MCP): text and URLs as
   usual, a file only inside the code root or an installed workspace, outside
   the vault, and never a credential-shaped file. `bk capture` is not confined.
