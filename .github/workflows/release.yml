@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v7
       # The job that builds what gets published never restores a shared cache:
       # anything a cache could plant here would ship inside the artifacts.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: false
 
