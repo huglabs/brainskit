@@ -48,9 +48,8 @@ group is carried on [`later.md`](later.md).
 
 ## Release pipeline
 
-R1 and R5 are repository settings rather than code, and are the operator's to
-take; they are listed here so they are not forgotten because nothing in the tree
-changes. **R4 moved to [`now.md`](now.md)** — `0.6.2` has since shipped without
+R1 and R5 are repository settings rather than code, so nothing in the tree
+records them; both are now verified and marked done below. **R4 moved to [`now.md`](now.md)** — `0.6.2` has since shipped without
 it, so it is now cheapest to fold into the tag after that one. **R7 is closed**:
 the stale premise it asked to correct is not in `release.yml` and, per
 `git log -S`, never was; the comment at `release.yml:91-98` already tells the
@@ -58,8 +57,8 @@ corrected `v0.5.0` `invalid-publisher` story.
 
 | ID | Intent | Size | Issue |
 |----|--------|------|-------|
-| R1 | `SECURITY.md`'s only sanctioned reporting channel does not exist — `private-vulnerability-reporting` is `{"enabled": false}` while the policy forbids public issues, so a reporter following `SECURITY.md:17-19` has nowhere to go. Secret scanning and Dependabot security updates are also disabled | setting | [#15](https://github.com/huglabs/brainskit/issues/15) |
-| R5 | Publishing is unattended. `release.yml:17-20` triggers on any `v*` tag push and `release.yml:74-89` declares `environment: pypi` with no manual-approval step of its own — so the only possible human gate is required reviewers on that GitHub environment, which is a repo setting and is not visible in the tree. Confirm it, or add the gate | setting | [#16](https://github.com/huglabs/brainskit/issues/16) |
+| R1 | `SECURITY.md`'s only sanctioned reporting channel does not exist — `private-vulnerability-reporting` is `{"enabled": false}` while the policy forbids public issues, so a reporter following `SECURITY.md:17-19` has nowhere to go. Secret scanning and Dependabot security updates are also disabled. **Done:** verified with private vulnerability reporting enabled | setting | [#15](https://github.com/huglabs/brainskit/issues/15) |
+| R5 | Publishing is unattended. `release.yml:17-20` triggers on any `v*` tag push and `release.yml:74-89` declares `environment: pypi` with no manual-approval step of its own — so the only possible human gate is required reviewers on that GitHub environment, which is a repo setting and is not visible in the tree. **Done:** verified with the `pypi` environment's required reviewer set and `can_admins_bypass` false | setting | [#16](https://github.com/huglabs/brainskit/issues/16) |
 | DEP1 | Work the Dependabot queue. `.github/dependabot.yml` is configured (github-actions and uv, monthly, with `tree-sitter*` and dev-tools grouped) but the open PRs have not been triaged. Five were open and **#3 — the only genuinely green one — was closed unmerged on 13 Aug**, leaving **#1, #2, #4 and #5**. Every one of those four shows a red X that is **a billing lock, not a test failure**: `lint and types` fails in about 2s with zero steps and the rest of the matrix skipped. **#1 (tree-sitter 0.26) must not be merged as-is**: it removes `Language.query`, `Language.version` and `Parser.timeout_micros` and makes `Point` a tuple subclass, `pyproject.toml` pins `tree-sitter>=0.23.0,<0.26` against exactly that, and the vendored extractors that would break are excluded from both ruff (`pyproject.toml:170`) and mypy (`:231`) — so CI would not catch it. **Done on `release-0.8.0`:** Dependabot queue cleared for 0.8.0. #5 merged on main and came into `release-0.8.0`; superseded by commits on `release-0.8.0`: #4 jsonschema ≥4.26.0 (d7f87ec); #2 pytest 9 / ruff 0.16 / mypy 2 plus fixes (37a8ae4, e1e73e7) — its red X was real lint failures, #4's a stale billing-lock run; #1 tree-sitter 0.26 (597386c) — audit found no call sites of the removed APIs and byte-identical code-graph output, the earlier 'must not merge' was wrong; #45 neo4j 6.3.1 lock-only (94f4632); #44 setup-uv v10.0.1 (443ce04). Close each PR with a link to its commit | medium | [#17](https://github.com/huglabs/brainskit/issues/17) |
 
 ## Test quality

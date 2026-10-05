@@ -64,15 +64,14 @@ remainder rather than widening that sweep.
 
 | ID | Intent | Issue |
 |----|--------|-------|
-| TQ2-nested | Extend `NoAssertionHidesInAnEmptyLoopTest` to assertions one block deeper (e.g. inside `with self.subTest():`); ~28 more sites across the suite at 0.8.0; and the vacuous-on-Linux `/private/var` case, `test_an_unresolved_path_spelling_still_reads_as_registered` in `tests/test_enforcement_status.py`, whose `.replace("/private/var/", "/var/", 1)` is a no-op on Linux (no `/private/var`), so it asserts nothing there | not yet filed |
+| TQ2-nested | Extend `NoAssertionHidesInAnEmptyLoopTest` to assertions one block deeper (e.g. inside `with self.subTest():`); ~28 more sites across the suite at 0.8.0; and the vacuous-on-Linux `/private/var` case, `test_an_unresolved_path_spelling_still_reads_as_registered` in `tests/test_enforcement_status.py`, whose `.replace("/private/var/", "/var/", 1)` is a no-op on Linux (no `/private/var`), so it asserts nothing there | [#50](https://github.com/huglabs/brainskit/issues/50) |
 
 ## Decided, not deferred
 
 Recorded so they are not re-raised as findings. Each was examined on 13 Aug and
 judged correct as written. Neither has an issue, and that absence is the
 decision: filing one would put back on the board the thing this section exists
-to keep off it. They are the only entries on this page without one, apart from
-TQ2-nested above, which is simply not filed yet.
+to keep off it. They are the only entries on this page without one.
 
 - **`application/compilation.py:337`** partitions novelty comparison by a page's
   self-declared `type` (`if existing["type"] != operation.kind.value: continue`).
