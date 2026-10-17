@@ -21,12 +21,6 @@ descobre as ferramentas MCP no namespace `mcp__brainskit__*`.
   uv tool install brainskit==0.8.0
   ```
 
-  Enquanto a 0.8.0 não estiver no PyPI, instale a partir do repositório:
-
-  ```sh
-  uv tool install --force --from git+https://github.com/huglabs/brainskit.git brainskit
-  ```
-
 - Um vault inicializado. No projeto usado pelo DSH:
 
   ```sh
